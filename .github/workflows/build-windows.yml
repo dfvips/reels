@@ -1,19 +1,16 @@
-name: Build Windows EXE
+name: Build Windows Single EXE
 
 on:
   push:
-    branches:
-      - main
-      - master
+    branches: [ main ]
   workflow_dispatch:
 
 jobs:
-  build-windows:
+  build:
     runs-on: windows-latest
 
     steps:
-      - name: Checkout source
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
@@ -24,15 +21,37 @@ jobs:
       - name: Enable Windows Desktop
         run: flutter config --enable-windows-desktop
 
-      - name: Install dependencies
+      - name: Pub Get
         run: flutter pub get
 
       - name: Build Windows
         run: flutter build windows --release
 
-      - name: Upload EXE Artifact
+      # ====== 单文件封装开始 ======
+      - name: Install Inno Setup
+        run: choco install innosetup -y
+
+      - name: Create installer script
+        run: |
+          echo [Setup] > installer.iss
+          echo AppName=DouyinParser >> installer.iss
+          echo AppVersion=1.0.0 >> installer.iss
+          echo DefaultDirName={pf}\DouyinParser >> installer.iss
+          echo OutputBaseFilename=DouyinParser_Setup >> installer.iss
+          echo Compression=lzma >> installer.iss
+          echo SolidCompression=yes >> installer.iss
+          echo. >> installer.iss
+          echo [Files] >> installer.iss
+          echo Source: "build\windows\x64\runner\Release\*"; DestDir: "{app}"; Flags: recursesubdirs >> installer.iss
+          echo. >> installer.iss
+          echo [Icons] >> installer.iss
+          echo Name: "{group}\DouyinParser"; Filename: "{app}\douyin_parser.exe" >> installer.iss
+
+      - name: Build Single EXE Installer
+        run: iscc installer.iss
+
+      - name: Upload Single EXE
         uses: actions/upload-artifact@v4
         with:
-          name: windows-exe
-          path: build/windows/x64/runner/Release/
-
+          name: windows-single-exe
+          path: Output/DouyinParser_Setup.exe

@@ -19,6 +19,8 @@ class DownloadService {
   // 存储设置的键名
   static const String _rememberLocationKey = 'remember_download_location';
   static const String _skipFilenameCustomKey = 'skip_filename_customization';
+  static const String _skipLocationPromptKey =
+      'skip_location_prompt'; // 新增：跳过位置提示
   static const String _lastDirectoryKey = 'last_download_directory';
   static const String _hasMacOSPermissionKey = 'macos_has_directory_permission';
 
@@ -118,35 +120,66 @@ class DownloadService {
     }
   }
 
+  // 检查是否是macOS沙盒目录
+  static bool isMacOSSandboxDirectory(String directoryPath) {
+    if (!Platform.isMacOS) return false;
+    return directoryPath.contains('Library/Containers/');
+  }
+
   // 获取macOS可用的保存目录
   static Future<String?> getAvailableMacOSDirectory() async {
     if (!Platform.isMacOS) return null;
 
     try {
-      // 1. 先检查是否保存了上次的目录
+      // 1. 检查是否保存了上次的目录
       final lastDirectory = await _getSetting(_lastDirectoryKey, '') as String;
+      final skipLocationPrompt =
+          await _getSetting(_skipLocationPromptKey, false) as bool;
       final hasPermissionFlag =
           await _getSetting(_hasMacOSPermissionKey, false) as bool;
 
+      // 如果有上次保存的目录且跳过了位置提示
+      if (lastDirectory.isNotEmpty && skipLocationPrompt) {
+        print('macOS用户跳过了位置提示，使用上次目录: $lastDirectory');
+
+        // 检查权限是否仍然有效
+        final hasAccess = await checkMacOSDirectoryAccess(lastDirectory);
+        if (hasAccess) {
+          print('macOS目录权限有效');
+          return lastDirectory;
+        } else {
+          print('macOS目录权限失效，需要重新选择');
+          // 清除权限标志，让用户重新选择
+          await _saveSetting(_hasMacOSPermissionKey, false);
+          // 注意：这里不重置skipLocationPrompt，用户仍然希望跳过提示
+        }
+      }
+
+      // 2. 检查目录是否在沙盒内
+      if (lastDirectory.isNotEmpty && isMacOSSandboxDirectory(lastDirectory)) {
+        print('macOS目录在沙盒内，需要用户选择新位置');
+        // 沙盒内的目录应该提示用户选择
+        return null; // 返回null会触发位置选择
+      }
+
+      // 3. 如果有上次目录且权限有效，直接使用
       if (lastDirectory.isNotEmpty && hasPermissionFlag) {
-        // 验证目录权限是否仍然有效
         final hasAccess = await checkMacOSDirectoryAccess(lastDirectory);
         if (hasAccess) {
           print('macOS使用上次保存的目录（权限有效）: $lastDirectory');
           return lastDirectory;
         } else {
           print('macOS上次保存的目录权限已失效: $lastDirectory');
-          // 清除权限标志
           await _saveSetting(_hasMacOSPermissionKey, false);
         }
       }
 
-      // 2. 尝试获取默认下载目录
+      // 4. 尝试获取默认下载目录
       final downloadsDir = await getDownloadsDirectory();
       if (downloadsDir != null) {
         final downloadsPath = downloadsDir.path;
         final hasAccess = await checkMacOSDirectoryAccess(downloadsPath);
-        if (hasAccess) {
+        if (hasAccess && !isMacOSSandboxDirectory(downloadsPath)) {
           print('macOS使用下载目录: $downloadsPath');
           await _saveSetting(_lastDirectoryKey, downloadsPath);
           await _saveSetting(_hasMacOSPermissionKey, true);
@@ -154,18 +187,18 @@ class DownloadService {
         }
       }
 
-      // 3. 尝试获取文档目录
+      // 5. 尝试获取文档目录
       final documentsDir = await getApplicationDocumentsDirectory();
       final documentsPath = documentsDir.path;
       final hasAccess = await checkMacOSDirectoryAccess(documentsPath);
-      if (hasAccess) {
+      if (hasAccess && !isMacOSSandboxDirectory(documentsPath)) {
         print('macOS使用文档目录: $documentsPath');
         await _saveSetting(_lastDirectoryKey, documentsPath);
         await _saveSetting(_hasMacOSPermissionKey, true);
         return documentsPath;
       }
 
-      return null;
+      return null; // 没有可用的目录
     } catch (e) {
       print('获取macOS可用目录失败: $e');
       return null;
@@ -300,8 +333,37 @@ class DownloadService {
       final platform = Platform.operatingSystem;
       print('显示${platform}保存对话框...');
 
-      // macOS：尝试获取可用的目录
+      // macOS：检查是否需要提示位置
       if (Platform.isMacOS) {
+        final skipLocationPrompt =
+            await _getSetting(_skipLocationPromptKey, false) as bool;
+
+        // 如果用户已经跳过了位置提示，直接尝试使用现有目录
+        if (skipLocationPrompt) {
+          final availableDir = await getAvailableMacOSDirectory();
+          if (availableDir != null) {
+            print('macOS用户跳过了位置提示，使用现有目录: $availableDir');
+
+            // 检查是否跳过文件名自定义
+            final skipFilenameCustom =
+                await _getSetting(_skipFilenameCustomKey, false) as bool;
+            if (skipFilenameCustom) {
+              // 跳过文件名自定义，直接使用默认文件名
+              final filePath = path.join(availableDir, '$defaultFileName.mp4');
+              print('macOS跳过文件名自定义，直接保存到: $filePath');
+              return filePath;
+            } else {
+              // 显示文件名输入对话框
+              return await _showFilenameInputDialog(
+                context,
+                availableDir,
+                defaultFileName,
+              );
+            }
+          }
+        }
+
+        // 检查是否有可用的目录
         final availableDir = await getAvailableMacOSDirectory();
         if (availableDir != null) {
           print('macOS找到可用目录: $availableDir');
@@ -322,10 +384,11 @@ class DownloadService {
               defaultFileName,
             );
           }
-        } else {
-          print('macOS没有可用的目录，需要用户选择');
-          return await _promptUserForSaveLocation(context, defaultFileName);
         }
+
+        // 没有可用目录，需要用户选择位置
+        print('macOS需要用户选择保存位置');
+        return await _promptUserForSaveLocation(context, defaultFileName);
       }
 
       // Windows：检查用户设置
@@ -367,17 +430,27 @@ class DownloadService {
     }
   }
 
-  // 提示用户选择保存位置（核心方法）
+  // 提示用户选择保存位置（核心方法）- 添加"不再提示"选项
   static Future<String?> _promptUserForSaveLocation(
     BuildContext context,
     String defaultFileName,
   ) async {
     try {
-      _showInfoToast('请选择保存位置...');
+      // 如果是macOS且目录在沙盒内，显示特定的提示信息
+      final lastDirectory = await _getSetting(_lastDirectoryKey, '') as String;
+      bool isSandboxDir =
+          Platform.isMacOS && isMacOSSandboxDirectory(lastDirectory);
+
+      if (isSandboxDir) {
+        print('macOS沙盒目录检测: $lastDirectory');
+        _showInfoToast('当前目录在应用沙盒内，请选择新的保存位置...');
+      } else {
+        _showInfoToast('请选择保存位置...');
+      }
 
       // 1. 先让用户选择目录
       String? selectedDir = await FilePicker.platform.getDirectoryPath(
-        dialogTitle: '选择视频保存位置',
+        dialogTitle: isSandboxDir ? '选择视频保存位置（当前目录在沙盒内）' : '选择视频保存位置',
       );
 
       if (selectedDir == null || selectedDir.isEmpty) {
@@ -393,6 +466,28 @@ class DownloadService {
         _showErrorToast('没有该目录的写入权限，请选择其他目录');
         return null;
       }
+
+      // 检查是否是macOS沙盒目录
+      if (Platform.isMacOS && isMacOSSandboxDirectory(selectedDir)) {
+        _showErrorToast('请不要选择应用沙盒内的目录，请选择用户目录如"下载"或"文档"');
+        return null;
+      }
+
+      // 显示位置确认对话框（带"不再提示"选项）
+      final shouldSkipPrompt = await _showLocationConfirmationDialog(
+        context,
+        selectedDir,
+        isSandboxDir,
+      );
+
+      if (shouldSkipPrompt == null) {
+        print('用户取消了位置确认');
+        return null;
+      }
+
+      // 保存用户的选择
+      final skipPrompt = shouldSkipPrompt;
+      await _saveSetting(_skipLocationPromptKey, skipPrompt);
 
       // 保存选择的目录和权限状态
       await _saveSetting(_lastDirectoryKey, selectedDir);
@@ -419,6 +514,83 @@ class DownloadService {
     } catch (e) {
       print('提示用户选择保存位置失败: $e');
       return null;
+    }
+  }
+
+  // 显示位置确认对话框（带"不再提示"选项）
+  static Future<bool?> _showLocationConfirmationDialog(
+    BuildContext context,
+    String selectedDir,
+    bool isSandboxDir,
+  ) async {
+    try {
+      bool skipFuturePrompts = false;
+
+      return await showDialog<bool>(
+        context: context,
+        barrierDismissible: false,
+        builder: (context) {
+          return StatefulBuilder(
+            builder: (context, setState) {
+              return AlertDialog(
+                title: Text(isSandboxDir ? '更换保存位置' : '确认保存位置'),
+                content: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text('您选择的保存位置是:'),
+                    SizedBox(height: 8),
+                    Container(
+                      padding: EdgeInsets.all(12),
+                      decoration: BoxDecoration(
+                        color: Colors.grey[100],
+                        borderRadius: BorderRadius.circular(8),
+                      ),
+                      child: SelectableText(
+                        selectedDir,
+                        style: TextStyle(fontFamily: 'Menlo', fontSize: 12),
+                      ),
+                    ),
+                    SizedBox(height: 16),
+                    if (isSandboxDir)
+                      Text(
+                        '✓ 已更换为非沙盒目录，可以正常保存文件',
+                        style: TextStyle(color: Colors.green, fontSize: 14),
+                      ),
+                    SizedBox(height: 16),
+                    CheckboxListTile(
+                      title: Text('不再提示保存位置'),
+                      subtitle: Text('下次直接使用此位置保存'),
+                      value: skipFuturePrompts,
+                      onChanged: (value) {
+                        setState(() {
+                          skipFuturePrompts = value ?? false;
+                        });
+                      },
+                      dense: true,
+                      contentPadding: EdgeInsets.zero,
+                    ),
+                  ],
+                ),
+                actions: [
+                  TextButton(
+                    onPressed: () => Navigator.of(context).pop(false),
+                    child: Text('取消'),
+                  ),
+                  ElevatedButton(
+                    onPressed:
+                        () => Navigator.of(context).pop(skipFuturePrompts),
+                    child: Text('确认'),
+                  ),
+                ],
+              );
+            },
+          );
+        },
+      );
+    } catch (e) {
+      print('显示位置确认对话框失败: $e');
+      return false;
     }
   }
 

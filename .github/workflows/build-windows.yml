@@ -1,4 +1,4 @@
-name: Build Windows Single EXE (7z SFX Auto)
+name: Build Windows Single EXE
 
 on:
   push:
@@ -10,43 +10,66 @@ jobs:
     runs-on: windows-latest
 
     steps:
+      # 1️⃣ 拉取代码
       - uses: actions/checkout@v4
 
+      # 2️⃣ 设置 Flutter
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
           channel: stable
           cache: true
 
+      # 3️⃣ 启用 Windows 桌面
       - name: Enable Windows Desktop
         run: flutter config --enable-windows-desktop
 
+      # 4️⃣ 安装依赖
       - name: Pub Get
         run: flutter pub get
 
+      # 5️⃣ 构建 Windows Release
       - name: Build Windows
         run: flutter build windows --release
 
-      # ===== 生成绿色单 exe =====
+      # 6️⃣ 安装 Inno Setup
+      - name: Install Inno Setup
+        run: choco install innosetup -y
 
-      - name: Install 7-Zip
-        run: choco install 7zip -y
-
-      - name: Create single EXE with built-in SFX
+      # 7️⃣ 读取版本号
+      - name: Read version from pubspec.yaml
         shell: pwsh
         run: |
-          $releaseDir = "build\windows\x64\runner\Release"
-          $exeOut = "$releaseDir\DouyinParser.exe"
+          $versionLine = Select-String -Path pubspec.yaml -Pattern '^version:'
+          $version = ($versionLine.Line.Split(':')[1].Trim() -split '\+')[0] # 去掉 build number
+          echo "APP_VERSION=$version" >> $env:GITHUB_ENV
 
-          # 删除旧文件（防止覆盖失败等）
-          if (Test-Path $exeOut) { Remove-Item $exeOut -Force }
+      # 8️⃣ 生成 installer.iss 脚本
+      - name: Create installer script
+        shell: pwsh
+        run: |
+          Set-Content installer.iss "[Setup]"
+          Add-Content installer.iss "AppName=DouyinParser"
+          Add-Content installer.iss "AppVersion=$env:APP_VERSION"
+          Add-Content installer.iss "DefaultDirName={pf}\DouyinParser"
+          Add-Content installer.iss "OutputBaseFilename=DouyinParser_Setup"
+          Add-Content installer.iss "Compression=lzma"
+          Add-Content installer.iss "SolidCompression=yes"
+          Add-Content installer.iss ""
+          Add-Content installer.iss "[Files]"
+          Add-Content installer.iss 'Source: "build\windows\x64\runner\Release\*"; DestDir: "{app}"; Flags: recursesubdirs'
+          Add-Content installer.iss ""
+          Add-Content installer.iss "[Icons]"
+          Add-Content installer.iss 'Name: "{group}\DouyinParser"; Filename: "{app}\douyin_parser.exe"'
+          Add-Content installer.iss 'Name: "{commondesktop}\DouyinParser"; Filename: "{app}\douyin_parser.exe"'
 
-          # 生成 SFX 单 exe
-          # -sfx = 使用默认 7z 自带 SFX
-          & 7z a -sfx $exeOut "$releaseDir\*"
+      # 9️⃣ 编译单文件安装包
+      - name: Build Single EXE Installer
+        run: iscc installer.iss
 
+      # 🔟 上传 artifact
       - name: Upload Single EXE
         uses: actions/upload-artifact@v4
         with:
           name: windows-single-exe
-          path: build/windows/x64/runner/Release/DouyinParser.exe
+          path: Output/DouyinParser_Setup.exe

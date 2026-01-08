@@ -38,15 +38,15 @@ jobs:
       - name: Install 7-Zip
         run: choco install 7zip -y
 
-      # 7️⃣ 提取 7zS.sfx（自解压模块）从安装包
-      - name: Extract 7zS.sfx from Installer
+      # 7️⃣ 下载官方 SFX 模块
+      - name: Download 7z.sfx
         shell: pwsh
         run: |
-          $installer = "C:\ProgramData\chocolatey\lib\7zip\tools\7zip.install.exe"
-          $tempDir = "temp_extract_7z"
-          New-Item -ItemType Directory -Path $tempDir | Out-Null
-          & 7z x $installer -o$tempDir | Out-Null
-          Copy-Item "$tempDir\7z.sfx" "build\windows\x64\runner\Release\7zS.sfx"
+          $sfxUrl = "https://www.7-zip.org/a/7z1900-extra.7z"
+          $sfxArchive = "build\windows\x64\runner\Release\7z_extra.7z"
+          Invoke-WebRequest $sfxUrl -OutFile $sfxArchive
+          # 解压 7z.sfx
+          & 7z x $sfxArchive -o"build\windows\x64\runner\Release" 7z.sfx
 
       # 8️⃣ 压缩 Release 目录成 7z
       - name: Package Release as 7z
@@ -61,7 +61,7 @@ jobs:
         shell: pwsh
         run: |
           $releaseDir = "build\windows\x64\runner\Release"
-          $sfx = "$releaseDir\7zS.sfx"
+          $sfx = "$releaseDir\7z.sfx"
           $archive = "$releaseDir\DouyinParser.7z"
           $exeOut = "$releaseDir\DouyinParser.exe"
           Copy-Item $sfx $exeOut -Force

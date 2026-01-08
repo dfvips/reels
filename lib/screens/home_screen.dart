@@ -113,7 +113,7 @@ class _HomeScreenState extends State<HomeScreen> {
       return;
     }
 
-    // 检查并请求权限（仅移动端）
+    // 移动端：检查并请求权限
     if (Platform.isAndroid || Platform.isIOS) {
       print('HomeScreen: 检查下载权限...');
       final hasPermission = await _requestPermissions();
@@ -122,6 +122,12 @@ class _HomeScreenState extends State<HomeScreen> {
       if (!hasPermission) {
         _showErrorToast('未授予存储权限，无法下载');
         _showSettingsDialog();
+        return;
+      }
+
+      // 移动端：显示下载确认对话框
+      final shouldContinue = await _showDownloadConfirmation();
+      if (!shouldContinue) {
         return;
       }
     }
@@ -136,17 +142,6 @@ class _HomeScreenState extends State<HomeScreen> {
     });
 
     try {
-      // 移动端显示下载确认对话框
-      if (Platform.isAndroid || Platform.isIOS) {
-        final shouldContinue = await _showDownloadConfirmation();
-        if (!shouldContinue) {
-          setState(() {
-            _isDownloading = false;
-          });
-          return;
-        }
-      }
-
       // 开始下载
       final filePath = await DownloadService.downloadVideo(
         _videoUrl!,
@@ -163,10 +158,26 @@ class _HomeScreenState extends State<HomeScreen> {
         context, // 传递 context 给 DownloadService
       );
 
-      // 移动端：下载完成后保存到相册
+      // 移动端：下载完成后自动保存到相册
       if (filePath != null && (Platform.isIOS || Platform.isAndroid)) {
+        // 延迟一点时间再保存到相册，确保文件已经完全写入
+        await Future.delayed(Duration(milliseconds: 500));
+
+        // 保存到相册但不显示额外提示，因为DownloadService内部已经显示了
         await DownloadService.saveVideoToGallery(filePath);
+
+        // 移动端保存到相册后，可以显示一个简单的成功提示
+        if (mounted) {
+          BotToast.showText(
+            text: '视频已保存到相册',
+            duration: const Duration(seconds: 3),
+            contentColor: Colors.green,
+            textStyle: const TextStyle(color: Colors.white, fontSize: 14),
+          );
+        }
       }
+
+      // 桌面端：文件保存完成后会弹出对话框，这里不需要额外处理
     } catch (e) {
       print('HomeScreen: 下载异常: $e');
       _showErrorToast('下载失败: $e');
@@ -231,7 +242,7 @@ class _HomeScreenState extends State<HomeScreen> {
           builder: (context) {
             return AlertDialog(
               title: const Text('下载视频'),
-              content: const Text('确定要下载这个视频吗？'),
+              content: const Text('确定要下载这个视频吗？下载完成后将自动保存到相册。'),
               actions: [
                 TextButton(
                   onPressed: () {
@@ -290,6 +301,15 @@ class _HomeScreenState extends State<HomeScreen> {
     final totalSize = DownloadService.formatFileSize(_totalBytes);
     final percentage = (progress * 100).toStringAsFixed(1);
 
+    String statusText;
+    if (Platform.isAndroid || Platform.isIOS) {
+      statusText = '下载完成后将自动保存到相册';
+    } else if (Platform.isMacOS || Platform.isWindows) {
+      statusText = '正在下载到用户选择的位置...';
+    } else {
+      statusText = '正在下载中...';
+    }
+
     return Card(
       margin: const EdgeInsets.only(bottom: 16),
       child: Padding(
@@ -332,7 +352,7 @@ class _HomeScreenState extends State<HomeScreen> {
             ),
             const SizedBox(height: 4),
             Text(
-              Platform.isMacOS ? '正在下载到用户选择的位置...' : '下载完成后将自动提示保存',
+              statusText,
               style: const TextStyle(fontSize: 12, color: Colors.grey),
             ),
           ],

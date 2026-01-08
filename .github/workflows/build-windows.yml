@@ -38,15 +38,25 @@ jobs:
       - name: Install 7-Zip
         run: choco install 7zip -y
 
-      # 7️⃣ 下载官方 SFX 模块
+      # 7️⃣ 下载官方 7z.sfx 到 Release 目录
       - name: Download 7z.sfx
         shell: pwsh
         run: |
-          $sfxUrl = "https://www.7-zip.org/a/7z1900-extra.7z"
-          $sfxArchive = "build\windows\x64\runner\Release\7z_extra.7z"
+          $releaseDir = "build\windows\x64\runner\Release"
+          $sfxUrl = "https://www.7-zip.org/a/7z1900-extra.7z"  # 官方 7-Zip Extra SFX 压缩包
+          $sfxArchive = "$releaseDir\7z_extra.7z"
+
+          # 下载
           Invoke-WebRequest $sfxUrl -OutFile $sfxArchive
-          # 解压 7z.sfx
-          & 7z x $sfxArchive -o"build\windows\x64\runner\Release" 7z.sfx
+
+          # 解压出 7z.sfx
+          & 7z x $sfxArchive -o$releaseDir 7z.sfx
+
+          # 确认文件存在
+          if (!(Test-Path "$releaseDir\7z.sfx")) {
+              Write-Error "7z.sfx 下载或解压失败"
+              exit 1
+          }
 
       # 8️⃣ 压缩 Release 目录成 7z
       - name: Package Release as 7z
@@ -64,6 +74,7 @@ jobs:
           $sfx = "$releaseDir\7z.sfx"
           $archive = "$releaseDir\DouyinParser.7z"
           $exeOut = "$releaseDir\DouyinParser.exe"
+
           Copy-Item $sfx $exeOut -Force
           Add-Content $exeOut -Value ([System.IO.File]::ReadAllBytes($archive))
 

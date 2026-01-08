@@ -34,5 +34,9 @@
 	<string>需要访问您的下载文件夹以保存视频文件</string>
 	<key>NSDesktopFolderUsageDescription</key>
 	<string>需要访问您的桌面文件夹以保存视频文件</string>
+	<key>CFBundleDisplayName</key>
+    <string>抖音视频解析</string>
+    <key>CFBundleName</key>
+    <string>抖音视频解析</string>
 </dict>
 </plist>

@@ -1,4 +1,5 @@
 import 'package:bot_toast/bot_toast.dart';
+import 'package:douyin_parser/services/download_service.dart';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import 'package:douyin_parser/models/app_settings.dart';
@@ -6,9 +7,12 @@ import 'package:douyin_parser/screens/home_screen.dart';
 import 'package:douyin_parser/screens/settings_screen.dart';
 import 'package:douyin_parser/utils/theme_manager.dart';
 
+final GlobalKey<NavigatorState> navigatorKey = GlobalKey<NavigatorState>();
+
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await ThemeManager.init();
+  await DownloadService.initializeDefaultSettings();
   runApp(const MyApp());
 }
 
@@ -23,6 +27,7 @@ class MyApp extends StatelessWidget {
         builder: (context, settings, child) {
           return MaterialApp(
             debugShowCheckedModeBanner: false,
+            navigatorKey: navigatorKey,
             title: '抖音视频解析工具',
             theme: ThemeData.light().copyWith(
               primaryColor: Colors.red,

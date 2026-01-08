@@ -21,45 +21,7 @@ class DownloadService {
   static const String _skipFilenameCustomKey = 'skip_filename_customization';
   static const String _skipLocationPromptKey = 'skip_location_prompt';
   static const String _lastDirectoryKey = 'last_download_directory';
-
-  static String get skipFilenameCustomizationKey => _skipFilenameCustomKey;
-  static String get skipLocationPromptKey => _skipLocationPromptKey;
-  static String get lastDirectoryKey => _lastDirectoryKey;
-  static String get rememberLocationKey => _rememberLocationKey;
-
-  // 获取设置的公共方法
-  static Future<bool> getSkipFilenameCustomization() async {
-    return await _getSetting(_skipFilenameCustomKey, false) as bool;
-  }
-
-  static Future<bool> getSkipLocationPrompt() async {
-    return await _getSetting(_skipLocationPromptKey, false) as bool;
-  }
-
-  static Future<String> getLastDirectory() async {
-    return await _getSetting(_lastDirectoryKey, '') as String;
-  }
-
-  static Future<bool> getRememberLocation() async {
-    return await _getSetting(_rememberLocationKey, false) as bool;
-  }
-
-  // 设置设置的公共方法
-  static Future<void> setSkipFilenameCustomization(bool value) async {
-    await _saveSetting(_skipFilenameCustomKey, value);
-  }
-
-  static Future<void> setSkipLocationPrompt(bool value) async {
-    await _saveSetting(_skipLocationPromptKey, value);
-  }
-
-  static Future<void> setLastDirectory(String value) async {
-    await _saveSetting(_lastDirectoryKey, value);
-  }
-
-  static Future<void> setRememberLocation(bool value) async {
-    await _saveSetting(_rememberLocationKey, value);
-  }
+  static const String _hasMacOSPermissionKey = 'macos_has_directory_permission';
 
   // 添加 formatFileSize 为公共静态方法
   static String formatFileSize(int bytes) {
@@ -67,6 +29,28 @@ class DownloadService {
     const suffixes = ["B", "KB", "MB", "GB", "TB"];
     final i = (log(bytes) / log(1024)).floor();
     return '${(bytes / pow(1024, i)).toStringAsFixed(1)} ${suffixes[i]}';
+  }
+
+  // 初始化默认设置
+  static Future<void> initializeDefaultSettings() async {
+    final prefs = await SharedPreferences.getInstance();
+
+    // 确保 skipFilenameCustomization 默认为 false（显示重命名窗口）
+    if (!prefs.containsKey(_skipFilenameCustomKey)) {
+      await prefs.setBool(_skipFilenameCustomKey, false);
+    }
+
+    // 确保 skipLocationPrompt 默认为 false（显示位置选择）
+    if (!prefs.containsKey(_skipLocationPromptKey)) {
+      await prefs.setBool(_skipLocationPromptKey, false);
+    }
+
+    // 确保 rememberLocation 默认为 false
+    if (!prefs.containsKey(_rememberLocationKey)) {
+      await prefs.setBool(_rememberLocationKey, false);
+    }
+
+    print('默认设置初始化完成');
   }
 
   // 保存设置到SharedPreferences
@@ -110,7 +94,7 @@ class DownloadService {
     return defaultValue;
   }
 
-  // 检查目录是否有写入权限（简化版）
+  // 检查目录是否有写入权限
   static Future<bool> checkDirectoryAccess(String directoryPath) async {
     try {
       final dir = Directory(directoryPath);
@@ -163,33 +147,40 @@ class DownloadService {
     }
 
     try {
-      // 1. 检查用户是否设置了保存位置
-      final lastDirectory = await _getSetting(_lastDirectoryKey, '') as String;
-      final skipLocationPrompt =
-          await _getSetting(_skipLocationPromptKey, false) as bool;
+      // 1. 检查用户是否跳过了位置提示
+      final skipLocationPrompt = await getSkipLocationPrompt();
 
-      // 如果有上次保存的目录且跳过了位置提示
-      if (lastDirectory.isNotEmpty && skipLocationPrompt) {
-        print('用户跳过了位置提示，使用上次目录: $lastDirectory');
+      // 如果用户跳过了位置提示，检查是否有保存的目录
+      if (skipLocationPrompt) {
+        final lastDirectory = await getLastDirectory();
 
-        // 检查权限是否仍然有效
-        final hasAccess = await checkDirectoryAccess(lastDirectory);
-        if (hasAccess) {
-          print('目录权限有效');
-          return lastDirectory;
-        } else {
-          print('目录权限失效，需要重新选择');
-          // macOS 应用重启后权限可能失效，这里返回 null 会触发位置选择
-          return null;
+        if (lastDirectory.isNotEmpty) {
+          print('用户跳过了位置提示，检查上次目录: $lastDirectory');
+
+          // 检查权限是否仍然有效
+          final hasAccess = await checkDirectoryAccess(lastDirectory);
+          if (hasAccess) {
+            print('目录权限有效，使用上次目录');
+            return lastDirectory;
+          } else {
+            print('目录权限失效，清除跳过位置提示设置');
+            // 清除设置，让用户重新选择
+            await setSkipLocationPrompt(false);
+            await setLastDirectory('');
+          }
         }
       }
 
-      // 2. 检查目录是否存在且有权限
+      // 2. 检查是否有上次保存的目录（即使没有跳过位置提示）
+      final lastDirectory = await getLastDirectory();
       if (lastDirectory.isNotEmpty) {
         final hasAccess = await checkDirectoryAccess(lastDirectory);
         if (hasAccess) {
           print('使用上次保存的目录: $lastDirectory');
           return lastDirectory;
+        } else {
+          print('上次保存的目录权限失效: $lastDirectory');
+          await setLastDirectory('');
         }
       }
 
@@ -200,7 +191,7 @@ class DownloadService {
         final hasAccess = await checkDirectoryAccess(downloadsPath);
         if (hasAccess) {
           print('使用下载目录: $downloadsPath');
-          await _saveSetting(_lastDirectoryKey, downloadsPath);
+          await setLastDirectory(downloadsPath);
           return downloadsPath;
         }
       }
@@ -331,14 +322,21 @@ class DownloadService {
     }
   }
 
-  // 显示桌面端保存对话框（macOS和Windows）
+  // 显示桌面端保存对话框
   static Future<String?> _showDesktopSaveDialog(
     BuildContext context,
     String defaultFileName,
   ) async {
     try {
-      // 1. 检查是否有可用的目录（根据用户设置）
-      final availableDir = await getAvailableDirectory();
+      // 1. 检查用户是否跳过了位置提示
+      final skipLocationPrompt = await getSkipLocationPrompt();
+      String? availableDir;
+
+      // 只有用户跳过了位置提示才尝试获取可用目录
+      if (skipLocationPrompt) {
+        availableDir = await getAvailableDirectory();
+        print('用户跳过了位置提示，可用目录: $availableDir');
+      }
 
       // 2. 显示统一的保存对话框
       return await _showSaveDialog(context, defaultFileName, availableDir);
@@ -348,17 +346,21 @@ class DownloadService {
     }
   }
 
-  // 统一的保存对话框（合并了位置确认和文件名自定义）
+  // 统一的保存对话框
   static Future<String?> _showSaveDialog(
     BuildContext context,
     String defaultFileName,
     String? availableDir,
   ) async {
     try {
-      // 如果可用目录为空，需要用户选择
       String? selectedDir = availableDir;
+      final skipLocationPrompt = await getSkipLocationPrompt();
 
-      if (selectedDir == null) {
+      // 如果可用目录为空，或者用户没有跳过位置提示，需要用户选择
+      if (selectedDir == null || !skipLocationPrompt) {
+        print(
+          '需要用户选择位置: availableDir=$availableDir, skipLocationPrompt=$skipLocationPrompt',
+        );
         _showInfoToast('请选择保存位置...');
 
         selectedDir = await FilePicker.platform.getDirectoryPath(
@@ -378,31 +380,29 @@ class DownloadService {
           _showErrorToast('没有该目录的写入权限，请选择其他目录');
           return null;
         }
+      } else {
+        print('使用现有目录: $selectedDir');
       }
 
-      // 读取用户设置
-      final skipLocationPrompt =
-          await _getSetting(_skipLocationPromptKey, false) as bool;
-      final skipFilenameCustom =
-          await _getSetting(_skipFilenameCustomKey, false) as bool;
+      // 检查是否跳过文件名自定义
+      final skipFilenameCustom = await getSkipFilenameCustomization();
+      print('skipFilenameCustom: $skipFilenameCustom');
 
-      // 如果用户已经设置了跳过文件名自定义，直接生成路径
+      // 如果用户跳过了文件名自定义，直接生成路径
       if (skipFilenameCustom) {
-        final filePath = path.join(selectedDir, '$defaultFileName.mp4');
+        final filePath = path.join(selectedDir!, '$defaultFileName.mp4');
         print('跳过文件名自定义，直接保存到: $filePath');
 
         // 保存目录设置
-        await _saveSetting(_lastDirectoryKey, selectedDir);
+        await setLastDirectory(selectedDir);
         return filePath;
       }
 
       // 显示统一的对话框（包含目录确认和文件名输入）
       return await _showUnifiedSaveDialog(
         context,
-        selectedDir,
+        selectedDir!,
         defaultFileName,
-        skipLocationPrompt,
-        skipFilenameCustom,
       );
     } catch (e) {
       print('显示保存对话框失败: $e');
@@ -410,17 +410,16 @@ class DownloadService {
     }
   }
 
-  // 统一的保存对话框（合并功能）
+  // 统一的保存对话框
   static Future<String?> _showUnifiedSaveDialog(
     BuildContext context,
     String selectedDir,
     String defaultFileName,
-    bool currentSkipLocationPrompt,
-    bool currentSkipFilenameCustom,
   ) async {
     try {
-      bool skipLocationPrompt = currentSkipLocationPrompt;
-      bool skipFilenameCustom = currentSkipFilenameCustom;
+      bool skipLocationPrompt = await getSkipLocationPrompt();
+      bool skipFilenameCustom = await getSkipFilenameCustomization();
+
       final TextEditingController controller = TextEditingController(
         text: defaultFileName,
       );
@@ -462,7 +461,7 @@ class DownloadService {
                           final newDir = await FilePicker.platform
                               .getDirectoryPath(dialogTitle: '选择新的保存位置');
                           if (newDir != null && newDir.isNotEmpty) {
-                            // 这里需要更新状态，但为了简化，我们只重新打开对话框
+                            // 直接更新目录，重新打开对话框
                             Navigator.of(context).pop({
                               'action': 'change_location',
                               'directory': newDir,
@@ -546,19 +545,13 @@ class DownloadService {
       // 处理更改位置的情况
       if (result['action'] == 'change_location') {
         final newDir = result['directory'] as String;
-        return await _showUnifiedSaveDialog(
-          context,
-          newDir,
-          defaultFileName,
-          skipLocationPrompt,
-          skipFilenameCustom,
-        );
+        return await _showUnifiedSaveDialog(context, newDir, defaultFileName);
       }
 
       // 保存用户设置
-      await _saveSetting(_skipLocationPromptKey, result['skipLocationPrompt']);
-      await _saveSetting(_skipFilenameCustomKey, result['skipFilenameCustom']);
-      await _saveSetting(_lastDirectoryKey, selectedDir);
+      await setSkipLocationPrompt(result['skipLocationPrompt']);
+      await setSkipFilenameCustomization(result['skipFilenameCustom']);
+      await setLastDirectory(selectedDir);
 
       // 构建完整路径
       String fileName = result['fileName'];
@@ -964,21 +957,61 @@ class DownloadService {
     }
   }
 
+  // 公共访问方法
+  static Future<bool> getSkipFilenameCustomization() async {
+    return await _getSetting(_skipFilenameCustomKey, false) as bool;
+  }
+
+  static Future<bool> getSkipLocationPrompt() async {
+    return await _getSetting(_skipLocationPromptKey, false) as bool;
+  }
+
+  static Future<String> getLastDirectory() async {
+    return await _getSetting(_lastDirectoryKey, '') as String;
+  }
+
+  static Future<bool> getRememberLocation() async {
+    return await _getSetting(_rememberLocationKey, false) as bool;
+  }
+
+  // 公共设置方法
+  static Future<void> setSkipFilenameCustomization(bool value) async {
+    await _saveSetting(_skipFilenameCustomKey, value);
+  }
+
+  static Future<void> setSkipLocationPrompt(bool value) async {
+    await _saveSetting(_skipLocationPromptKey, value);
+  }
+
+  static Future<void> setLastDirectory(String value) async {
+    await _saveSetting(_lastDirectoryKey, value);
+  }
+
+  static Future<void> setRememberLocation(bool value) async {
+    await _saveSetting(_rememberLocationKey, value);
+  }
+
   // 获取当前保存位置
   static Future<String?> getCurrentSaveLocation() async {
-    final location = await _getSetting(_lastDirectoryKey, '') as String;
+    final location = await getLastDirectory();
     return location.isNotEmpty ? location : null;
   }
 
   // 设置保存位置
   static Future<void> setSaveLocation(String path) async {
-    await _saveSetting(_lastDirectoryKey, path);
+    await setLastDirectory(path);
   }
 
   // 重置保存位置设置
   static Future<void> resetSaveLocationSettings() async {
     await _saveSetting(_skipLocationPromptKey, false);
+    await _saveSetting(_skipFilenameCustomKey, false);
     await _saveSetting(_lastDirectoryKey, '');
+    await _saveSetting(_rememberLocationKey, false);
+    if (Platform.isMacOS) {
+      await _saveSetting(_hasMacOSPermissionKey, false);
+    }
+    print('保存位置设置已重置');
   }
 
   static String generateFileName() {

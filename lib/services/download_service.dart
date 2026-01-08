@@ -19,10 +19,47 @@ class DownloadService {
   // 存储设置的键名
   static const String _rememberLocationKey = 'remember_download_location';
   static const String _skipFilenameCustomKey = 'skip_filename_customization';
-  static const String _skipLocationPromptKey =
-      'skip_location_prompt'; // 新增：跳过位置提示
+  static const String _skipLocationPromptKey = 'skip_location_prompt';
   static const String _lastDirectoryKey = 'last_download_directory';
-  static const String _hasMacOSPermissionKey = 'macos_has_directory_permission';
+
+  static String get skipFilenameCustomizationKey => _skipFilenameCustomKey;
+  static String get skipLocationPromptKey => _skipLocationPromptKey;
+  static String get lastDirectoryKey => _lastDirectoryKey;
+  static String get rememberLocationKey => _rememberLocationKey;
+
+  // 获取设置的公共方法
+  static Future<bool> getSkipFilenameCustomization() async {
+    return await _getSetting(_skipFilenameCustomKey, false) as bool;
+  }
+
+  static Future<bool> getSkipLocationPrompt() async {
+    return await _getSetting(_skipLocationPromptKey, false) as bool;
+  }
+
+  static Future<String> getLastDirectory() async {
+    return await _getSetting(_lastDirectoryKey, '') as String;
+  }
+
+  static Future<bool> getRememberLocation() async {
+    return await _getSetting(_rememberLocationKey, false) as bool;
+  }
+
+  // 设置设置的公共方法
+  static Future<void> setSkipFilenameCustomization(bool value) async {
+    await _saveSetting(_skipFilenameCustomKey, value);
+  }
+
+  static Future<void> setSkipLocationPrompt(bool value) async {
+    await _saveSetting(_skipLocationPromptKey, value);
+  }
+
+  static Future<void> setLastDirectory(String value) async {
+    await _saveSetting(_lastDirectoryKey, value);
+  }
+
+  static Future<void> setRememberLocation(bool value) async {
+    await _saveSetting(_rememberLocationKey, value);
+  }
 
   // 添加 formatFileSize 为公共静态方法
   static String formatFileSize(int bytes) {
@@ -73,26 +110,25 @@ class DownloadService {
     return defaultValue;
   }
 
-  // 检查macOS是否有目录访问权限（带缓存）
-  static Future<bool> checkMacOSDirectoryAccess(String directoryPath) async {
-    if (!Platform.isMacOS) return true;
-
+  // 检查目录是否有写入权限（简化版）
+  static Future<bool> checkDirectoryAccess(String directoryPath) async {
     try {
-      // 检查目录是否存在
       final dir = Directory(directoryPath);
       if (!await dir.exists()) {
-        print('macOS目录不存在: $directoryPath');
+        print('目录不存在: $directoryPath');
         return false;
       }
 
       // 尝试在目录中创建一个临时文件来测试权限
-      final tempFilePath =
-          '$directoryPath/.douyin_permission_test_${DateTime.now().millisecondsSinceEpoch}.tmp';
+      final tempFilePath = path.join(
+        directoryPath,
+        '.temp_test_${DateTime.now().millisecondsSinceEpoch}.tmp',
+      );
       final tempFile = File(tempFilePath);
 
       try {
         // 尝试写入
-        await tempFile.writeAsString('permission_test', flush: true);
+        await tempFile.writeAsString('test', flush: true);
 
         // 尝试读取
         await tempFile.readAsString();
@@ -102,10 +138,10 @@ class DownloadService {
           await tempFile.delete();
         }
 
-        print('macOS目录权限检查通过: $directoryPath');
+        print('目录权限检查通过: $directoryPath');
         return true;
       } catch (e) {
-        print('macOS目录权限检查失败: $e');
+        print('目录权限检查失败: $e');
         // 清理可能创建的临时文件
         if (await tempFile.exists()) {
           try {
@@ -115,92 +151,63 @@ class DownloadService {
         return false;
       }
     } catch (e) {
-      print('macOS目录权限检查异常: $e');
+      print('目录权限检查异常: $e');
       return false;
     }
   }
 
-  // 检查是否是macOS沙盒目录
-  static bool isMacOSSandboxDirectory(String directoryPath) {
-    if (!Platform.isMacOS) return false;
-    return directoryPath.contains('Library/Containers/');
-  }
-
-  // 获取macOS可用的保存目录
-  static Future<String?> getAvailableMacOSDirectory() async {
-    if (!Platform.isMacOS) return null;
+  // 获取可用的保存目录
+  static Future<String?> getAvailableDirectory() async {
+    if (!Platform.isMacOS && !Platform.isWindows && !Platform.isLinux) {
+      return null; // 仅桌面平台使用
+    }
 
     try {
-      // 1. 检查是否保存了上次的目录
+      // 1. 检查用户是否设置了保存位置
       final lastDirectory = await _getSetting(_lastDirectoryKey, '') as String;
       final skipLocationPrompt =
           await _getSetting(_skipLocationPromptKey, false) as bool;
-      final hasPermissionFlag =
-          await _getSetting(_hasMacOSPermissionKey, false) as bool;
 
       // 如果有上次保存的目录且跳过了位置提示
       if (lastDirectory.isNotEmpty && skipLocationPrompt) {
-        print('macOS用户跳过了位置提示，使用上次目录: $lastDirectory');
+        print('用户跳过了位置提示，使用上次目录: $lastDirectory');
 
         // 检查权限是否仍然有效
-        final hasAccess = await checkMacOSDirectoryAccess(lastDirectory);
+        final hasAccess = await checkDirectoryAccess(lastDirectory);
         if (hasAccess) {
-          print('macOS目录权限有效');
+          print('目录权限有效');
           return lastDirectory;
         } else {
-          print('macOS目录权限失效，需要重新选择');
-          // 清除权限标志，让用户重新选择
-          await _saveSetting(_hasMacOSPermissionKey, false);
-          // 注意：这里不重置skipLocationPrompt，用户仍然希望跳过提示
+          print('目录权限失效，需要重新选择');
+          // macOS 应用重启后权限可能失效，这里返回 null 会触发位置选择
+          return null;
         }
       }
 
-      // 2. 检查目录是否在沙盒内
-      if (lastDirectory.isNotEmpty && isMacOSSandboxDirectory(lastDirectory)) {
-        print('macOS目录在沙盒内，需要用户选择新位置');
-        // 沙盒内的目录应该提示用户选择
-        return null; // 返回null会触发位置选择
-      }
-
-      // 3. 如果有上次目录且权限有效，直接使用
-      if (lastDirectory.isNotEmpty && hasPermissionFlag) {
-        final hasAccess = await checkMacOSDirectoryAccess(lastDirectory);
+      // 2. 检查目录是否存在且有权限
+      if (lastDirectory.isNotEmpty) {
+        final hasAccess = await checkDirectoryAccess(lastDirectory);
         if (hasAccess) {
-          print('macOS使用上次保存的目录（权限有效）: $lastDirectory');
+          print('使用上次保存的目录: $lastDirectory');
           return lastDirectory;
-        } else {
-          print('macOS上次保存的目录权限已失效: $lastDirectory');
-          await _saveSetting(_hasMacOSPermissionKey, false);
         }
       }
 
-      // 4. 尝试获取默认下载目录
+      // 3. 尝试获取默认下载目录
       final downloadsDir = await getDownloadsDirectory();
       if (downloadsDir != null) {
         final downloadsPath = downloadsDir.path;
-        final hasAccess = await checkMacOSDirectoryAccess(downloadsPath);
-        if (hasAccess && !isMacOSSandboxDirectory(downloadsPath)) {
-          print('macOS使用下载目录: $downloadsPath');
+        final hasAccess = await checkDirectoryAccess(downloadsPath);
+        if (hasAccess) {
+          print('使用下载目录: $downloadsPath');
           await _saveSetting(_lastDirectoryKey, downloadsPath);
-          await _saveSetting(_hasMacOSPermissionKey, true);
           return downloadsPath;
         }
       }
 
-      // 5. 尝试获取文档目录
-      final documentsDir = await getApplicationDocumentsDirectory();
-      final documentsPath = documentsDir.path;
-      final hasAccess = await checkMacOSDirectoryAccess(documentsPath);
-      if (hasAccess && !isMacOSSandboxDirectory(documentsPath)) {
-        print('macOS使用文档目录: $documentsPath');
-        await _saveSetting(_lastDirectoryKey, documentsPath);
-        await _saveSetting(_hasMacOSPermissionKey, true);
-        return documentsPath;
-      }
-
       return null; // 没有可用的目录
     } catch (e) {
-      print('获取macOS可用目录失败: $e');
+      print('获取可用目录失败: $e');
       return null;
     }
   }
@@ -330,288 +337,90 @@ class DownloadService {
     String defaultFileName,
   ) async {
     try {
-      final platform = Platform.operatingSystem;
-      print('显示${platform}保存对话框...');
+      // 1. 检查是否有可用的目录（根据用户设置）
+      final availableDir = await getAvailableDirectory();
 
-      // macOS：检查是否需要提示位置
-      if (Platform.isMacOS) {
-        final skipLocationPrompt =
-            await _getSetting(_skipLocationPromptKey, false) as bool;
-
-        // 如果用户已经跳过了位置提示，直接尝试使用现有目录
-        if (skipLocationPrompt) {
-          final availableDir = await getAvailableMacOSDirectory();
-          if (availableDir != null) {
-            print('macOS用户跳过了位置提示，使用现有目录: $availableDir');
-
-            // 检查是否跳过文件名自定义
-            final skipFilenameCustom =
-                await _getSetting(_skipFilenameCustomKey, false) as bool;
-            if (skipFilenameCustom) {
-              // 跳过文件名自定义，直接使用默认文件名
-              final filePath = path.join(availableDir, '$defaultFileName.mp4');
-              print('macOS跳过文件名自定义，直接保存到: $filePath');
-              return filePath;
-            } else {
-              // 显示文件名输入对话框
-              return await _showFilenameInputDialog(
-                context,
-                availableDir,
-                defaultFileName,
-              );
-            }
-          }
-        }
-
-        // 检查是否有可用的目录
-        final availableDir = await getAvailableMacOSDirectory();
-        if (availableDir != null) {
-          print('macOS找到可用目录: $availableDir');
-
-          // 检查是否跳过文件名自定义
-          final skipFilenameCustom =
-              await _getSetting(_skipFilenameCustomKey, false) as bool;
-          if (skipFilenameCustom) {
-            // 跳过文件名自定义，直接使用默认文件名
-            final filePath = path.join(availableDir, '$defaultFileName.mp4');
-            print('macOS跳过文件名自定义，直接保存到: $filePath');
-            return filePath;
-          } else {
-            // 显示文件名输入对话框
-            return await _showFilenameInputDialog(
-              context,
-              availableDir,
-              defaultFileName,
-            );
-          }
-        }
-
-        // 没有可用目录，需要用户选择位置
-        print('macOS需要用户选择保存位置');
-        return await _promptUserForSaveLocation(context, defaultFileName);
-      }
-
-      // Windows：检查用户设置
-      if (Platform.isWindows) {
-        final rememberLocation =
-            await _getSetting(_rememberLocationKey, false) as bool;
-        final skipFilenameCustom =
-            await _getSetting(_skipFilenameCustomKey, false) as bool;
-        final lastDirectory =
-            await _getSetting(_lastDirectoryKey, '') as String;
-
-        // 如果记住位置且有上次保存的目录，并且目录存在，直接使用
-        if (rememberLocation &&
-            lastDirectory.isNotEmpty &&
-            Directory(lastDirectory).existsSync()) {
-          print('Windows：使用上次保存的目录: $lastDirectory');
-
-          if (skipFilenameCustom) {
-            // 跳过文件名自定义，直接使用默认文件名
-            final filePath = path.join(lastDirectory, '$defaultFileName.mp4');
-            print('跳过文件名自定义，直接保存到: $filePath');
-            return filePath;
-          } else {
-            // 需要自定义文件名
-            return await _showFilenameInputDialog(
-              context,
-              lastDirectory,
-              defaultFileName,
-            );
-          }
-        }
-      }
-
-      // 显示保存对话框让用户选择位置
-      return await _promptUserForSaveLocation(context, defaultFileName);
+      // 2. 显示统一的保存对话框
+      return await _showSaveDialog(context, defaultFileName, availableDir);
     } catch (e) {
       print('显示保存对话框失败: $e');
       return null;
     }
   }
 
-  // 提示用户选择保存位置（核心方法）- 添加"不再提示"选项
-  static Future<String?> _promptUserForSaveLocation(
+  // 统一的保存对话框（合并了位置确认和文件名自定义）
+  static Future<String?> _showSaveDialog(
     BuildContext context,
     String defaultFileName,
+    String? availableDir,
   ) async {
     try {
-      // 如果是macOS且目录在沙盒内，显示特定的提示信息
-      final lastDirectory = await _getSetting(_lastDirectoryKey, '') as String;
-      bool isSandboxDir =
-          Platform.isMacOS && isMacOSSandboxDirectory(lastDirectory);
+      // 如果可用目录为空，需要用户选择
+      String? selectedDir = availableDir;
 
-      if (isSandboxDir) {
-        print('macOS沙盒目录检测: $lastDirectory');
-        _showInfoToast('当前目录在应用沙盒内，请选择新的保存位置...');
-      } else {
+      if (selectedDir == null) {
         _showInfoToast('请选择保存位置...');
+
+        selectedDir = await FilePicker.platform.getDirectoryPath(
+          dialogTitle: '选择视频保存位置',
+        );
+
+        if (selectedDir == null || selectedDir.isEmpty) {
+          print('用户取消选择目录');
+          return null;
+        }
+
+        print('用户选择的目录: $selectedDir');
+
+        // 检查目录权限
+        final hasAccess = await checkDirectoryAccess(selectedDir);
+        if (!hasAccess) {
+          _showErrorToast('没有该目录的写入权限，请选择其他目录');
+          return null;
+        }
       }
 
-      // 1. 先让用户选择目录
-      String? selectedDir = await FilePicker.platform.getDirectoryPath(
-        dialogTitle: isSandboxDir ? '选择视频保存位置（当前目录在沙盒内）' : '选择视频保存位置',
-      );
-
-      if (selectedDir == null || selectedDir.isEmpty) {
-        print('用户取消选择目录');
-        return null;
-      }
-
-      print('用户选择的目录: $selectedDir');
-
-      // 检查目录权限
-      final hasAccess = await checkMacOSDirectoryAccess(selectedDir);
-      if (!hasAccess) {
-        _showErrorToast('没有该目录的写入权限，请选择其他目录');
-        return null;
-      }
-
-      // 检查是否是macOS沙盒目录
-      if (Platform.isMacOS && isMacOSSandboxDirectory(selectedDir)) {
-        _showErrorToast('请不要选择应用沙盒内的目录，请选择用户目录如"下载"或"文档"');
-        return null;
-      }
-
-      // 显示位置确认对话框（带"不再提示"选项）
-      final shouldSkipPrompt = await _showLocationConfirmationDialog(
-        context,
-        selectedDir,
-        isSandboxDir,
-      );
-
-      if (shouldSkipPrompt == null) {
-        print('用户取消了位置确认');
-        return null;
-      }
-
-      // 保存用户的选择
-      final skipPrompt = shouldSkipPrompt;
-      await _saveSetting(_skipLocationPromptKey, skipPrompt);
-
-      // 保存选择的目录和权限状态
-      await _saveSetting(_lastDirectoryKey, selectedDir);
-      if (Platform.isMacOS) {
-        await _saveSetting(_hasMacOSPermissionKey, true);
-      }
-
-      // 检查是否跳过文件名自定义
+      // 读取用户设置
+      final skipLocationPrompt =
+          await _getSetting(_skipLocationPromptKey, false) as bool;
       final skipFilenameCustom =
           await _getSetting(_skipFilenameCustomKey, false) as bool;
+
+      // 如果用户已经设置了跳过文件名自定义，直接生成路径
       if (skipFilenameCustom) {
-        // 跳过文件名自定义，直接使用默认文件名
         final filePath = path.join(selectedDir, '$defaultFileName.mp4');
         print('跳过文件名自定义，直接保存到: $filePath');
+
+        // 保存目录设置
+        await _saveSetting(_lastDirectoryKey, selectedDir);
         return filePath;
       }
 
-      // 显示对话框让用户输入文件名和选择选项
-      return await _showFilenameInputDialog(
+      // 显示统一的对话框（包含目录确认和文件名输入）
+      return await _showUnifiedSaveDialog(
         context,
         selectedDir,
         defaultFileName,
+        skipLocationPrompt,
+        skipFilenameCustom,
       );
     } catch (e) {
-      print('提示用户选择保存位置失败: $e');
+      print('显示保存对话框失败: $e');
       return null;
     }
   }
 
-  // 显示位置确认对话框（带"不再提示"选项）
-  static Future<bool?> _showLocationConfirmationDialog(
-    BuildContext context,
-    String selectedDir,
-    bool isSandboxDir,
-  ) async {
-    try {
-      bool skipFuturePrompts = false;
-
-      return await showDialog<bool>(
-        context: context,
-        barrierDismissible: false,
-        builder: (context) {
-          return StatefulBuilder(
-            builder: (context, setState) {
-              return AlertDialog(
-                title: Text(isSandboxDir ? '更换保存位置' : '确认保存位置'),
-                content: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text('您选择的保存位置是:'),
-                    SizedBox(height: 8),
-                    Container(
-                      padding: EdgeInsets.all(12),
-                      decoration: BoxDecoration(
-                        color: Colors.grey[100],
-                        borderRadius: BorderRadius.circular(8),
-                      ),
-                      child: SelectableText(
-                        selectedDir,
-                        style: TextStyle(fontFamily: 'Menlo', fontSize: 12),
-                      ),
-                    ),
-                    SizedBox(height: 16),
-                    if (isSandboxDir)
-                      Text(
-                        '✓ 已更换为非沙盒目录，可以正常保存文件',
-                        style: TextStyle(color: Colors.green, fontSize: 14),
-                      ),
-                    SizedBox(height: 16),
-                    CheckboxListTile(
-                      title: Text('不再提示保存位置'),
-                      subtitle: Text('下次直接使用此位置保存'),
-                      value: skipFuturePrompts,
-                      onChanged: (value) {
-                        setState(() {
-                          skipFuturePrompts = value ?? false;
-                        });
-                      },
-                      dense: true,
-                      contentPadding: EdgeInsets.zero,
-                    ),
-                  ],
-                ),
-                actions: [
-                  TextButton(
-                    onPressed: () => Navigator.of(context).pop(false),
-                    child: Text('取消'),
-                  ),
-                  ElevatedButton(
-                    onPressed:
-                        () => Navigator.of(context).pop(skipFuturePrompts),
-                    child: Text('确认'),
-                  ),
-                ],
-              );
-            },
-          );
-        },
-      );
-    } catch (e) {
-      print('显示位置确认对话框失败: $e');
-      return false;
-    }
-  }
-
-  // 显示文件名输入对话框（带复选框选项）
-  static Future<String?> _showFilenameInputDialog(
+  // 统一的保存对话框（合并功能）
+  static Future<String?> _showUnifiedSaveDialog(
     BuildContext context,
     String selectedDir,
     String defaultFileName,
+    bool currentSkipLocationPrompt,
+    bool currentSkipFilenameCustom,
   ) async {
     try {
-      // 读取设置
-      bool rememberLocation = false;
-      bool skipFilenameCustom =
-          await _getSetting(_skipFilenameCustomKey, false) as bool;
-
-      // 只有Windows显示"记住位置"选项
-      if (Platform.isWindows) {
-        rememberLocation =
-            await _getSetting(_rememberLocationKey, false) as bool;
-      }
-
+      bool skipLocationPrompt = currentSkipLocationPrompt;
+      bool skipFilenameCustom = currentSkipFilenameCustom;
       final TextEditingController controller = TextEditingController(
         text: defaultFileName,
       );
@@ -623,41 +432,74 @@ class DownloadService {
           return StatefulBuilder(
             builder: (context, setState) {
               return AlertDialog(
-                title: Text('保存视频文件'),
+                title: const Text('保存视频文件'),
                 content: SingleChildScrollView(
                   child: Column(
                     mainAxisSize: MainAxisSize.min,
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      Text('保存到: $selectedDir'),
-                      SizedBox(height: 16),
+                      // 目录信息
+                      const Text('保存位置:'),
+                      const SizedBox(height: 4),
+                      Container(
+                        padding: const EdgeInsets.all(8),
+                        decoration: BoxDecoration(
+                          color: Colors.grey[100],
+                          borderRadius: BorderRadius.circular(4),
+                        ),
+                        child: SelectableText(
+                          selectedDir,
+                          style: const TextStyle(fontSize: 12),
+                        ),
+                      ),
+                      const SizedBox(height: 12),
+
+                      // 更改位置按钮
+                      OutlinedButton.icon(
+                        icon: const Icon(Icons.folder_open, size: 16),
+                        label: const Text('更改保存位置'),
+                        onPressed: () async {
+                          final newDir = await FilePicker.platform
+                              .getDirectoryPath(dialogTitle: '选择新的保存位置');
+                          if (newDir != null && newDir.isNotEmpty) {
+                            // 这里需要更新状态，但为了简化，我们只重新打开对话框
+                            Navigator.of(context).pop({
+                              'action': 'change_location',
+                              'directory': newDir,
+                            });
+                          }
+                        },
+                      ),
+                      const SizedBox(height: 16),
+
+                      // 文件名输入
                       TextField(
                         controller: controller,
-                        decoration: InputDecoration(
+                        decoration: const InputDecoration(
                           labelText: '文件名',
                           border: OutlineInputBorder(),
                           suffixText: '.mp4',
                         ),
                         autofocus: true,
                       ),
-                      SizedBox(height: 16),
-                      // 只有Windows显示"记住此保存位置"
-                      if (Platform.isWindows)
-                        CheckboxListTile(
-                          title: Text('记住此保存位置'),
-                          value: rememberLocation,
-                          onChanged: (value) {
-                            setState(() {
-                              rememberLocation = value ?? false;
-                            });
-                          },
-                          dense: true,
-                          contentPadding: EdgeInsets.zero,
-                        ),
-                      // Windows和macOS都显示"不再提示文件名自定义"
+                      const SizedBox(height: 16),
+
+                      // 选项
                       CheckboxListTile(
-                        title: Text('不再提示文件名自定义'),
-                        subtitle: Text('下次直接保存，不再弹出此窗口'),
+                        title: const Text('不再提示保存位置'),
+                        subtitle: const Text('下次直接使用此位置保存'),
+                        value: skipLocationPrompt,
+                        onChanged: (value) {
+                          setState(() {
+                            skipLocationPrompt = value ?? false;
+                          });
+                        },
+                        dense: true,
+                        contentPadding: EdgeInsets.zero,
+                      ),
+                      CheckboxListTile(
+                        title: const Text('不再提示文件名自定义'),
+                        subtitle: const Text('下次直接保存，不再弹出此窗口'),
                         value: skipFilenameCustom,
                         onChanged: (value) {
                           setState(() {
@@ -673,7 +515,7 @@ class DownloadService {
                 actions: [
                   TextButton(
                     onPressed: () => Navigator.of(context).pop(null),
-                    child: Text('取消'),
+                    child: const Text('取消'),
                   ),
                   ElevatedButton(
                     onPressed: () {
@@ -682,12 +524,13 @@ class DownloadService {
                         fileName = defaultFileName;
                       }
                       Navigator.of(context).pop({
+                        'action': 'save',
                         'fileName': fileName,
-                        'rememberLocation': rememberLocation,
+                        'skipLocationPrompt': skipLocationPrompt,
                         'skipFilenameCustom': skipFilenameCustom,
                       });
                     },
-                    child: Text('保存'),
+                    child: const Text('保存'),
                   ),
                 ],
               );
@@ -700,13 +543,22 @@ class DownloadService {
         return null;
       }
 
-      // 保存用户设置
-      if (Platform.isWindows) {
-        await _saveSetting(_rememberLocationKey, result['rememberLocation']);
+      // 处理更改位置的情况
+      if (result['action'] == 'change_location') {
+        final newDir = result['directory'] as String;
+        return await _showUnifiedSaveDialog(
+          context,
+          newDir,
+          defaultFileName,
+          skipLocationPrompt,
+          skipFilenameCustom,
+        );
       }
 
-      // Windows和macOS都保存"跳过文件名自定义"设置
+      // 保存用户设置
+      await _saveSetting(_skipLocationPromptKey, result['skipLocationPrompt']);
       await _saveSetting(_skipFilenameCustomKey, result['skipFilenameCustom']);
+      await _saveSetting(_lastDirectoryKey, selectedDir);
 
       // 构建完整路径
       String fileName = result['fileName'];
@@ -719,7 +571,7 @@ class DownloadService {
 
       return fullPath;
     } catch (e) {
-      print('显示文件名输入对话框失败: $e');
+      print('显示统一保存对话框失败: $e');
       return null;
     }
   }
@@ -730,7 +582,7 @@ class DownloadService {
     String fileName,
     Function(int received, int total)? progressCallback,
     CancelToken? cancelToken,
-    BuildContext context, // 这里改为非可选参数
+    BuildContext context,
   ) async {
     try {
       print('开始下载流程，平台: ${Platform.operatingSystem}');
@@ -751,7 +603,7 @@ class DownloadService {
       // 获取保存路径
       String? filePath;
 
-      if (Platform.isMacOS || Platform.isWindows) {
+      if (Platform.isMacOS || Platform.isWindows || Platform.isLinux) {
         print('桌面平台，显示保存对话框...');
         // 显示保存对话框
         filePath = await _showDesktopSaveDialog(context, fileName);
@@ -766,8 +618,8 @@ class DownloadService {
         print('移动端平台，使用默认路径...');
         filePath = await _getDefaultFilePath(fileName);
       } else {
-        // Linux：使用下载目录
-        print('Linux平台，使用下载目录...');
+        // 其他平台
+        print('其他平台，使用下载目录...');
         filePath = await _getDesktopFilePath(fileName);
       }
 
@@ -902,7 +754,7 @@ class DownloadService {
     }
   }
 
-  // 获取桌面端文件路径（Linux）
+  // 获取桌面端文件路径
   static Future<String?> _getDesktopFilePath(String fileName) async {
     try {
       final downloadsDir = await getDownloadsDirectory();
@@ -950,7 +802,7 @@ class DownloadService {
         false;
   }
 
-  // 显示下载完成对话框（仅桌面端）- 修改为不自动关闭
+  // 显示下载完成对话框（仅桌面端）
   static Future<void> _showDownloadCompleteDialog(
     String filePath,
     int fileSize,
@@ -1029,7 +881,7 @@ class DownloadService {
     BotToast.showAttachedWidget(
       attachedBuilder:
           (_) => Card(
-            margin: EdgeInsets.all(10),
+            margin: const EdgeInsets.all(10),
             child: Padding(
               padding: const EdgeInsets.all(16.0),
               child: Column(
@@ -1039,23 +891,23 @@ class DownloadService {
                     '权限被拒绝',
                     style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
                   ),
-                  SizedBox(height: 8),
-                  Text('请在系统设置中授予存储权限以继续下载'),
-                  SizedBox(height: 16),
+                  const SizedBox(height: 8),
+                  const Text('请在系统设置中授予存储权限以继续下载'),
+                  const SizedBox(height: 16),
                   Row(
                     mainAxisAlignment: MainAxisAlignment.end,
                     children: [
                       TextButton(
                         onPressed: () => BotToast.cleanAll(),
-                        child: Text('取消'),
+                        child: const Text('取消'),
                       ),
-                      SizedBox(width: 8),
+                      const SizedBox(width: 8),
                       ElevatedButton(
                         onPressed: () {
                           BotToast.cleanAll();
                           openAppSettings();
                         },
-                        child: Text('去设置'),
+                        child: const Text('去设置'),
                       ),
                     ],
                   ),
@@ -1063,8 +915,8 @@ class DownloadService {
               ),
             ),
           ),
-      duration: Duration(seconds: 10),
-      target: Offset(0, 0),
+      duration: const Duration(seconds: 10),
+      target: const Offset(0, 0),
       preferDirection: PreferDirection.topRight,
     );
   }
@@ -1112,6 +964,23 @@ class DownloadService {
     }
   }
 
+  // 获取当前保存位置
+  static Future<String?> getCurrentSaveLocation() async {
+    final location = await _getSetting(_lastDirectoryKey, '') as String;
+    return location.isNotEmpty ? location : null;
+  }
+
+  // 设置保存位置
+  static Future<void> setSaveLocation(String path) async {
+    await _saveSetting(_lastDirectoryKey, path);
+  }
+
+  // 重置保存位置设置
+  static Future<void> resetSaveLocationSettings() async {
+    await _saveSetting(_skipLocationPromptKey, false);
+    await _saveSetting(_lastDirectoryKey, '');
+  }
+
   static String generateFileName() {
     final now = DateTime.now();
     return 'douyin_${now.year}${now.month.toString().padLeft(2, '0')}${now.day.toString().padLeft(2, '0')}_${now.hour}${now.minute}${now.second}';
@@ -1131,27 +1000,27 @@ class DownloadService {
   static void _showSuccessToast(String message) {
     BotToast.showText(
       text: message,
-      duration: Duration(seconds: 3),
+      duration: const Duration(seconds: 3),
       contentColor: Colors.green,
-      textStyle: TextStyle(color: Colors.white, fontSize: 14),
+      textStyle: const TextStyle(color: Colors.white, fontSize: 14),
     );
   }
 
   static void _showErrorToast(String message) {
     BotToast.showText(
       text: message,
-      duration: Duration(seconds: 4),
+      duration: const Duration(seconds: 4),
       contentColor: Colors.red,
-      textStyle: TextStyle(color: Colors.white, fontSize: 14),
+      textStyle: const TextStyle(color: Colors.white, fontSize: 14),
     );
   }
 
   static void _showInfoToast(String message) {
     BotToast.showText(
       text: message,
-      duration: Duration(seconds: 2),
+      duration: const Duration(seconds: 2),
       contentColor: Colors.blue,
-      textStyle: TextStyle(color: Colors.white, fontSize: 14),
+      textStyle: const TextStyle(color: Colors.white, fontSize: 14),
     );
   }
 }

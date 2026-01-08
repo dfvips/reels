@@ -124,7 +124,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
           ),
           const Divider(height: 1),
 
-          // 清除缓存 - 显示缓存大小
+          // 清除缓存 - 显示缓存大小和位置
           Material(
             color: Theme.of(context).colorScheme.surface,
             child: InkWell(
@@ -160,15 +160,31 @@ class _SettingsScreenState extends State<SettingsScreen> {
                           const SizedBox(height: 4),
                           Consumer<AppSettings>(
                             builder: (context, settings, child) {
-                              return Text(
-                                '当前缓存: ${settings.cacheSize}',
-                                style: TextStyle(
-                                  fontSize: 14,
-                                  color:
-                                      Theme.of(
-                                        context,
-                                      ).colorScheme.onSurfaceVariant,
-                                ),
+                              return Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Text(
+                                    '当前缓存: ${settings.cacheSize}',
+                                    style: TextStyle(
+                                      fontSize: 14,
+                                      color:
+                                          Theme.of(
+                                            context,
+                                          ).colorScheme.onSurfaceVariant,
+                                    ),
+                                  ),
+                                  if (settings.cachePaths.isNotEmpty)
+                                    Text(
+                                      '${settings.cachePaths.length}个位置',
+                                      style: TextStyle(
+                                        fontSize: 12,
+                                        color: Theme.of(context)
+                                            .colorScheme
+                                            .onSurfaceVariant
+                                            .withOpacity(0.7),
+                                      ),
+                                    ),
+                                ],
                               );
                             },
                           ),
@@ -393,7 +409,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               const Text('确定要清除所有缓存数据吗？'),
-              const SizedBox(height: 8),
+              const SizedBox(height: 12),
               Consumer<AppSettings>(
                 builder: (context, settings, child) {
                   return Text(
@@ -402,6 +418,29 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       fontSize: 14,
                       color: Theme.of(context).colorScheme.secondary,
                     ),
+                  );
+                },
+              ),
+              const SizedBox(height: 8),
+              const Text(
+                '将清理以下位置的缓存:',
+                style: TextStyle(fontSize: 12, color: Colors.grey),
+              ),
+              const SizedBox(height: 4),
+              Consumer<AppSettings>(
+                builder: (context, settings, child) {
+                  return Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children:
+                        settings.cachePaths.map((path) {
+                          return Text(
+                            '• $path',
+                            style: const TextStyle(
+                              fontSize: 11,
+                              color: Colors.grey,
+                            ),
+                          );
+                        }).toList(),
                   );
                 },
               ),
@@ -417,20 +456,15 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 Navigator.pop(context);
 
                 // 显示清理中的提示
-                BotToast.showLoading();
+                final cancel = BotToast.showLoading();
 
                 try {
-                  await settings.clearCache();
+                  final result = await settings.clearCache();
 
                   BotToast.closeAllLoading();
-                  BotToast.showText(
-                    text: '缓存已清除',
-                    duration: const Duration(seconds: 2),
-                    contentColor: Colors.green,
-                  );
 
-                  // 刷新界面
-                  setState(() {});
+                  // 显示清理结果
+                  _showCleanResultDialog(context, result);
                 } catch (e) {
                   BotToast.closeAllLoading();
                   BotToast.showText(
@@ -440,7 +474,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   );
                 }
               },
-              child: const Text('清除'),
+              child: const Text('清理'),
             ),
           ],
         );
@@ -448,7 +482,105 @@ class _SettingsScreenState extends State<SettingsScreen> {
     );
   }
 
-  // 显示保存位置设置对话框 - 修复版本（保持不变）
+  // 显示清理结果对话框
+  void _showCleanResultDialog(
+    BuildContext context,
+    Map<String, dynamic> result,
+  ) {
+    final bool success = result['success'] as bool;
+    final String message = result['message'] as String;
+    final List<String> cleanedPaths =
+        (result['cleanedPaths'] as List<dynamic>).cast<String>();
+
+    showDialog(
+      context: context,
+      builder: (context) {
+        return AlertDialog(
+          title: Row(
+            children: [
+              Icon(
+                success ? Icons.check_circle : Icons.error,
+                color: success ? Colors.green : Colors.red,
+                size: 24,
+              ),
+              const SizedBox(width: 8),
+              Text(success ? '清理完成' : '清理失败'),
+            ],
+          ),
+          content: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  message,
+                  style: TextStyle(
+                    color: success ? Colors.green : Colors.red,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+                const SizedBox(height: 12),
+
+                if (cleanedPaths.isNotEmpty)
+                  Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Text(
+                        '清理详情:',
+                        style: TextStyle(fontWeight: FontWeight.bold),
+                      ),
+                      const SizedBox(height: 8),
+                      Container(
+                        constraints: const BoxConstraints(maxHeight: 200),
+                        child: SingleChildScrollView(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children:
+                                cleanedPaths.map((detail) {
+                                  final isError = detail.contains('❌');
+                                  final isSuccess = detail.contains('🗑️');
+
+                                  return Padding(
+                                    padding: const EdgeInsets.only(bottom: 4),
+                                    child: Text(
+                                      detail,
+                                      style: TextStyle(
+                                        fontSize: 12,
+                                        color:
+                                            isError
+                                                ? Colors.red
+                                                : isSuccess
+                                                ? Colors.green
+                                                : Colors.grey,
+                                      ),
+                                    ),
+                                  );
+                                }).toList(),
+                          ),
+                        ),
+                      ),
+                    ],
+                  )
+                else
+                  const Text(
+                    '未发现需要清理的缓存文件',
+                    style: TextStyle(color: Colors.grey),
+                  ),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('确定'),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  // 显示保存位置设置对话框 - 修复版本
   static Future<void> _showSaveLocationSettings(BuildContext context) async {
     try {
       // 获取当前设置

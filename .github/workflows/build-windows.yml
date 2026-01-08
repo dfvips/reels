@@ -1,4 +1,4 @@
-name: Build Windows Single EXE
+name: Build Windows Single EXE (SFX)
 
 on:
   push:
@@ -27,32 +27,34 @@ jobs:
       - name: Build Windows
         run: flutter build windows --release
 
-      # ====== 单文件封装开始 ======
-      - name: Install Inno Setup
-        run: choco install innosetup -y
+      # ====== 7z SFX 开始 ======
+      - name: Install 7-Zip
+        run: choco install 7zip -y
 
-      - name: Create installer script
+      - name: Package Release as 7z
         shell: pwsh
         run: |
-          Set-Content installer.iss "[Setup]"
-          Add-Content installer.iss "AppName=DouyinParser"
-          Add-Content installer.iss "AppVersion=1.0.0"
-          Add-Content installer.iss "DefaultDirName={pf}\DouyinParser"
-          Add-Content installer.iss "OutputBaseFilename=DouyinParser_Setup"
-          Add-Content installer.iss "Compression=lzma"
-          Add-Content installer.iss "SolidCompression=yes"
-          Add-Content installer.iss ""
-          Add-Content installer.iss "[Files]"
-          Add-Content installer.iss 'Source: "build\windows\x64\runner\Release\*"; DestDir: "{app}"; Flags: recursesubdirs'
-          Add-Content installer.iss ""
-          Add-Content installer.iss "[Icons]"
-          Add-Content installer.iss 'Name: "{group}\DouyinParser"; Filename: "{app}\douyin_parser.exe"'
+          $releaseDir = "build\windows\x64\runner\Release"
+          $archive = "build\windows\x64\runner\Release\DouyinParser.7z"
+          7z a $archive "$releaseDir\*" -r
 
-      - name: Build Single EXE Installer
-        run: iscc installer.iss
+      - name: Download 7z SFX module
+        shell: pwsh
+        run: |
+          $sfxUrl = "https://www.7-zip.org/a/7zS.sfx"
+          Invoke-WebRequest $sfxUrl -OutFile "build\windows\x64\runner\Release\7zS.sfx"
+
+      - name: Combine SFX + Archive into Single EXE
+        shell: pwsh
+        run: |
+          $sfx = "build\windows\x64\runner\Release\7zS.sfx"
+          $archive = "build\windows\x64\runner\Release\DouyinParser.7z"
+          $exeOut = "build\windows\x64\runner\Release\DouyinParser.exe"
+          Copy-Item $sfx $exeOut -Force
+          Add-Content $exeOut -Value ([System.IO.File]::ReadAllBytes($archive))
 
       - name: Upload Single EXE
         uses: actions/upload-artifact@v4
         with:
           name: windows-single-exe
-          path: Output/DouyinParser_Setup.exe
+          path: build/windows/x64/runner/Release/DouyinParser.exe

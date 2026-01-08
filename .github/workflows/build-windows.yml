@@ -10,49 +10,64 @@ jobs:
     runs-on: windows-latest
 
     steps:
+      # 1️⃣ 检出代码
       - uses: actions/checkout@v4
 
+      # 2️⃣ 安装 Flutter
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
           channel: stable
           cache: true
 
+      # 3️⃣ 启用 Windows 桌面
       - name: Enable Windows Desktop
         run: flutter config --enable-windows-desktop
 
+      # 4️⃣ 获取依赖
       - name: Pub Get
         run: flutter pub get
 
+      # 5️⃣ 构建 Windows Release
       - name: Build Windows
         run: flutter build windows --release
 
-      # ====== 7z SFX 开始 ======
+      # ====== 绿色免安装单 exe 打包 ======
+
+      # 6️⃣ 安装 7-Zip
       - name: Install 7-Zip
         run: choco install 7zip -y
 
+      # 7️⃣ 提取 7zS.sfx（自解压模块）从安装包
+      - name: Extract 7zS.sfx from Installer
+        shell: pwsh
+        run: |
+          $installer = "C:\ProgramData\chocolatey\lib\7zip\tools\7zip.install.exe"
+          $tempDir = "temp_extract_7z"
+          New-Item -ItemType Directory -Path $tempDir | Out-Null
+          & 7z x $installer -o$tempDir | Out-Null
+          Copy-Item "$tempDir\7z.sfx" "build\windows\x64\runner\Release\7zS.sfx"
+
+      # 8️⃣ 压缩 Release 目录成 7z
       - name: Package Release as 7z
         shell: pwsh
         run: |
           $releaseDir = "build\windows\x64\runner\Release"
-          $archive = "build\windows\x64\runner\Release\DouyinParser.7z"
+          $archive = "$releaseDir\DouyinParser.7z"
           7z a $archive "$releaseDir\*" -r
 
-      - name: Download 7z SFX module
-        shell: pwsh
-        run: |
-          $sfxUrl = "https://www.7-zip.org/a/7zS.sfx"
-          Invoke-WebRequest $sfxUrl -OutFile "build\windows\x64\runner\Release\7zS.sfx"
-
+      # 9️⃣ 拼接 SFX + 压缩包生成单 exe
       - name: Combine SFX + Archive into Single EXE
         shell: pwsh
         run: |
-          $sfx = "build\windows\x64\runner\Release\7zS.sfx"
-          $archive = "build\windows\x64\runner\Release\DouyinParser.7z"
-          $exeOut = "build\windows\x64\runner\Release\DouyinParser.exe"
+          $releaseDir = "build\windows\x64\runner\Release"
+          $sfx = "$releaseDir\7zS.sfx"
+          $archive = "$releaseDir\DouyinParser.7z"
+          $exeOut = "$releaseDir\DouyinParser.exe"
           Copy-Item $sfx $exeOut -Force
           Add-Content $exeOut -Value ([System.IO.File]::ReadAllBytes($archive))
 
+      # 10️⃣ 上传生成的单 exe
       - name: Upload Single EXE
         uses: actions/upload-artifact@v4
         with:

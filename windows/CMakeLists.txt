@@ -4,7 +4,7 @@ project(douyin_parser LANGUAGES CXX)
 
 # The name of the executable created for the application. Change this to change
 # the on-disk name of your application.
-set(BINARY_NAME "抖音视频解析")
+set(BINARY_NAME "douyin_parser")
 
 # Explicitly opt in to modern CMake behaviors to avoid warnings with recent
 # versions of CMake.

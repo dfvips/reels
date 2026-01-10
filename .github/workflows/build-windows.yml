@@ -28,7 +28,7 @@ jobs:
       - name: Pub Get
         run: flutter pub get
 
-      # 5️⃣ 构建 Windows Release
+      # 5️⃣ 构建 Windows Release（确保图标已正确放入 resources/app_icon.ico）
       - name: Build Windows
         run: flutter build windows --release
 
@@ -41,35 +41,55 @@ jobs:
         shell: pwsh
         run: |
           $versionLine = Select-String -Path pubspec.yaml -Pattern '^version:'
-          $version = ($versionLine.Line.Split(':')[1].Trim() -split '\+')[0] # 去掉 build number
+          $version = ($versionLine.Line.Split(':')[1].Trim() -split '\+')[0]
           echo "APP_VERSION=$version" >> $env:GITHUB_ENV
 
-      # 8️⃣ 生成 installer.iss 脚本
+      # 8️⃣ 创建 Inno Setup 脚本（关键：使用中文名称 + 指定图标）
+      # 8️⃣ 创建 Inno Setup 脚本（安全写法，避免 YAML 解析错误）
       - name: Create installer script
         shell: pwsh
         run: |
-          Set-Content installer.iss "[Setup]"
-          Add-Content installer.iss "AppName=DouyinParser"
-          Add-Content installer.iss "AppVersion=$env:APP_VERSION"
-          Add-Content installer.iss "DefaultDirName={pf}\DouyinParser"
-          Add-Content installer.iss "OutputBaseFilename=DouyinParser_Setup"
-          Add-Content installer.iss "Compression=lzma"
-          Add-Content installer.iss "SolidCompression=yes"
-          Add-Content installer.iss ""
-          Add-Content installer.iss "[Files]"
-          Add-Content installer.iss 'Source: "build\windows\x64\runner\Release\*"; DestDir: "{app}"; Flags: recursesubdirs'
-          Add-Content installer.iss ""
-          Add-Content installer.iss "[Icons]"
-          Add-Content installer.iss 'Name: "{group}\DouyinParser"; Filename: "{app}\douyin_parser.exe"'
-          Add-Content installer.iss 'Name: "{commondesktop}\DouyinParser"; Filename: "{app}\douyin_parser.exe"'
+          $appName = "抖音视频解析"
+          $exeName = "douyin_parser.exe"
+          $iconPath = "windows\runner\resources\app.ico"
+          $version = "${{ env.APP_VERSION }}"
 
-      # 9️⃣ 编译单文件安装包
-      - name: Build Single EXE Installer
+          if (-not (Test-Path $iconPath)) {
+            Write-Error "图标文件不存在: $iconPath"
+            exit 1
+          }
+
+          $issContent = @(
+            "[Setup]",
+            "AppName=$appName",
+            "AppVersion=$version",
+            "DefaultDirName={pf}\$appName",
+            "OutputBaseFilename=抖音视频解析_Setup_v$version",
+            "Compression=lzma",
+            "SolidCompression=yes",
+            "SetupIconFile=$iconPath",
+            "UninstallDisplayIcon={app}\$exeName",
+            "",
+            "[Files]",
+            'Source: "build\windows\x64\runner\Release\*"; DestDir: "{app}"; Flags: recursesubdirs',
+            "",
+            "[Icons]",
+            "Name: ""{group}\$appName""; Filename: ""{app}\$exeName""; IconFilename: ""{app}\$exeName""",
+            "Name: ""{commondesktop}\$appName""; Filename: ""{app}\$exeName""; IconFilename: ""{app}\$exeName""",
+            "",
+            "[Run]",
+            "Filename: ""{app}\$exeName""; Description: ""启动 $appName""; Flags: nowait postinstall skipifsilent"
+          )
+
+          $issContent | Set-Content -Path installer.iss -Encoding UTF8
+
+      # 9️⃣ 编译安装包
+      - name: Build Installer
         run: iscc installer.iss
 
-      # 🔟 上传 artifact
-      - name: Upload Single EXE
+      # 🔟 上传 artifact（注意：Windows 路径分隔符）
+      - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: windows-single-exe
-          path: Output/DouyinParser_Setup.exe
+          name: windows-installer
+          path: Output/抖音视频解析_Setup_v${{ env.APP_VERSION }}.exe

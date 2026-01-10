@@ -3,7 +3,7 @@ import 'package:dio/dio.dart';
 class HttpService {
   static final Dio _dio = Dio();
 
-  static Future<String> fetchHtml(String url) async {
+  static Future<String> fetchHtml(String url, {bool showTip = true}) async {
     try {
       String currentUrl = url;
       int redirectCount = 0;
@@ -34,6 +34,10 @@ class HttpService {
           ),
         );
 
+        if (showTip == false) {
+          return '';
+        }
+
         // 检查是否是重定向状态码
         if (response.statusCode == 301 ||
             response.statusCode == 302 ||
@@ -50,12 +54,14 @@ class HttpService {
             if (location.startsWith('http')) {
               redirectUri = Uri.parse(location);
             } else {
-              redirectUri =
-                  Uri.parse(Uri.parse(currentUrl).resolve(location).toString());
+              redirectUri = Uri.parse(
+                Uri.parse(currentUrl).resolve(location).toString(),
+              );
             }
 
             print(
-                '[$redirectCount] 重定向 ${response.statusCode} -> ${redirectUri.toString()}');
+              '[$redirectCount] 重定向 ${response.statusCode} -> ${redirectUri.toString()}',
+            );
             currentUrl = redirectUri.toString();
             return fetchHtml(currentUrl);
           } else {
@@ -73,7 +79,12 @@ class HttpService {
 
       throw Exception('达到最大重定向次数: $maxRedirects');
     } catch (e) {
-      throw Exception('网络请求错误: $e');
+      if (showTip) {
+        // throw Exception('网络请求错误: $e');
+        throw Exception('网络请求异常，请在系统设置中允许本应用使用网络');
+      } else {
+        return '';
+      }
     }
   }
 
@@ -124,7 +135,7 @@ class HttpService {
         options: Options(
           headers: {
             'User-Agent':
-                'Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 Mobile/15E148 Safari/604.1'
+                'Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 Mobile/15E148 Safari/604.1',
           },
           followRedirects: false,
           validateStatus: (status) => true, // 接受所有状态码

@@ -8,7 +8,7 @@
 PRODUCT_NAME = douyin_parser
 
 // The application's bundle identifier
-PRODUCT_BUNDLE_IDENTIFIER = com.example.douyinParser
+PRODUCT_BUNDLE_IDENTIFIER = com.dreamfly.douyinParser
 
 // The copyright displayed in application information
-PRODUCT_COPYRIGHT = Copyright © 2026 com.example. All rights reserved.
+PRODUCT_COPYRIGHT = Copyright © 2026 com.dreamfly. All rights reserved.

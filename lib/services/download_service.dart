@@ -35,11 +35,6 @@ class DownloadService {
   static Future<void> initializeDefaultSettings() async {
     final prefs = await SharedPreferences.getInstance();
 
-    // 确保 skipFilenameCustomization 默认为 false（显示重命名窗口）
-    if (!prefs.containsKey(_skipFilenameCustomKey)) {
-      await prefs.setBool(_skipFilenameCustomKey, false);
-    }
-
     // 确保 skipLocationPrompt 默认为 false（显示位置选择）
     if (!prefs.containsKey(_skipLocationPromptKey)) {
       await prefs.setBool(_skipLocationPromptKey, false);
@@ -322,10 +317,12 @@ class DownloadService {
     }
   }
 
-  // 显示桌面端保存对话框
+  // 显示桌面端保存对话框（批量下载时使用同一个目录）
   static Future<String?> _showDesktopSaveDialog(
     BuildContext context,
     String defaultFileName,
+    String? videoTitle, // 新增：视频标题参数
+    bool isBatchDownload,
   ) async {
     try {
       // 1. 检查用户是否跳过了位置提示
@@ -339,7 +336,13 @@ class DownloadService {
       }
 
       // 2. 显示统一的保存对话框
-      return await _showSaveDialog(context, defaultFileName, availableDir);
+      return await _showSaveDialog(
+        context,
+        defaultFileName,
+        videoTitle, // 传递视频标题
+        availableDir,
+        isBatchDownload,
+      );
     } catch (e) {
       print('显示保存对话框失败: $e');
       return null;
@@ -350,7 +353,9 @@ class DownloadService {
   static Future<String?> _showSaveDialog(
     BuildContext context,
     String defaultFileName,
+    String? videoTitle,
     String? availableDir,
+    bool isBatchDownload,
   ) async {
     try {
       String? selectedDir = availableDir;
@@ -361,10 +366,9 @@ class DownloadService {
         print(
           '需要用户选择位置: availableDir=$availableDir, skipLocationPrompt=$skipLocationPrompt',
         );
-        _showInfoToast('请选择保存位置...');
 
         selectedDir = await FilePicker.platform.getDirectoryPath(
-          dialogTitle: '选择视频保存位置',
+          dialogTitle: isBatchDownload ? '选择视频保存位置（所有文件将保存到此目录）' : '选择视频保存位置',
         );
 
         if (selectedDir == null || selectedDir.isEmpty) {
@@ -384,201 +388,34 @@ class DownloadService {
         print('使用现有目录: $selectedDir');
       }
 
-      // 检查是否跳过文件名自定义
-      final skipFilenameCustom = await getSkipFilenameCustomization();
-      print('skipFilenameCustom: $skipFilenameCustom');
+      // 使用视频标题作为文件名
+      final fileName = videoTitle ?? defaultFileName;
+      final filePath = path.join(selectedDir!, '$fileName.mp4');
+      print('直接保存到: $filePath');
 
-      // 如果用户跳过了文件名自定义，直接生成路径
-      if (skipFilenameCustom) {
-        final filePath = path.join(selectedDir!, '$defaultFileName.mp4');
-        print('跳过文件名自定义，直接保存到: $filePath');
-
-        // 保存目录设置
-        await setLastDirectory(selectedDir);
-        return filePath;
-      }
-
-      // 显示统一的对话框（包含目录确认和文件名输入）
-      return await _showUnifiedSaveDialog(
-        context,
-        selectedDir!,
-        defaultFileName,
-      );
+      // 保存目录设置
+      await setLastDirectory(selectedDir);
+      return filePath;
     } catch (e) {
       print('显示保存对话框失败: $e');
       return null;
     }
   }
 
-  // 统一的保存对话框
-  static Future<String?> _showUnifiedSaveDialog(
-    BuildContext context,
-    String selectedDir,
-    String defaultFileName,
-  ) async {
-    try {
-      bool skipLocationPrompt = await getSkipLocationPrompt();
-      bool skipFilenameCustom = await getSkipFilenameCustomization();
-
-      final TextEditingController controller = TextEditingController(
-        text: defaultFileName,
-      );
-
-      final result = await showDialog<Map<String, dynamic>>(
-        context: context,
-        barrierDismissible: false,
-        builder: (context) {
-          return StatefulBuilder(
-            builder: (context, setState) {
-              return AlertDialog(
-                title: const Text('保存视频文件'),
-                content: SingleChildScrollView(
-                  child: Column(
-                    mainAxisSize: MainAxisSize.min,
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      // 目录信息
-                      const Text('保存位置:'),
-                      const SizedBox(height: 4),
-                      Container(
-                        padding: const EdgeInsets.all(8),
-                        decoration: BoxDecoration(
-                          color: Colors.grey[100],
-                          borderRadius: BorderRadius.circular(4),
-                        ),
-                        child: SelectableText(
-                          selectedDir,
-                          style: const TextStyle(fontSize: 12),
-                        ),
-                      ),
-                      const SizedBox(height: 12),
-
-                      // 更改位置按钮
-                      OutlinedButton.icon(
-                        icon: const Icon(Icons.folder_open, size: 16),
-                        label: const Text('更改保存位置'),
-                        onPressed: () async {
-                          final newDir = await FilePicker.platform
-                              .getDirectoryPath(dialogTitle: '选择新的保存位置');
-                          if (newDir != null && newDir.isNotEmpty) {
-                            // 直接更新目录，重新打开对话框
-                            Navigator.of(context).pop({
-                              'action': 'change_location',
-                              'directory': newDir,
-                            });
-                          }
-                        },
-                      ),
-                      const SizedBox(height: 16),
-
-                      // 文件名输入
-                      TextField(
-                        controller: controller,
-                        decoration: const InputDecoration(
-                          labelText: '文件名',
-                          border: OutlineInputBorder(),
-                          suffixText: '.mp4',
-                        ),
-                        autofocus: true,
-                      ),
-                      const SizedBox(height: 16),
-
-                      // 选项
-                      CheckboxListTile(
-                        title: const Text('不再提示保存位置'),
-                        subtitle: const Text('下次直接使用此位置保存'),
-                        value: skipLocationPrompt,
-                        onChanged: (value) {
-                          setState(() {
-                            skipLocationPrompt = value ?? false;
-                          });
-                        },
-                        dense: true,
-                        contentPadding: EdgeInsets.zero,
-                      ),
-                      CheckboxListTile(
-                        title: const Text('不再提示文件名自定义'),
-                        subtitle: const Text('下次直接保存，不再弹出此窗口'),
-                        value: skipFilenameCustom,
-                        onChanged: (value) {
-                          setState(() {
-                            skipFilenameCustom = value ?? false;
-                          });
-                        },
-                        dense: true,
-                        contentPadding: EdgeInsets.zero,
-                      ),
-                    ],
-                  ),
-                ),
-                actions: [
-                  TextButton(
-                    onPressed: () => Navigator.of(context).pop(null),
-                    child: const Text('取消'),
-                  ),
-                  ElevatedButton(
-                    onPressed: () {
-                      String fileName = controller.text.trim();
-                      if (fileName.isEmpty) {
-                        fileName = defaultFileName;
-                      }
-                      Navigator.of(context).pop({
-                        'action': 'save',
-                        'fileName': fileName,
-                        'skipLocationPrompt': skipLocationPrompt,
-                        'skipFilenameCustom': skipFilenameCustom,
-                      });
-                    },
-                    child: const Text('保存'),
-                  ),
-                ],
-              );
-            },
-          );
-        },
-      );
-
-      if (result == null) {
-        return null;
-      }
-
-      // 处理更改位置的情况
-      if (result['action'] == 'change_location') {
-        final newDir = result['directory'] as String;
-        return await _showUnifiedSaveDialog(context, newDir, defaultFileName);
-      }
-
-      // 保存用户设置
-      await setSkipLocationPrompt(result['skipLocationPrompt']);
-      await setSkipFilenameCustomization(result['skipFilenameCustom']);
-      await setLastDirectory(selectedDir);
-
-      // 构建完整路径
-      String fileName = result['fileName'];
-      if (!fileName.toLowerCase().endsWith('.mp4')) {
-        fileName = '$fileName.mp4';
-      }
-
-      final fullPath = path.join(selectedDir, fileName);
-      print('最终保存路径: $fullPath');
-
-      return fullPath;
-    } catch (e) {
-      print('显示统一保存对话框失败: $e');
-      return null;
-    }
-  }
-
-  // 主要下载方法
+  // 主要下载方法 - 单个视频下载
   static Future<String?> downloadVideo(
     String url,
     String fileName,
+    String? videoTitle, // 新增：视频标题参数
     Function(int received, int total)? progressCallback,
     CancelToken? cancelToken,
-    BuildContext context,
-  ) async {
+    BuildContext context, {
+    bool isBatchDownload = false,
+    String? saveDirectory,
+  }) async {
     try {
       print('开始下载流程，平台: ${Platform.operatingSystem}');
+      print('视频标题: $videoTitle');
 
       // 检查权限（仅移动端）
       if (Platform.isAndroid || Platform.isIOS) {
@@ -598,8 +435,26 @@ class DownloadService {
 
       if (Platform.isMacOS || Platform.isWindows || Platform.isLinux) {
         print('桌面平台，显示保存对话框...');
-        // 显示保存对话框
-        filePath = await _showDesktopSaveDialog(context, fileName);
+
+        // 如果是批量下载且有保存目录，直接使用该目录
+        if (isBatchDownload &&
+            saveDirectory != null &&
+            saveDirectory.isNotEmpty) {
+          print('批量下载，使用已有目录: $saveDirectory');
+
+          // 直接使用视频标题作为文件名
+          final name = videoTitle ?? fileName;
+          filePath = path.join(saveDirectory, '$name.mp4');
+        } else {
+          // 单个下载或没有保存目录，显示完整的保存对话框
+          filePath = await _showDesktopSaveDialog(
+            context,
+            fileName,
+            videoTitle, // 传递视频标题
+            isBatchDownload,
+          );
+        }
+
         if (filePath == null) {
           print('用户取消了保存位置选择');
           _showInfoToast('下载已取消');
@@ -607,13 +462,15 @@ class DownloadService {
         }
         print('用户选择的路径: $filePath');
       } else if (Platform.isAndroid || Platform.isIOS) {
-        // 移动端：使用默认路径，然后直接保存到相册
+        // 移动端：使用默认路径，优先使用视频标题作为文件名
         print('移动端平台，使用默认路径...');
-        filePath = await _getDefaultFilePath(fileName);
+        final name = videoTitle ?? fileName;
+        filePath = await _getDefaultFilePath(name);
       } else {
         // 其他平台
         print('其他平台，使用下载目录...');
-        filePath = await _getDesktopFilePath(fileName);
+        final name = videoTitle ?? fileName;
+        filePath = await _getDesktopFilePath(name);
       }
 
       if (filePath == null) {
@@ -627,20 +484,34 @@ class DownloadService {
         final fileSize = await file.length();
         print('文件已存在，大小: $fileSize bytes');
 
-        // 询问是否覆盖
-        final shouldOverwrite = await _showOverwriteDialog(
-          context,
-          filePath,
-          fileSize,
-        );
-        if (!shouldOverwrite) {
-          _showInfoToast('下载已取消');
-          return null;
+        // 批量下载时不询问覆盖，自动使用新文件名
+        if (isBatchDownload) {
+          final baseName = videoTitle ?? fileName;
+          final newFileName = await _generateUniqueFileName(
+            path.dirname(filePath),
+            baseName,
+          );
+          filePath = path.join(path.dirname(filePath), '$newFileName.mp4');
+          print('文件已存在，使用新文件名: $filePath');
+        } else {
+          // 询问是否覆盖
+          final shouldOverwrite = await _showOverwriteDialog(
+            context,
+            filePath,
+            fileSize,
+          );
+          if (!shouldOverwrite) {
+            _showInfoToast('下载已取消');
+            return null;
+          }
         }
       }
 
       // 显示开始下载提示
-      _showInfoToast('开始下载视频...');
+      if (!isBatchDownload) {
+        final displayName = videoTitle ?? fileName;
+        _showInfoToast('开始下载视频: $displayName');
+      }
 
       // 下载文件
       _currentCancelToken = cancelToken ?? CancelToken();
@@ -655,13 +526,16 @@ class DownloadService {
         await dir.create(recursive: true);
       }
 
+      // 使用原来的普通下载方式
       await _dio.download(
         url,
         filePath,
         cancelToken: _currentCancelToken,
         onReceiveProgress: (received, total) {
+          print('下载进度: $received / $total');
           if (progressCallback != null) {
-            progressCallback(received, total);
+            // 确保传递有效的进度值
+            progressCallback(received, total > 0 ? total : received * 2);
           }
         },
         options: Options(
@@ -676,9 +550,13 @@ class DownloadService {
                     : 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
             'Referer': 'https://www.douyin.com/',
             'Accept': '*/*',
+            'Range': 'bytes=0-', // 添加Range头，确保可以获取文件大小
           },
           receiveTimeout: const Duration(minutes: 10),
           sendTimeout: const Duration(minutes: 10),
+          followRedirects: true,
+          maxRedirects: 5,
+          responseType: ResponseType.bytes,
         ),
       );
 
@@ -687,11 +565,18 @@ class DownloadService {
       if (await downloadedFile.exists()) {
         final fileSize = await downloadedFile.length();
         print('下载完成，文件大小: $fileSize bytes');
-        _showSuccessToast('下载完成 (${formatFileSize(fileSize)})');
 
-        // 下载完成后询问用户操作（仅桌面端）
-        if (Platform.isMacOS || Platform.isWindows || Platform.isLinux) {
-          await _showDownloadCompleteDialog(filePath, fileSize, context);
+        // 批量下载时不单独显示完成通知
+        if (!isBatchDownload) {
+          final displayName = videoTitle ?? fileName;
+          _showSuccessToast(
+            '"$displayName" 下载完成 (${formatFileSize(fileSize)})',
+          );
+
+          // 下载完成后询问用户操作（仅桌面端）
+          if (Platform.isMacOS || Platform.isWindows || Platform.isLinux) {
+            await _showDownloadCompleteDialog(filePath, fileSize, context);
+          }
         }
 
         return filePath;
@@ -715,6 +600,100 @@ class DownloadService {
       return null;
     } finally {
       _currentCancelToken = null;
+    }
+  }
+
+  // 批量顺序下载方法
+  static Future<List<String?>> downloadMultipleVideos(
+    List<String> urls,
+    List<String> videoTitles, // 新增：视频标题列表
+    String baseFileName,
+    Function(int index, int received, int total)? progressCallback,
+    CancelToken? cancelToken,
+    BuildContext context,
+  ) async {
+    final results = <String?>[];
+    String? saveDirectory;
+
+    try {
+      // 先获取保存目录（只问一次）
+      if (Platform.isMacOS || Platform.isWindows || Platform.isLinux) {
+        final filePath = await _showDesktopSaveDialog(
+          context,
+          baseFileName,
+          null, // 批量下载时不传递单个标题
+          true, // 标记为批量下载
+        );
+
+        if (filePath == null) {
+          print('用户取消了批量下载位置选择');
+          _showInfoToast('批量下载已取消');
+          return results;
+        }
+
+        saveDirectory = path.dirname(filePath);
+        print('批量下载保存目录: $saveDirectory');
+      }
+
+      for (var i = 0; i < urls.length; i++) {
+        if (cancelToken?.isCancelled == true) {
+          break;
+        }
+
+        final url = urls[i];
+        final videoTitle = i < videoTitles.length ? videoTitles[i] : null;
+        final fileName = videoTitle ?? '${baseFileName}_${i + 1}';
+
+        print('开始下载第 ${i + 1}/${urls.length} 个视频: $fileName');
+
+        final filePath = await downloadVideo(
+          url,
+          fileName,
+          videoTitle, // 传递视频标题
+          (received, total) {
+            if (progressCallback != null) {
+              progressCallback(i, received, total);
+            }
+          },
+          cancelToken,
+          context,
+          isBatchDownload: true,
+          saveDirectory: saveDirectory,
+        );
+
+        results.add(filePath);
+
+        // 等待1秒再下载下一个，避免请求过于频繁
+        if (i < urls.length - 1) {
+          await Future.delayed(Duration(seconds: 1));
+        }
+      }
+
+      return results;
+    } catch (e) {
+      print('批量下载异常: $e');
+      return results;
+    }
+  }
+
+  // 生成唯一文件名
+  static Future<String> _generateUniqueFileName(
+    String directory,
+    String baseName,
+  ) async {
+    var fileName = baseName;
+    var counter = 1;
+
+    while (true) {
+      final filePath = path.join(directory, '$fileName.mp4');
+      final file = File(filePath);
+
+      if (!await file.exists()) {
+        return fileName;
+      }
+
+      fileName = '${baseName}_$counter';
+      counter++;
     }
   }
 
@@ -766,6 +745,20 @@ class DownloadService {
     String filePath,
     int fileSize,
   ) async {
+    final isDarkMode = Theme.of(context).brightness == Brightness.dark;
+    final primaryColor = Theme.of(context).colorScheme.primary;
+    final onPrimaryColor = Theme.of(context).colorScheme.onPrimary;
+
+    // 浅色模式颜色定义
+    const Color lightEnabledColor = Color(0xFF409EFF);
+    const Color lightEnabledBgColor = Color(0xFFECF5FF);
+    const Color lightEnabledBorderColor = Color(0xFFB3D8FF);
+
+    // 深色模式颜色定义
+    const Color darkClearBgColor = Color(0xFF18232B); // 清空按钮背景色
+    const Color darkClearBorderColor = Color(0xFF409EFF); // 清空按钮边框色
+    const Color darkClearTextColor = Color(0xFF409EFF); // 清空按钮文本色
+
     return await showDialog<bool>(
           context: context,
           barrierDismissible: false,
@@ -776,17 +769,87 @@ class DownloadService {
                 '文件 ${path.basename(filePath)} 已存在，大小为 ${formatFileSize(fileSize)}。\n\n是否要覆盖？',
               ),
               actions: [
-                TextButton(
-                  onPressed: () {
-                    Navigator.of(context).pop(false);
-                  },
-                  child: const Text('取消'),
+                // 取消按钮 - 使用解析按钮的样式
+                Container(
+                  decoration: BoxDecoration(
+                    borderRadius: BorderRadius.circular(4),
+                    // boxShadow: [
+                    //   BoxShadow(
+                    //     color: Colors.black.withOpacity(0.05),
+                    //     blurRadius: 2,
+                    //     offset: const Offset(0, 1),
+                    //   ),
+                    // ],
+                  ),
+                  child: TextButton(
+                    onPressed: () {
+                      Navigator.of(context).pop(false);
+                    },
+                    style: TextButton.styleFrom(
+                      padding: const EdgeInsets.symmetric(
+                        vertical: 12,
+                        horizontal: 16,
+                      ),
+                      backgroundColor:
+                          isDarkMode ? darkClearBgColor : lightEnabledBgColor,
+                      foregroundColor:
+                          isDarkMode ? darkClearTextColor : lightEnabledColor,
+                      side: BorderSide(
+                        color:
+                            isDarkMode
+                                ? darkClearBorderColor
+                                : lightEnabledBorderColor,
+                        width: 1,
+                      ),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(4),
+                      ),
+                    ),
+                    child: const Text('取消'),
+                  ),
                 ),
-                ElevatedButton(
-                  onPressed: () {
-                    Navigator.of(context).pop(true);
-                  },
-                  child: const Text('覆盖'),
+                // 覆盖按钮 - 使用解析按钮的样式
+                Container(
+                  decoration: BoxDecoration(
+                    borderRadius: BorderRadius.circular(4),
+                    // boxShadow: [
+                    //   BoxShadow(
+                    //     color: Colors.black.withOpacity(0.05),
+                    //     blurRadius: 2,
+                    //     offset: const Offset(0, 1),
+                    //   ),
+                    // ],
+                  ),
+                  child: ElevatedButton(
+                    onPressed: () {
+                      Navigator.of(context).pop(true);
+                    },
+                    style: ElevatedButton.styleFrom(
+                      padding: const EdgeInsets.symmetric(
+                        vertical: 12,
+                        horizontal: 16,
+                      ),
+                      backgroundColor: primaryColor,
+                      foregroundColor:
+                          isDarkMode ? Colors.white : onPrimaryColor,
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(4),
+                      ),
+                      elevation: 0,
+                    ),
+                    child: Row(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        Icon(
+                          Icons.file_download,
+                          size: 14,
+                          color: isDarkMode ? Colors.white : onPrimaryColor,
+                        ),
+                        const SizedBox(width: 2),
+                        const Text('覆盖'),
+                      ],
+                    ),
+                  ),
                 ),
               ],
             );
@@ -801,6 +864,20 @@ class DownloadService {
     int fileSize,
     BuildContext context,
   ) async {
+    final isDarkMode = Theme.of(context).brightness == Brightness.dark;
+    final primaryColor = Theme.of(context).colorScheme.primary;
+    final onPrimaryColor = Theme.of(context).colorScheme.onPrimary;
+
+    // 浅色模式颜色定义
+    const Color lightEnabledColor = Color(0xFF409EFF);
+    const Color lightEnabledBgColor = Color(0xFFECF5FF);
+    const Color lightEnabledBorderColor = Color(0xFFB3D8FF);
+
+    // 深色模式颜色定义
+    const Color darkClearBgColor = Color(0xFF18232B); // 清空按钮背景色
+    const Color darkClearBorderColor = Color(0xFF409EFF); // 清空按钮边框色
+    const Color darkClearTextColor = Color(0xFF409EFF); // 清空按钮文本色
+
     final fileName = path.basename(filePath);
     final formattedSize = formatFileSize(fileSize);
 
@@ -816,52 +893,186 @@ class DownloadService {
           title: const Text('下载完成'),
           content: Text('视频文件 "$fileName" 已下载完成，大小为 $formattedSize。\n\n您希望：'),
           actions: [
-            TextButton(
-              onPressed: () async {
-                // 打开文件但不关闭对话框
-                try {
-                  await OpenFile.open(filePath);
-                } catch (e) {
-                  print('打开文件失败: $e');
-                  _showErrorToast('无法打开文件: $e');
-                }
-              },
-              child: const Text('打开文件'),
+            // 打开文件按钮
+            Container(
+              decoration: BoxDecoration(
+                borderRadius: BorderRadius.circular(4),
+                // boxShadow: [
+                //   BoxShadow(
+                //     color: Colors.black.withOpacity(0.05),
+                //     blurRadius: 2,
+                //     offset: const Offset(0, 1),
+                //   ),
+                // ],
+              ),
+              child: TextButton(
+                onPressed: () async {
+                  // 打开文件但不关闭对话框
+                  try {
+                    await OpenFile.open(filePath);
+                  } catch (e) {
+                    print('打开文件失败: $e');
+                    _showErrorToast('无法打开文件: $e');
+                  }
+                },
+                style: TextButton.styleFrom(
+                  padding: const EdgeInsets.symmetric(
+                    vertical: 12,
+                    horizontal: 16,
+                  ),
+                  backgroundColor:
+                      isDarkMode ? darkClearBgColor : lightEnabledBgColor,
+                  foregroundColor:
+                      isDarkMode ? darkClearTextColor : lightEnabledColor,
+                  side: BorderSide(
+                    color:
+                        isDarkMode
+                            ? darkClearBorderColor
+                            : lightEnabledBorderColor,
+                    width: 1,
+                  ),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(4),
+                  ),
+                ),
+                child: const Text('打开文件'),
+              ),
             ),
             if (Platform.isMacOS)
-              TextButton(
-                onPressed: () async {
-                  // 在Finder中显示但不关闭对话框
-                  try {
-                    await Process.run('open', ['-R', filePath]);
-                  } catch (e) {
-                    print('在Finder中显示失败: $e');
-                    await OpenFile.open(path.dirname(filePath));
-                  }
-                },
-                child: const Text('在Finder中显示'),
+              Container(
+                decoration: BoxDecoration(
+                  borderRadius: BorderRadius.circular(4),
+                  // boxShadow: [
+                  //   BoxShadow(
+                  //     color: Colors.black.withOpacity(0.05),
+                  //     blurRadius: 2,
+                  //     offset: const Offset(0, 1),
+                  //   ),
+                  // ],
+                ),
+                child: TextButton(
+                  onPressed: () async {
+                    // 在Finder中显示但不关闭对话框
+                    try {
+                      await Process.run('open', ['-R', filePath]);
+                    } catch (e) {
+                      print('在Finder中显示失败: $e');
+                      await OpenFile.open(path.dirname(filePath));
+                    }
+                  },
+                  style: TextButton.styleFrom(
+                    padding: const EdgeInsets.symmetric(
+                      vertical: 12,
+                      horizontal: 16,
+                    ),
+                    backgroundColor:
+                        isDarkMode ? darkClearBgColor : lightEnabledBgColor,
+                    foregroundColor:
+                        isDarkMode ? darkClearTextColor : lightEnabledColor,
+                    side: BorderSide(
+                      color:
+                          isDarkMode
+                              ? darkClearBorderColor
+                              : lightEnabledBorderColor,
+                      width: 1,
+                    ),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(4),
+                    ),
+                  ),
+                  child: const Text('在Finder中显示'),
+                ),
               ),
             if (Platform.isWindows)
-              TextButton(
-                onPressed: () async {
-                  // 在资源管理器中显示但不关闭对话框
-                  try {
-                    await Process.run('explorer', ['/select,', filePath]);
-                  } catch (e) {
-                    print('在资源管理器中显示失败: $e');
-                    await OpenFile.open(path.dirname(filePath));
+              Container(
+                decoration: BoxDecoration(
+                  borderRadius: BorderRadius.circular(4),
+                  // boxShadow: [
+                  //   BoxShadow(
+                  //     color: Colors.black.withOpacity(0.05),
+                  //     blurRadius: 2,
+                  //     offset: const Offset(0, 1),
+                  //   ),
+                  // ],
+                ),
+                child: TextButton(
+                  onPressed: () async {
+                    // 在资源管理器中显示但不关闭对话框
+                    try {
+                      await Process.run('explorer', ['/select,', filePath]);
+                    } catch (e) {
+                      print('在资源管理器中显示失败: $e');
+                      await OpenFile.open(path.dirname(filePath));
+                    }
+                  },
+                  style: TextButton.styleFrom(
+                    padding: const EdgeInsets.symmetric(
+                      vertical: 12,
+                      horizontal: 16,
+                    ),
+                    backgroundColor:
+                        isDarkMode ? darkClearBgColor : lightEnabledBgColor,
+                    foregroundColor:
+                        isDarkMode ? darkClearTextColor : lightEnabledColor,
+                    side: BorderSide(
+                      color:
+                          isDarkMode
+                              ? darkClearBorderColor
+                              : lightEnabledBorderColor,
+                      width: 1,
+                    ),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(4),
+                    ),
+                  ),
+                  child: const Text('在文件夹中显示'),
+                ),
+              ),
+            // 关闭按钮 - 使用解析按钮的样式
+            Container(
+              decoration: BoxDecoration(
+                borderRadius: BorderRadius.circular(4),
+                // boxShadow: [
+                //   BoxShadow(
+                //     color: Colors.black.withOpacity(0.05),
+                //     blurRadius: 2,
+                //     offset: const Offset(0, 1),
+                //   ),
+                // ],
+              ),
+              child: ElevatedButton(
+                onPressed: () {
+                  // 只有点击关闭才关闭对话框
+                  if (dialogContext != null &&
+                      Navigator.canPop(dialogContext!)) {
+                    Navigator.of(dialogContext!).pop();
                   }
                 },
-                child: const Text('在文件夹中显示'),
+                style: ElevatedButton.styleFrom(
+                  padding: const EdgeInsets.symmetric(
+                    vertical: 12,
+                    horizontal: 16,
+                  ),
+                  backgroundColor: primaryColor,
+                  foregroundColor: isDarkMode ? Colors.white : onPrimaryColor,
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(4),
+                  ),
+                  elevation: 0,
+                ),
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    Icon(
+                      Icons.close,
+                      size: 14,
+                      color: isDarkMode ? Colors.white : onPrimaryColor,
+                    ),
+                    const SizedBox(width: 2),
+                    const Text('关闭'),
+                  ],
+                ),
               ),
-            TextButton(
-              onPressed: () {
-                // 只有点击关闭才关闭对话框
-                if (dialogContext != null && Navigator.canPop(dialogContext!)) {
-                  Navigator.of(dialogContext!).pop();
-                }
-              },
-              child: const Text('关闭'),
             ),
           ],
         );
@@ -954,6 +1165,70 @@ class DownloadService {
     } catch (e) {
       print('保存失败: $e');
       _showErrorToast('保存失败: ${e.toString()}');
+    }
+  }
+
+  // 批量保存视频到相册（仅移动端）
+  static Future<void> saveMultipleVideosToGallery(
+    List<String> filePaths,
+  ) async {
+    try {
+      print('开始批量保存 ${filePaths.length} 个视频到相册');
+
+      if (Platform.isIOS || Platform.isAndroid) {
+        // 先检查相册保存权限
+        _showInfoToast('正在检查相册权限...');
+
+        final hasGalleryPermission = await requestSaveToGalleryPermission();
+        if (!hasGalleryPermission) {
+          _showErrorToast('未授予保存到相册的权限');
+          return;
+        }
+
+        int successCount = 0;
+        int failCount = 0;
+
+        for (var i = 0; i < filePaths.length; i++) {
+          final filePath = filePaths[i];
+          final file = File(filePath);
+
+          if (!await file.exists()) {
+            print('文件不存在: $filePath');
+            failCount++;
+            continue;
+          }
+
+          try {
+            await Gal.putVideo(filePath, album: '抖音视频');
+            print('第 ${i + 1} 个视频保存成功: $filePath');
+            successCount++;
+          } catch (e) {
+            print('第 ${i + 1} 个视频保存失败: $e');
+            failCount++;
+          }
+
+          // 延迟一下，避免请求过于频繁
+          if (i < filePaths.length - 1) {
+            await Future.delayed(Duration(milliseconds: 500));
+          }
+        }
+
+        if (successCount > 0) {
+          if (failCount == 0) {
+            _showSuccessToast('$successCount 个视频已全部保存到相册');
+          } else {
+            _showSuccessToast('$successCount 个视频保存成功，$failCount 个失败');
+          }
+        } else {
+          _showErrorToast('所有视频保存到相册失败');
+        }
+      } else {
+        // 桌面端：只显示完成通知
+        _showSuccessToast('${filePaths.length} 个视频下载完成');
+      }
+    } catch (e) {
+      print('批量保存失败: $e');
+      _showErrorToast('批量保存失败: ${e.toString()}');
     }
   }
 
@@ -1052,8 +1327,8 @@ class DownloadService {
     BotToast.showText(
       text: message,
       duration: const Duration(seconds: 2),
-      contentColor: Colors.blue,
-      textStyle: const TextStyle(color: Colors.white, fontSize: 14),
+      contentColor: Colors.black54,
+      textStyle: const TextStyle(color: Colors.white, fontSize: 16.0),
     );
   }
 }

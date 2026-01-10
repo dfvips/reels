@@ -9,7 +9,7 @@ class ClipboardUtils {
     await Clipboard.setData(ClipboardData(text: text));
 
     BotToast.showText(
-      text: '已复制到剪贴板',
+      text: '已复制全部到剪贴板',
       duration: const Duration(seconds: 2),
       contentColor: Colors.black54,
       textStyle: const TextStyle(color: Colors.white, fontSize: 16.0),

@@ -5,7 +5,7 @@
 	<key>CFBundleDevelopmentRegion</key>
 	<string>$(DEVELOPMENT_LANGUAGE)</string>
 	<key>CFBundleDisplayName</key>
-	<string>Douyin Parser</string>
+	<string>抖音视频解析</string>
 	<key>CFBundleExecutable</key>
 	<string>$(EXECUTABLE_NAME)</string>
 	<key>CFBundleIdentifier</key>
@@ -51,8 +51,6 @@
     <string>需要访问您的相册以保存下载的视频</string>
 	<key>NSPhotoLibraryUsageDescription</key>
 	<string>需要访问您的相册以保存图片和视频</string>
-	<key>CFBundleDisplayName</key>
-	<string>抖音视频解析</string>
 	<key>CFBundleName</key>
 	<string>抖音视频解析</string>
 </dict>

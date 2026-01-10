@@ -1,4 +1,4 @@
-package com.example.douyin_parser
+package com.dreamfly.douyin_parser
 
 import io.flutter.embedding.android.FlutterActivity
 

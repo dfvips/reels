@@ -1,28 +1,39 @@
 class UrlParser {
-  static String? extractUrl(String text) {
-    // 改进的正则表达式：匹配URL直到遇到空格、标点符号或中文等非URL字符
+  /// 从文本中提取所有抖音视频链接
+  static List<String> extractUrls(String text) {
+    // 改进的正则表达式：匹配所有抖音URL
     final regex = RegExp(
-      r'(?:https?://v\.douyin\.com/[A-Za-z0-9_-]+|https?://(?:www\.|m\.)?douyin\.com/(?:video/[0-9]+|share/video/[0-9]+)|https?://www\.iesdouyin\.com/share/video/[0-9]+/)',
+      r'(?:https?://v\.douyin\.com/[A-Za-z0-9_-]+|https?://(?:www\.|m\.)?douyin\.com/(?:video/[0-9]+|share/video/[0-9]+)|https?://www\.iesdouyin\.com/share/video/[0-9]+/?)',
       caseSensitive: false,
     );
 
     final matches = regex.allMatches(text);
-    if (matches.isNotEmpty) {
-      if (matches.isNotEmpty) {
-        final url = matches.first.group(0)!;
-        // 调用convertDouyinVideoUrl进行转换
-        return convertDouyinVideoUrl(url);
+    final urls = <String>[];
+
+    for (final match in matches) {
+      if (match.group(0) != null) {
+        final url = match.group(0)!;
+        // 去重
+        if (!urls.contains(url)) {
+          urls.add(convertDouyinVideoUrl(url));
+        }
       }
-      return null;
     }
 
-    return null;
+    return urls;
+  }
+
+  /// 从单个文本中提取链接（保持向后兼容）
+  static String? extractUrl(String text) {
+    final urls = extractUrls(text);
+    return urls.isNotEmpty ? urls.first : null;
   }
 
   static String convertDouyinVideoUrl(String url) {
     // 匹配抖音视频链接模式
-    final douyinPattern =
-        RegExp(r'^https?://(?:www\.)?douyin\.com/video/(\d+)/?$');
+    final douyinPattern = RegExp(
+      r'^https?://(?:www\.)?douyin\.com/video/(\d+)/?$',
+    );
     final match = douyinPattern.firstMatch(url);
 
     if (match != null) {
@@ -105,6 +116,85 @@ class UrlParser {
     }
 
     return null;
+  }
+
+  /// 从HTML中提取视频标题
+  static String? extractVideoTitle(String html) {
+    try {
+      // 方法1: 从 <title> 标签中提取
+      final titleRegex1 = RegExp(
+        r'<title[^>]*>(.*?)</title>',
+        caseSensitive: false,
+      );
+      final titleMatch1 = titleRegex1.firstMatch(html);
+
+      if (titleMatch1 != null) {
+        final title = titleMatch1.group(1);
+        if (title != null && title.isNotEmpty) {
+          print('从<title>标签提取到标题: $title');
+          return _cleanTitle(title);
+        }
+      }
+
+      // 方法2: 从 meta 标签中提取 og:title
+      final metaRegex = RegExp(
+        r'<meta\s+property="og:title"\s+content="([^"]+)"',
+        caseSensitive: false,
+      );
+      final metaMatch = metaRegex.firstMatch(html);
+
+      if (metaMatch != null) {
+        final title = metaMatch.group(1);
+        if (title != null && title.isNotEmpty) {
+          print('从og:title提取到标题: $title');
+          return _cleanTitle(title);
+        }
+      }
+
+      // 方法3: 从抖音特定的数据结构中提取
+      final douyinTitleRegex = RegExp(
+        r'"desc(?:ription)?"\s*:\s*"([^"]+)"',
+        caseSensitive: false,
+      );
+      final douyinTitleMatch = douyinTitleRegex.firstMatch(html);
+
+      if (douyinTitleMatch != null) {
+        final title = douyinTitleMatch.group(1);
+        if (title != null && title.isNotEmpty) {
+          print('从desc提取到标题: $title');
+          return _cleanTitle(title);
+        }
+      }
+
+      print('未找到视频标题');
+      return null;
+    } catch (e) {
+      print('提取视频标题失败: $e');
+      return null;
+    }
+  }
+
+  /// 清理标题，移除不需要的字符和抖音相关的后缀
+  static String _cleanTitle(String title) {
+    String cleaned = title.trim();
+
+    // 移除抖音相关后缀
+    cleaned = cleaned.replaceAll(RegExp(r'\s*-?\s*抖音.*$'), '');
+    cleaned = cleaned.replaceAll(RegExp(r'\s*-?\s*抖音短视频$'), '');
+    cleaned = cleaned.replaceAll(RegExp(r'\s*-?\s*记录美好生活$'), '');
+    cleaned = cleaned.replaceAll(RegExp(r'\s*#抖音.*$'), '');
+
+    // 移除特殊字符和多余空格
+    cleaned = cleaned.replaceAll(RegExp(r'[<>:"/\\|?*]'), ''); // Windows文件名非法字符
+    cleaned = cleaned.replaceAll(RegExp(r'\s+'), ' '); // 多个空格合并为一个
+    cleaned = cleaned.trim();
+
+    // 限制标题长度
+    if (cleaned.length > 100) {
+      cleaned = cleaned.substring(0, 100);
+    }
+
+    return cleaned.isEmpty ? '抖音视频' : cleaned;
   }
 
   static String generateVideoUrl(String videoId) {

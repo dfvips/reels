@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:douyin_parser/utils/clipboard_utils.dart';
@@ -17,33 +18,71 @@ class HomeScreen extends StatefulWidget {
 }
 
 class _HomeScreenState extends State<HomeScreen> {
-  String? _result;
+  List<String> _results = [];
   bool _isLoading = false;
-  String? _videoUrl;
+  List<String> _videoUrls = [];
+  List<String> _videoTitles = []; // 新增：存储视频标题
 
   // 下载相关状态
   bool _isDownloading = false;
-  int _downloadedBytes = 0;
-  int _totalBytes = 0;
+  int _currentDownloadIndex = 0;
+  int _totalDownloads = 0;
+  List<int> _downloadedBytes = [];
+  List<int> _totalBytes = [];
+  List<bool> _downloadCompleted = [];
   CancelToken? _downloadCancelToken;
+
+  // 用于控制进度 dialog
+  bool _isProgressDialogVisible = false;
+  Completer<void>? _progressDialogCompleter; // 用于跟踪进度对话框的完成
 
   void _parseUrl(String text) async {
     setState(() {
       _isLoading = true;
-      _result = null;
-      _videoUrl = null;
+      _results.clear();
+      _videoUrls.clear();
+      _videoTitles.clear(); // 清空标题列表
     });
 
     try {
-      final result = await VideoExtractor.extractVideoUrl(text);
+      final results = await VideoExtractor.extractMultipleVideoUrls(text);
 
       setState(() {
         _isLoading = false;
-        if (result.success) {
-          _videoUrl = result.videoUrl;
-          _result = result.videoUrl ?? '解析成功但未获取到链接';
+
+        final successfulResults =
+            results
+                .where((result) => result.success && result.videoUrl != null)
+                .toList();
+
+        if (successfulResults.isNotEmpty) {
+          _videoUrls =
+              successfulResults.map((result) => result.videoUrl!).toList();
+          _videoTitles =
+              successfulResults.map((result) {
+                // 使用视频标题，如果没有则使用默认名称
+                return result.videoTitle ?? '抖音视频_${_videoTitles.length + 1}';
+              }).toList();
+          _results = _videoUrls;
+
+          // 初始化下载状态
+          _downloadedBytes = List.filled(_videoUrls.length, 0);
+          _totalBytes = List.filled(_videoUrls.length, 0);
+          _downloadCompleted = List.filled(_videoUrls.length, false);
+
+          _showSuccessToast('成功解析 ${_results.length} 个视频链接');
         } else {
-          _showErrorToast(result.error ?? '解析失败');
+          final errors =
+              results
+                  .where((result) => result.error != null)
+                  .map((result) => result.error!)
+                  .toList();
+
+          if (errors.isNotEmpty) {
+            _showErrorToast('解析失败: ${errors.join(', ')}');
+          } else {
+            _showErrorToast('未找到有效的视频链接');
+          }
         }
       });
     } catch (e) {
@@ -52,6 +91,15 @@ class _HomeScreenState extends State<HomeScreen> {
         _showErrorToast('解析失败: $e');
       });
     }
+  }
+
+  void _showSuccessToast(String message) {
+    BotToast.showText(
+      text: message,
+      duration: const Duration(seconds: 3),
+      contentColor: Colors.green,
+      textStyle: const TextStyle(color: Colors.white, fontSize: 16.0),
+    );
   }
 
   void _showErrorToast(String message) {
@@ -68,9 +116,17 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
-  Future<void> _copyLink() async {
-    if (_result != null && _result!.isNotEmpty) {
-      await ClipboardUtils.copyToClipboard(_result!);
+  Future<void> _copyLinks() async {
+    if (_results.isNotEmpty) {
+      // 按"标题\n链接"的格式复制
+      final allLinks = [];
+      for (int i = 0; i < _videoUrls.length; i++) {
+        final title = _videoTitles[i];
+        final link = _videoUrls[i];
+        allLinks.add('$title\n$link');
+      }
+      final formattedText = allLinks.join('\n\n');
+      await ClipboardUtils.copyToClipboard(formattedText);
     } else {
       _showErrorToast('没有可复制的内容');
     }
@@ -78,23 +134,21 @@ class _HomeScreenState extends State<HomeScreen> {
 
   void _handleDownload() {
     if (!_isDownloading) {
-      _downloadVideo();
+      _downloadVideos();
     }
   }
 
-  // 添加权限请求方法
   Future<bool> _requestPermissions() async {
     try {
       print('HomeScreen: 开始请求权限...');
 
       if (Platform.isAndroid || Platform.isIOS) {
-        // 直接使用 DownloadService 的权限请求方法
         final hasPermission = await DownloadService.requestStoragePermission();
         print('HomeScreen: 权限请求结果: $hasPermission');
         return hasPermission;
       }
 
-      return true; // 桌面平台不需要特殊权限
+      return true;
     } catch (e) {
       print('HomeScreen: 权限请求失败: $e');
       _showErrorToast('权限请求失败，请检查系统设置');
@@ -102,8 +156,8 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
-  Future<void> _downloadVideo() async {
-    if (_videoUrl == null || _videoUrl!.isEmpty) {
+  Future<void> _downloadVideos() async {
+    if (_videoUrls.isEmpty) {
       _showErrorToast('没有可下载的视频链接');
       return;
     }
@@ -125,62 +179,105 @@ class _HomeScreenState extends State<HomeScreen> {
         return;
       }
 
-      // 移动端：显示下载确认对话框
-      final shouldContinue = await _showDownloadConfirmation();
+      final shouldContinue = await _showBatchDownloadConfirmation();
+      if (!shouldContinue) {
+        return;
+      }
+    } else {
+      final shouldContinue = await _showBatchDownloadConfirmation();
       if (!shouldContinue) {
         return;
       }
     }
 
-    final fileName = DownloadService.generateFileName();
+    // 生成基础文件名（批量下载时使用）
+    final baseFileName = DownloadService.generateFileName();
     _downloadCancelToken = CancelToken();
 
     setState(() {
       _isDownloading = true;
-      _downloadedBytes = 0;
-      _totalBytes = 0;
+      _currentDownloadIndex = 0;
+      _totalDownloads = _videoUrls.length;
+      _downloadedBytes = List.filled(_videoUrls.length, 0);
+      _totalBytes = List.filled(_videoUrls.length, 0);
+      _downloadCompleted = List.filled(_videoUrls.length, false);
     });
 
+    // 显示批量下载进度 dialog
+    _showBatchDownloadProgressDialog();
+
     try {
-      // 开始下载
-      final filePath = await DownloadService.downloadVideo(
-        _videoUrl!,
-        fileName,
-        (received, total) {
+      // 开始批量顺序下载
+      final filePaths = await DownloadService.downloadMultipleVideos(
+        _videoUrls,
+        _videoTitles, // 传递视频标题列表
+        baseFileName,
+        (index, received, total) {
           if (mounted) {
             setState(() {
-              _downloadedBytes = received;
-              _totalBytes = total;
+              _downloadedBytes[index] = received;
+              _totalBytes[index] = total;
+              // 更新当前下载索引（总是显示下一个要下载的索引）
+              if (received < total || total == 0) {
+                _currentDownloadIndex = index;
+              } else {
+                // 当前文件下载完成，标记为完成
+                _downloadCompleted[index] = true;
+                // 如果当前文件完成且不是最后一个，显示下一个索引
+                if (index < _videoUrls.length - 1) {
+                  _currentDownloadIndex = index + 1;
+                }
+              }
             });
           }
         },
         _downloadCancelToken,
-        context, // 传递 context 给 DownloadService
+        context,
       );
 
-      // 移动端：下载完成后自动保存到相册
-      if (filePath != null && (Platform.isIOS || Platform.isAndroid)) {
-        // 延迟一点时间再保存到相册，确保文件已经完全写入
-        await Future.delayed(Duration(milliseconds: 500));
+      // 所有下载完成后，显示完成通知
+      final successfulDownloads =
+          filePaths.where((path) => path != null).toList();
 
-        // 保存到相册但不显示额外提示，因为DownloadService内部已经显示了
-        await DownloadService.saveVideoToGallery(filePath);
-
-        // 移动端保存到相册后，可以显示一个简单的成功提示
-        if (mounted) {
-          BotToast.showText(
-            text: '视频已保存到相册',
-            duration: const Duration(seconds: 3),
-            contentColor: Colors.green,
-            textStyle: const TextStyle(color: Colors.white, fontSize: 14),
+      if (successfulDownloads.isNotEmpty) {
+        // 移动端：批量保存到相册
+        if (Platform.isIOS || Platform.isAndroid) {
+          await Future.delayed(Duration(seconds: 1));
+          await DownloadService.saveMultipleVideosToGallery(
+            successfulDownloads.cast<String>(),
           );
-        }
-      }
 
-      // 桌面端：文件保存完成后会弹出对话框，这里不需要额外处理
+          // 移动端：显示完成提示
+          _showSuccessToast(
+            '批量下载完成: ${successfulDownloads.length}/$_totalDownloads 个视频',
+          );
+        } else {
+          // 桌面端：显示统一的完成通知
+          _showSuccessToast(
+            '批量下载完成: ${successfulDownloads.length}/$_totalDownloads 个视频',
+          );
+
+          // 等待进度对话框关闭后再显示下载完成总结
+          if (mounted && successfulDownloads.length > 0) {
+            // 先等待进度对话框关闭完成
+            if (_progressDialogCompleter != null) {
+              await _progressDialogCompleter!.future;
+            }
+
+            // 然后显示总结对话框
+            if (mounted) {
+              await _showDownloadCompleteSummary(
+                successfulDownloads.cast<String>(),
+              );
+            }
+          }
+        }
+      } else {
+        _showErrorToast('下载失败: 0/$_totalDownloads 个视频');
+      }
     } catch (e) {
-      print('HomeScreen: 下载异常: $e');
-      _showErrorToast('下载失败: $e');
+      print('HomeScreen: 批量下载异常: $e');
+      _showErrorToast('批量下载失败: $e');
     } finally {
       if (mounted) {
         setState(() {
@@ -188,61 +285,138 @@ class _HomeScreenState extends State<HomeScreen> {
           _downloadCancelToken = null;
         });
       }
+      _cancelDownload();
+      // Navigator.of(context).pop();
     }
   }
 
-  // 显示去设置对话框
-  void _showSettingsDialog() {
-    BotToast.showAttachedWidget(
-      attachedBuilder:
-          (_) => Card(
-            margin: EdgeInsets.all(10),
-            child: Padding(
-              padding: const EdgeInsets.all(16.0),
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Text(
-                    '权限被拒绝',
-                    style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+  Future<void> _showDownloadCompleteSummary(List<String> filePaths) async {
+    if (filePaths.isEmpty) return;
+
+    await showDialog<void>(
+      context: context,
+      barrierDismissible: false, // 设置为false，不允许点击外部关闭
+      builder: (context) {
+        return AlertDialog(
+          title: const Text('下载完成'),
+          content: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  '已成功下载 ${filePaths.length} 个视频文件：',
+                  style: const TextStyle(
+                    fontSize: 14,
+                    fontWeight: FontWeight.bold,
                   ),
-                  SizedBox(height: 8),
-                  Text('请在系统设置中授予存储权限以继续下载'),
-                  SizedBox(height: 16),
-                  Row(
-                    mainAxisAlignment: MainAxisAlignment.end,
-                    children: [
-                      TextButton(
-                        onPressed: () => BotToast.cleanAll(),
-                        child: Text('取消'),
-                      ),
-                      SizedBox(width: 8),
-                      ElevatedButton(
-                        onPressed: () {
-                          BotToast.cleanAll();
-                          openAppSettings();
-                        },
-                        child: Text('去设置'),
-                      ),
-                    ],
+                ),
+                const SizedBox(height: 12),
+                ...filePaths.take(5).map((path) {
+                  final fileName = path.split('/').last;
+                  return Padding(
+                    padding: const EdgeInsets.symmetric(vertical: 2.0),
+                    child: Text(
+                      '• $fileName',
+                      style: const TextStyle(fontSize: 12),
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  );
+                }).toList(),
+                if (filePaths.length > 5) ...[
+                  const SizedBox(height: 4),
+                  Text(
+                    '... 以及 ${filePaths.length - 5} 个文件',
+                    style: const TextStyle(fontSize: 12, color: Colors.grey),
                   ),
                 ],
-              ),
+              ],
             ),
           ),
-      duration: Duration(seconds: 10),
-      target: Offset(0, 0),
-      preferDirection: PreferDirection.topRight,
+          actions: [
+            TextButton(
+              onPressed: () {
+                Navigator.of(context).pop();
+              },
+              child: const Text('关闭'),
+            ),
+            if (Platform.isMacOS)
+              TextButton(
+                onPressed: () async {
+                  try {
+                    final firstFile = File(filePaths.first);
+                    if (await firstFile.exists()) {
+                      final directory = firstFile.parent.path;
+                      await Process.run('open', [directory]);
+                    }
+                  } catch (e) {
+                    print('打开目录失败: $e');
+                  }
+                  // 注意：不关闭对话框，让用户自己点击关闭
+                },
+                child: const Text('打开文件夹'),
+              ),
+            if (Platform.isWindows)
+              TextButton(
+                onPressed: () async {
+                  try {
+                    final firstFile = File(filePaths.first);
+                    if (await firstFile.exists()) {
+                      final directory = firstFile.parent.path;
+                      await Process.run('explorer', [directory]);
+                    }
+                  } catch (e) {
+                    print('打开目录失败: $e');
+                  }
+                  // 注意：不关闭对话框，让用户自己点击关闭
+                },
+                child: const Text('打开文件夹'),
+              ),
+          ],
+        );
+      },
     );
   }
 
-  Future<bool> _showDownloadConfirmation() async {
+  void _showSettingsDialog() {
+    showDialog(
+      context: context,
+      barrierDismissible: true,
+      builder: (context) {
+        return AlertDialog(
+          title: const Text('权限被拒绝'),
+          content: const Text('请在系统设置中授予存储权限以继续下载'),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(),
+              child: const Text('取消'),
+            ),
+            ElevatedButton(
+              onPressed: () {
+                Navigator.of(context).pop();
+                openAppSettings();
+              },
+              child: const Text('去设置'),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  Future<bool> _showBatchDownloadConfirmation() async {
+    final isDarkMode = Theme.of(context).brightness == Brightness.dark;
+    final primaryColor = Theme.of(context).colorScheme.primary;
+    final onPrimaryColor = Theme.of(context).colorScheme.onPrimary;
+
     return await showDialog<bool>(
           context: context,
           builder: (context) {
             return AlertDialog(
-              title: const Text('下载视频'),
-              content: const Text('确定要下载这个视频吗？下载完成后将自动保存到相册。'),
+              title: const Text('下载确认'),
+              content: Text(
+                '视频将按顺序依次下载，下载完成后${Platform.isAndroid || Platform.isIOS ? '将自动保存到相册' : '将保存到您选择的位置'}。\n确定要顺序下载这 ${_videoUrls.length} 个视频吗？',
+              ),
               actions: [
                 TextButton(
                   onPressed: () {
@@ -250,11 +424,38 @@ class _HomeScreenState extends State<HomeScreen> {
                   },
                   child: const Text('取消'),
                 ),
-                ElevatedButton(
-                  onPressed: () {
-                    Navigator.of(context).pop(true);
-                  },
-                  child: const Text('开始下载'),
+
+                Container(
+                  decoration: BoxDecoration(
+                    borderRadius: BorderRadius.circular(4),
+                    // boxShadow: [
+                    //   BoxShadow(
+                    //     color: Colors.black.withOpacity(0.05),
+                    //     blurRadius: 2,
+                    //     offset: const Offset(0, 1),
+                    //   ),
+                    // ],
+                  ),
+                  child: ElevatedButton(
+                    onPressed: () {
+                      Navigator.of(context).pop(true);
+                    },
+                    style: ElevatedButton.styleFrom(
+                      padding: const EdgeInsets.symmetric(
+                        vertical: 12,
+                        horizontal: 16,
+                      ),
+                      backgroundColor: primaryColor,
+                      foregroundColor:
+                          isDarkMode ? Colors.white : onPrimaryColor,
+                      side: BorderSide.none,
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(16),
+                      ),
+                      elevation: 0,
+                    ),
+                    child: const Text('开始下载'),
+                  ),
                 ),
               ],
             );
@@ -271,6 +472,9 @@ class _HomeScreenState extends State<HomeScreen> {
       });
       _showInfoToast('下载已取消');
     }
+    if (Navigator.of(context).canPop()) {
+      Navigator.of(context).pop();
+    }
   }
 
   void _showInfoToast(String message) {
@@ -278,85 +482,348 @@ class _HomeScreenState extends State<HomeScreen> {
       text: message,
       duration: const Duration(seconds: 2),
       contentColor: Colors.black54,
-      textStyle: const TextStyle(
-        color: Colors.white,
-        fontSize: 16.0,
-        fontWeight: FontWeight.w500,
-      ),
-      borderRadius: BorderRadius.circular(8),
+      textStyle: const TextStyle(color: Colors.white, fontSize: 16.0),
     );
   }
 
-  // 下载进度显示组件
-  Widget _buildDownloadProgress() {
-    if (!_isDownloading) return const SizedBox.shrink();
-
-    // 添加空值检查
-    final progress =
-        _totalBytes > 0
-            ? (_downloadedBytes / _totalBytes).clamp(0.0, 1.0)
-            : 0.0;
-
-    final downloadedSize = DownloadService.formatFileSize(_downloadedBytes);
-    final totalSize = DownloadService.formatFileSize(_totalBytes);
-    final percentage = (progress * 100).toStringAsFixed(1);
-
-    String statusText;
-    if (Platform.isAndroid || Platform.isIOS) {
-      statusText = '下载完成后将自动保存到相册';
-    } else if (Platform.isMacOS || Platform.isWindows) {
-      statusText = '正在下载到用户选择的位置...';
-    } else {
-      statusText = '正在下载中...';
+  // 显示批量下载进度 dialog
+  void _showBatchDownloadProgressDialog() {
+    if (_isProgressDialogVisible) {
+      return;
     }
 
-    return Card(
-      margin: const EdgeInsets.only(bottom: 16),
-      child: Padding(
-        padding: const EdgeInsets.all(16.0),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(
-              mainAxisAlignment: MainAxisAlignment.spaceBetween,
-              children: [
-                const Text(
-                  '正在下载视频...',
-                  style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
-                ),
-                IconButton(
-                  icon: const Icon(Icons.close),
-                  onPressed: _cancelDownload,
-                  tooltip: '取消下载',
-                ),
-              ],
-            ),
-            const SizedBox(height: 12),
-            LinearProgressIndicator(
-              value: progress,
-              backgroundColor: Colors.grey[200],
-              valueColor: AlwaysStoppedAnimation<Color>(
-                Theme.of(context).colorScheme.primary,
+    _isProgressDialogVisible = true;
+    _progressDialogCompleter = Completer<void>();
+
+    showDialog(
+      context: context,
+      barrierDismissible: false, // 不允许点击外部关闭
+      builder: (context) {
+        return StatefulBuilder(
+          builder: (context, setState) {
+            // 保存对话框的 StateSetter 以便更新
+            return AlertDialog(
+              title: Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  const Text('下载进度'),
+                  IconButton(
+                    icon: const Icon(Icons.close, size: 20),
+                    onPressed: () {
+                      _cancelDownload();
+                      // Navigator.of(context).pop(); // 直接关闭对话框
+                    },
+                    tooltip: '关闭',
+                  ),
+                ],
               ),
-            ),
-            const SizedBox(height: 8),
-            Row(
-              mainAxisAlignment: MainAxisAlignment.spaceBetween,
-              children: [
-                Text(
-                  '$percentage%',
-                  style: const TextStyle(fontWeight: FontWeight.bold),
+              content: SizedBox(
+                width: double.infinity,
+                child: StreamBuilder(
+                  stream: Stream.periodic(const Duration(milliseconds: 200)),
+                  builder: (context, snapshot) {
+                    // 计算已完成的数量
+                    int completedCount =
+                        _downloadCompleted
+                            .where((completed) => completed)
+                            .length;
+
+                    // 计算总体进度
+                    double overallProgress = 0.0;
+
+                    if (_totalDownloads > 0) {
+                      // 已完成的文件贡献的进度
+                      double completedProgress =
+                          completedCount / _totalDownloads;
+
+                      // 当前文件的进度贡献
+                      double currentFileProgress = 0.0;
+                      if (_currentDownloadIndex < _totalBytes.length &&
+                          _totalBytes[_currentDownloadIndex] > 0 &&
+                          !_downloadCompleted[_currentDownloadIndex]) {
+                        currentFileProgress =
+                            (_downloadedBytes[_currentDownloadIndex] /
+                                _totalBytes[_currentDownloadIndex]) /
+                            _totalDownloads;
+                      }
+
+                      overallProgress = completedProgress + currentFileProgress;
+                    }
+
+                    overallProgress = overallProgress.clamp(0.0, 1.0);
+
+                    // 当前视频进度
+                    final currentProgress =
+                        _currentDownloadIndex < _totalBytes.length &&
+                                _totalBytes[_currentDownloadIndex] > 0 &&
+                                !_downloadCompleted[_currentDownloadIndex]
+                            ? (_downloadedBytes[_currentDownloadIndex] /
+                                    _totalBytes[_currentDownloadIndex])
+                                .clamp(0.0, 1.0)
+                            : _currentDownloadIndex <
+                                    _downloadCompleted.length &&
+                                _downloadCompleted[_currentDownloadIndex]
+                            ? 1.0
+                            : 0.0;
+
+                    final overallPercentage = (overallProgress * 100)
+                        .toStringAsFixed(1);
+                    final currentPercentage = (currentProgress * 100)
+                        .toStringAsFixed(1);
+
+                    // 计算总下载字节数
+                    int totalDownloaded = 0;
+                    int totalSize = 0;
+
+                    for (var i = 0; i < _downloadedBytes.length; i++) {
+                      totalDownloaded += _downloadedBytes[i];
+                      if (_totalBytes[i] > 0) {
+                        totalSize += _totalBytes[i];
+                      } else if (_downloadCompleted[i]) {
+                        // 如果文件已下载完成但_totalBytes为0，使用_downloadedBytes作为总大小
+                        totalSize += _downloadedBytes[i];
+                      }
+                    }
+
+                    final downloadedSize = DownloadService.formatFileSize(
+                      totalDownloaded,
+                    );
+                    final totalDownloadSize =
+                        totalSize > 0
+                            ? DownloadService.formatFileSize(totalSize)
+                            : '计算中...';
+
+                    String statusText = '正在顺序下载...';
+                    bool allCompleted =
+                        completedCount == _totalDownloads &&
+                        _totalDownloads > 0;
+
+                    if (allCompleted) {
+                      statusText = '所有下载完成！正在关闭进度窗口...';
+
+                      // 所有下载完成后，立即关闭进度对话框
+                      Future.delayed(const Duration(milliseconds: 300), () {
+                        if (mounted && _isProgressDialogVisible) {
+                          Navigator.of(context).pop();
+                          if (_progressDialogCompleter != null &&
+                              !_progressDialogCompleter!.isCompleted) {
+                            _progressDialogCompleter!.complete();
+                          }
+                        }
+                      });
+                    }
+
+                    return Column(
+                      mainAxisSize: MainAxisSize.min,
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        // 总体进度
+                        Row(
+                          children: [
+                            const Text('总体进度:', style: TextStyle(fontSize: 12)),
+                            const SizedBox(width: 8),
+                            Text(
+                              '$completedCount/$_totalDownloads 已完成',
+                              style: const TextStyle(
+                                fontSize: 12,
+                                color: Colors.green,
+                              ),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 4),
+                        LinearProgressIndicator(
+                          value: overallProgress,
+                          backgroundColor: Colors.grey[200],
+                          valueColor: AlwaysStoppedAnimation<Color>(
+                            Theme.of(context).colorScheme.primary,
+                          ),
+                        ),
+                        const SizedBox(height: 4),
+                        Row(
+                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                          children: [
+                            Text(
+                              '$overallPercentage%',
+                              style: const TextStyle(
+                                fontSize: 12,
+                                fontWeight: FontWeight.bold,
+                              ),
+                            ),
+                            Text(
+                              '$downloadedSize / $totalDownloadSize',
+                              style: const TextStyle(fontSize: 12),
+                            ),
+                          ],
+                        ),
+
+                        const SizedBox(height: 12),
+
+                        // 当前视频进度
+                        if (_currentDownloadIndex < _totalDownloads)
+                          Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                '当前视频 (${_currentDownloadIndex + 1}/$_totalDownloads):',
+                                style: const TextStyle(fontSize: 12),
+                              ),
+                              const SizedBox(height: 4),
+                              LinearProgressIndicator(
+                                value: currentProgress,
+                                backgroundColor: Colors.grey[200],
+                                valueColor: AlwaysStoppedAnimation<Color>(
+                                  Theme.of(context).colorScheme.secondary,
+                                ),
+                              ),
+                              const SizedBox(height: 4),
+                              Row(
+                                mainAxisAlignment:
+                                    MainAxisAlignment.spaceBetween,
+                                children: [
+                                  Text(
+                                    '$currentPercentage%',
+                                    style: const TextStyle(
+                                      fontSize: 12,
+                                      fontWeight: FontWeight.bold,
+                                    ),
+                                  ),
+                                  if (_currentDownloadIndex <
+                                          _totalBytes.length &&
+                                      (_totalBytes[_currentDownloadIndex] > 0 ||
+                                          _downloadCompleted[_currentDownloadIndex]))
+                                    Text(
+                                      '${DownloadService.formatFileSize(_downloadedBytes[_currentDownloadIndex])} / '
+                                      '${_totalBytes[_currentDownloadIndex] > 0 ? DownloadService.formatFileSize(_totalBytes[_currentDownloadIndex]) : DownloadService.formatFileSize(_downloadedBytes[_currentDownloadIndex])}',
+                                      style: const TextStyle(fontSize: 12),
+                                    ),
+                                ],
+                              ),
+                            ],
+                          ),
+
+                        const SizedBox(height: 12),
+                        Text(
+                          statusText,
+                          style: TextStyle(
+                            fontSize: 11,
+                            color: allCompleted ? Colors.green : Colors.grey,
+                          ),
+                        ),
+                      ],
+                    );
+                  },
                 ),
-                Text('$downloadedSize / $totalSize'),
+              ),
+            );
+          },
+        );
+      },
+    ).then((_) {
+      // dialog 被关闭后的回调
+      if (mounted) {
+        setState(() {
+          _isProgressDialogVisible = false;
+        });
+      }
+
+      // 完成 completer
+      if (_progressDialogCompleter != null &&
+          !_progressDialogCompleter!.isCompleted) {
+        _progressDialogCompleter!.complete();
+      }
+    });
+  }
+
+  void _showSupportedFormats() {
+    showDialog(
+      context: context,
+      barrierDismissible: true,
+      builder: (context) {
+        return AlertDialog(
+          title: const Text(
+            '使用说明',
+            style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+          ),
+          content: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text('支持解析以下链接格式：', style: TextStyle(fontSize: 14)),
+                const SizedBox(height: 12),
+                _buildFormatItem(
+                  '5.12 复制打开抖音，看看【赵今麦angel的作品】小林～拍照📷# 剧剧抖有戏  https://v.douyin.com/HUbJB4-GQdc/ 03/26 e@b.nD yGi:/ ',
+                ),
+                _buildFormatItem('https://v.douyin.com/L8tSCYe-sC4'),
+                _buildFormatItem(
+                  'https://www.douyin.com/video/7588361322312650038',
+                ),
+                _buildFormatItem(
+                  'https://m.douyin.com/share/video/7588361322312650038',
+                ),
+                _buildFormatItem(
+                  'https://www.iesdouyin.com/share/video/7588361322312650038',
+                ),
+                const SizedBox(height: 16),
+                Container(
+                  padding: const EdgeInsets.all(0),
+                  child: Row(
+                    children: [
+                      Transform.rotate(
+                        angle: -45 * (3.14159 / 180),
+                        child: Icon(Icons.link, size: 16, color: Colors.blue),
+                      ),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: Text(
+                          '支持批量粘贴多个抖音分享链接，系统会自动提取所有有效链接。',
+                          style: TextStyle(
+                            fontSize: 13,
+                            color: Colors.grey[600],
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
               ],
             ),
-            const SizedBox(height: 4),
-            Text(
-              statusText,
-              style: const TextStyle(fontSize: 12, color: Colors.grey),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () {
+                Navigator.of(context).pop();
+              },
+              child: const Text('知道了'),
             ),
           ],
-        ),
+        );
+      },
+    );
+  }
+
+  Widget _buildFormatItem(String url) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 4.0),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Padding(
+            padding: EdgeInsets.only(top: 2.0, right: 8.0),
+            child: Icon(Icons.check_circle, size: 16, color: Colors.green),
+          ),
+          Expanded(
+            child: SelectableText(
+              url,
+              style: const TextStyle(
+                fontSize: 13,
+                fontFamily: 'Monospace',
+                color: Colors.blue,
+              ),
+            ),
+          ),
+        ],
       ),
     );
   }
@@ -365,38 +832,53 @@ class _HomeScreenState extends State<HomeScreen> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const Text('抖音视频解析工具'),
-        centerTitle: true,
+        title: Row(
+          children: [
+            Icon(Icons.play_circle_filled, color: Color(0xFF3586F9), size: 26),
+            SizedBox(width: 4),
+            const Text(
+              '抖音视频解析',
+              style: TextStyle(
+                color: Color(0xFF3586F9),
+                fontSize: 20,
+                fontWeight: FontWeight.bold,
+              ),
+            ),
+          ],
+        ),
         actions: [
           IconButton(
-            icon: const Icon(Icons.settings),
-            onPressed: () {
-              Navigator.pushNamed(context, '/settings');
-            },
+            icon: const Icon(Icons.contact_support),
+            onPressed: _showSupportedFormats,
+            tooltip: '帮助',
+          ),
+          Padding(
+            padding: const EdgeInsets.only(right: 10),
+            child: IconButton(
+              icon: const Icon(Icons.settings),
+              onPressed: () {
+                Navigator.pushNamed(context, '/settings');
+              },
+              tooltip: '设置',
+            ),
           ),
         ],
       ),
       body: SingleChildScrollView(
-        padding: const EdgeInsets.all(16.0),
+        padding: const EdgeInsets.fromLTRB(16, 16, 16, 16),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            // 输入区域
             UrlInput(onParse: _parseUrl),
 
-            const SizedBox(height: 24),
-
-            // 下载进度显示
-            _buildDownloadProgress(),
-
-            // 解析状态
             if (_isLoading)
               Column(
                 children: [
+                  const SizedBox(height: 24),
                   const CircularProgressIndicator(),
                   const SizedBox(height: 16),
                   Text(
-                    '正在解析中...',
+                    '正在解析链接...',
                     style: TextStyle(
                       color: Theme.of(context).colorScheme.secondary,
                       fontSize: 16,
@@ -404,10 +886,11 @@ class _HomeScreenState extends State<HomeScreen> {
                   ),
                 ],
               )
-            else if (_result != null)
+            else if (_results.isNotEmpty)
               ResultDisplay(
-                result: _result!,
-                onCopy: _copyLink,
+                results: _results,
+                titles: _videoTitles,
+                onCopy: _copyLinks,
                 onDownload: _handleDownload,
               ),
           ],
@@ -418,10 +901,16 @@ class _HomeScreenState extends State<HomeScreen> {
 
   @override
   void dispose() {
-    // 清理下载任务
     if (_downloadCancelToken != null && !_downloadCancelToken!.isCancelled) {
       _downloadCancelToken!.cancel();
     }
+
+    // 完成 completer 避免内存泄漏
+    if (_progressDialogCompleter != null &&
+        !_progressDialogCompleter!.isCompleted) {
+      _progressDialogCompleter!.complete();
+    }
+
     super.dispose();
   }
 }

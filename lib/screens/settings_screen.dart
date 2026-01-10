@@ -32,175 +32,291 @@ class _SettingsScreenState extends State<SettingsScreen> {
   @override
   Widget build(BuildContext context) {
     final settings = Provider.of<AppSettings>(context);
+    final isDarkMode = Theme.of(context).brightness == Brightness.dark;
+
+    // 获取主题色
+    final primaryColor = Theme.of(context).colorScheme.primary;
+    final onPrimaryColor = Theme.of(context).colorScheme.onPrimary;
+
+    // 设置全局背景色
+    final backgroundColor = isDarkMode ? Color(0xFF141414) : Colors.white;
 
     return Scaffold(
-      appBar: AppBar(title: const Text('设置'), centerTitle: true),
-      body: ListView(
-        children: [
-          const SizedBox(height: 8),
+      appBar: AppBar(
+        title: const Text('设置'),
+        centerTitle: true,
+        backgroundColor: isDarkMode ? Color(0xFF141414) : Colors.white,
+      ),
+      backgroundColor: backgroundColor, // 设置页面背景色
+      body: Container(
+        color: backgroundColor, // 设置列表容器背景色
+        child: ListView(
+          children: [
+            const SizedBox(height: 8),
 
-          // 保存位置设置（仅桌面端显示）
-          if (Platform.isMacOS || Platform.isWindows || Platform.isLinux)
-            Column(
-              children: [
-                SettingItem(
-                  title: '保存位置',
-                  subtitle: '设置视频保存的默认位置',
-                  icon: Icons.folder,
-                  onTap: () {
-                    _showSaveLocationSettings(context);
-                  },
-                ),
-                const Divider(height: 1),
-              ],
-            ),
-
-          // 主题设置 - 修改为可点击整个项
-          Material(
-            color: Theme.of(context).colorScheme.surface,
-            child: InkWell(
-              onTap: () {
-                _showThemeDialog(context, settings);
-              },
-              child: Container(
-                padding: const EdgeInsets.symmetric(
-                  horizontal: 16,
-                  vertical: 12,
-                ),
-                child: Row(
-                  children: [
-                    Container(
-                      margin: const EdgeInsets.only(right: 16),
-                      child: Icon(
-                        Icons.color_lens,
-                        color: Theme.of(context).colorScheme.primary,
-                        size: 24,
-                      ),
-                    ),
-                    Expanded(
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          const Text(
-                            '主题设置',
-                            style: TextStyle(
-                              fontSize: 16,
-                              fontWeight: FontWeight.w500,
+            // 保存位置设置（仅桌面端显示）
+            if (Platform.isMacOS || Platform.isWindows || Platform.isLinux)
+              Column(
+                children: [
+                  // 保存位置项 - 修改为与主题设置相同样式
+                  Material(
+                    color: backgroundColor,
+                    child: InkWell(
+                      onTap: () {
+                        _showSaveLocationSettings(context);
+                      },
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 16,
+                          vertical: 12,
+                        ),
+                        child: Row(
+                          children: [
+                            Container(
+                              margin: const EdgeInsets.only(right: 16),
+                              child: Icon(
+                                Icons.folder,
+                                color: Theme.of(context).colorScheme.primary,
+                                size: 24,
+                              ),
                             ),
-                          ),
-                          const SizedBox(height: 4),
-                          Text(
-                            '当前: ${settings.themeName}',
-                            style: TextStyle(
-                              fontSize: 14,
-                              color:
-                                  Theme.of(
-                                    context,
-                                  ).colorScheme.onSurfaceVariant,
-                            ),
-                          ),
-                        ],
-                      ),
-                    ),
-                    Icon(
-                      Icons.chevron_right,
-                      color: Theme.of(context).colorScheme.onSurfaceVariant,
-                    ),
-                  ],
-                ),
-              ),
-            ),
-          ),
-          const Divider(height: 1),
-
-          // 关于
-          SettingItem(
-            title: '关于',
-            subtitle: '应用版本: 20260106',
-            icon: Icons.info_outline,
-            onTap: () {
-              _showAboutDialog(context);
-            },
-          ),
-          const Divider(height: 1),
-
-          // 清除缓存 - 显示缓存大小和位置
-          Material(
-            color: Theme.of(context).colorScheme.surface,
-            child: InkWell(
-              onTap: () {
-                _showClearCacheDialog(context);
-              },
-              child: Container(
-                padding: const EdgeInsets.symmetric(
-                  horizontal: 16,
-                  vertical: 12,
-                ),
-                child: Row(
-                  children: [
-                    Container(
-                      margin: const EdgeInsets.only(right: 16),
-                      child: Icon(
-                        Icons.delete_outline,
-                        color: Theme.of(context).colorScheme.primary,
-                        size: 24,
-                      ),
-                    ),
-                    Expanded(
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          const Text(
-                            '清除缓存',
-                            style: TextStyle(
-                              fontSize: 16,
-                              fontWeight: FontWeight.w500,
-                            ),
-                          ),
-                          const SizedBox(height: 4),
-                          Consumer<AppSettings>(
-                            builder: (context, settings, child) {
-                              return Column(
+                            Expanded(
+                              child: Column(
                                 crossAxisAlignment: CrossAxisAlignment.start,
                                 children: [
                                   Text(
-                                    '当前缓存: ${settings.cacheSize}',
+                                    '存储设置',
+                                    style: TextStyle(
+                                      fontSize: 16,
+                                      fontWeight: FontWeight.w500,
+                                      color:
+                                          isDarkMode
+                                              ? Colors.white
+                                              : Colors.black,
+                                    ),
+                                  ),
+                                  const SizedBox(height: 4),
+                                  Text(
+                                    '设置视频保存的默认位置',
                                     style: TextStyle(
                                       fontSize: 14,
                                       color:
-                                          Theme.of(
-                                            context,
-                                          ).colorScheme.onSurfaceVariant,
+                                          isDarkMode
+                                              ? Colors.white.withOpacity(0.7)
+                                              : Color(0xFF606266),
                                     ),
                                   ),
-                                  if (settings.cachePaths.isNotEmpty)
-                                    Text(
-                                      '${settings.cachePaths.length}个位置',
-                                      style: TextStyle(
-                                        fontSize: 12,
-                                        color: Theme.of(context)
-                                            .colorScheme
-                                            .onSurfaceVariant
-                                            .withOpacity(0.7),
-                                      ),
-                                    ),
                                 ],
-                              );
-                            },
-                          ),
-                        ],
+                              ),
+                            ),
+                          ],
+                        ),
                       ),
                     ),
-                    Icon(
-                      Icons.chevron_right,
-                      color: Theme.of(context).colorScheme.onSurfaceVariant,
-                    ),
-                  ],
+                  ),
+                  Divider(
+                    height: 1,
+                    color: isDarkMode ? Color(0xFF333333) : Color(0xFFEBEEF5),
+                  ),
+                ],
+              ),
+
+            // 主题设置 - 修改为可点击整个项
+            Material(
+              color: backgroundColor, // 使用全局背景色
+              child: InkWell(
+                onTap: () {
+                  _showThemeDialog(context, settings);
+                },
+                child: Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 16,
+                    vertical: 12,
+                  ),
+                  child: Row(
+                    children: [
+                      Container(
+                        margin: const EdgeInsets.only(right: 16),
+                        child: Icon(
+                          Icons.color_lens,
+                          color: Theme.of(context).colorScheme.primary,
+                          size: 24,
+                        ),
+                      ),
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              '主题设置',
+                              style: TextStyle(
+                                fontSize: 16,
+                                fontWeight: FontWeight.w500,
+                                color: isDarkMode ? Colors.white : Colors.black,
+                              ),
+                            ),
+                            const SizedBox(height: 4),
+                            Text(
+                              '当前: ${settings.themeName}',
+                              style: TextStyle(
+                                fontSize: 14,
+                                color:
+                                    isDarkMode
+                                        ? Colors.white.withOpacity(0.7)
+                                        : Color(0xFF606266),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                      // 移除右侧箭头图标，因为没有下级菜单
+                    ],
+                  ),
                 ),
               ),
             ),
-          ),
-        ],
+            Divider(
+              height: 1,
+              color: isDarkMode ? Color(0xFF333333) : Color(0xFFEBEEF5),
+            ),
+
+            // 关于 - 修改为与主题设置相同样式
+            Material(
+              color: backgroundColor,
+              child: InkWell(
+                onTap: () {
+                  _showAboutDialog(context);
+                },
+                child: Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 16,
+                    vertical: 12,
+                  ),
+                  child: Row(
+                    children: [
+                      Container(
+                        margin: const EdgeInsets.only(right: 16),
+                        child: Icon(
+                          Icons.info_outline,
+                          color: Theme.of(context).colorScheme.primary,
+                          size: 24,
+                        ),
+                      ),
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              '关于',
+                              style: TextStyle(
+                                fontSize: 16,
+                                fontWeight: FontWeight.w500,
+                                color: isDarkMode ? Colors.white : Colors.black,
+                              ),
+                            ),
+                            const SizedBox(height: 4),
+                            Text(
+                              '应用版本: 20260110',
+                              style: TextStyle(
+                                fontSize: 14,
+                                color:
+                                    isDarkMode
+                                        ? Colors.white.withOpacity(0.7)
+                                        : Color(0xFF606266),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                      // 移除右侧箭头图标，因为没有下级菜单
+                    ],
+                  ),
+                ),
+              ),
+            ),
+            Divider(
+              height: 1,
+              color: isDarkMode ? Color(0xFF333333) : Color(0xFFEBEEF5),
+            ),
+
+            // 清除缓存 - 显示缓存大小和位置
+            Material(
+              color: backgroundColor, // 使用全局背景色
+              child: InkWell(
+                onTap: () {
+                  _showClearCacheDialog(context);
+                },
+                child: Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 16,
+                    vertical: 12,
+                  ),
+                  child: Row(
+                    children: [
+                      Container(
+                        margin: const EdgeInsets.only(right: 16),
+                        child: Icon(
+                          Icons.delete_outline,
+                          color: Theme.of(context).colorScheme.primary,
+                          size: 24,
+                        ),
+                      ),
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              '清除缓存',
+                              style: TextStyle(
+                                fontSize: 16,
+                                fontWeight: FontWeight.w500,
+                                color: isDarkMode ? Colors.white : Colors.black,
+                              ),
+                            ),
+                            const SizedBox(height: 4),
+                            Consumer<AppSettings>(
+                              builder: (context, settings, child) {
+                                return Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    Text(
+                                      '当前缓存: ${settings.cacheSize}',
+                                      style: TextStyle(
+                                        fontSize: 14,
+                                        color:
+                                            isDarkMode
+                                                ? Colors.white.withOpacity(0.7)
+                                                : Color(0xFF606266),
+                                      ),
+                                    ),
+                                    if (settings.cachePaths.isNotEmpty)
+                                      Text(
+                                        '${settings.cachePaths.length}个位置',
+                                        style: TextStyle(
+                                          fontSize: 12,
+                                          color:
+                                              isDarkMode
+                                                  ? Colors.white.withOpacity(
+                                                    0.5,
+                                                  )
+                                                  : Color(0xFF909399),
+                                        ),
+                                      ),
+                                  ],
+                                );
+                              },
+                            ),
+                          ],
+                        ),
+                      ),
+                      // 移除右侧箭头图标，因为没有下级菜单
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -398,6 +514,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
   // 显示清除缓存对话框
   void _showClearCacheDialog(BuildContext context) {
     final settings = Provider.of<AppSettings>(context, listen: false);
+    final isDarkMode = Theme.of(context).brightness == Brightness.dark;
+    final primaryColor = Theme.of(context).colorScheme.primary;
+    final onPrimaryColor = Theme.of(context).colorScheme.onPrimary;
 
     showDialog(
       context: context,
@@ -451,30 +570,55 @@ class _SettingsScreenState extends State<SettingsScreen> {
               onPressed: () => Navigator.pop(context),
               child: const Text('取消'),
             ),
-            ElevatedButton(
-              onPressed: () async {
-                Navigator.pop(context);
+            Container(
+              decoration: BoxDecoration(
+                borderRadius: BorderRadius.circular(4),
+                // boxShadow: [
+                //   BoxShadow(
+                //     color: Colors.black.withOpacity(0.05),
+                //     blurRadius: 2,
+                //     offset: const Offset(0, 1),
+                //   ),
+                // ],
+              ),
+              child: ElevatedButton(
+                onPressed: () async {
+                  Navigator.pop(context);
 
-                // 显示清理中的提示
-                final cancel = BotToast.showLoading();
+                  // 显示清理中的提示
+                  final cancel = BotToast.showLoading();
 
-                try {
-                  final result = await settings.clearCache();
+                  try {
+                    final result = await settings.clearCache();
 
-                  BotToast.closeAllLoading();
+                    BotToast.closeAllLoading();
 
-                  // 显示清理结果
-                  _showCleanResultDialog(context, result);
-                } catch (e) {
-                  BotToast.closeAllLoading();
-                  BotToast.showText(
-                    text: '清除缓存失败: $e',
-                    duration: const Duration(seconds: 3),
-                    contentColor: Colors.red,
-                  );
-                }
-              },
-              child: const Text('清理'),
+                    // 显示清理结果
+                    _showCleanResultDialog(context, result);
+                  } catch (e) {
+                    BotToast.closeAllLoading();
+                    BotToast.showText(
+                      text: '清除缓存失败: $e',
+                      duration: const Duration(seconds: 3),
+                      contentColor: Colors.red,
+                    );
+                  }
+                },
+                style: ElevatedButton.styleFrom(
+                  padding: const EdgeInsets.symmetric(
+                    vertical: 12,
+                    horizontal: 16,
+                  ),
+                  backgroundColor: primaryColor,
+                  foregroundColor: isDarkMode ? Colors.white : onPrimaryColor,
+                  side: BorderSide.none,
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(16),
+                  ),
+                  elevation: 0,
+                ),
+                child: const Text('清理'),
+              ),
             ),
           ],
         );
@@ -594,13 +738,24 @@ class _SettingsScreenState extends State<SettingsScreen> {
       bool tempSkipLocationPrompt = skipLocationPrompt;
       bool tempSkipFilenameCustom = skipFilenameCustom;
 
+      // 获取主题色
+      final isDarkMode = Theme.of(context).brightness == Brightness.dark;
+      final primaryColor = Theme.of(context).colorScheme.primary;
+      final onPrimaryColor = Theme.of(context).colorScheme.onPrimary;
+
+      // 深色模式颜色定义
+      const Color darkClearBgColor = Color(0xFF18232B); // 清空按钮背景色
+      const Color darkClearBorderColor = Color(0xFF409EFF); // 清空按钮边框色
+      const Color darkClearTextColor = Color(0xFF409EFF); // 清空按钮文本色
+      const Color lightEnabledBgColor = Color(0xFFECF5FF);
+
       final result = await showDialog<Map<String, dynamic>>(
         context: context,
         builder: (context) {
           return StatefulBuilder(
             builder: (context, setState) {
               return AlertDialog(
-                title: const Text('保存位置设置'),
+                title: const Text('存储设置'),
                 content: SingleChildScrollView(
                   child: Column(
                     mainAxisSize: MainAxisSize.min,
@@ -608,39 +763,122 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     children: [
                       // 当前保存位置
                       const Text('当前保存位置:'),
-                      const SizedBox(height: 4),
-                      Container(
-                        padding: const EdgeInsets.all(8),
-                        decoration: BoxDecoration(
-                          color: Colors.grey[100],
-                          borderRadius: BorderRadius.circular(4),
-                        ),
-                        child: Text(
-                          currentLocation ?? '未设置',
-                          style: const TextStyle(fontSize: 12),
-                        ),
+                      Column(
+                        children: [
+                          const SizedBox(height: 4),
+                          // 使用 IntrinsicWidth 可以强制子元素适应 Column 的宽度
+                          IntrinsicWidth(
+                            child: Container(
+                              width: 300, // 确保 Container 尽可能宽
+                              padding: const EdgeInsets.all(8),
+                              decoration: BoxDecoration(
+                                color:
+                                    isDarkMode
+                                        ? const Color(0xFF1A222C)
+                                        : const Color(0xFFEEF5FF),
+                                borderRadius: BorderRadius.circular(4),
+                              ),
+                              child: Text(
+                                currentLocation ?? '未设置',
+                                style: TextStyle(
+                                  fontSize: 12,
+                                  color:
+                                      isDarkMode
+                                          ? Colors.white
+                                          : const Color(0xFF409eff),
+                                ),
+                                softWrap: true,
+                              ),
+                            ),
+                          ),
+                          const SizedBox(height: 16),
+                        ],
                       ),
-                      const SizedBox(height: 12),
 
-                      // 更改位置按钮
-                      OutlinedButton.icon(
-                        icon: const Icon(Icons.folder_open, size: 16),
-                        label: const Text('更改保存位置'),
-                        onPressed: () async {
-                          Navigator.of(
-                            context,
-                          ).pop({'action': 'change_location'});
-                        },
-                      ),
-                      const SizedBox(height: 16),
+                      // 按钮行：更改和重置
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                        children: [
+                          // 更改按钮 - 使用解析按钮样式
+                          Expanded(
+                            child: MouseRegion(
+                              cursor: SystemMouseCursors.click,
+                              child: Container(
+                                decoration: BoxDecoration(
+                                  borderRadius: BorderRadius.circular(4),
+                                  // boxShadow: [
+                                  //   BoxShadow(
+                                  //     color: Colors.black.withOpacity(0.05),
+                                  //     blurRadius: 2,
+                                  //     offset: const Offset(0, 1),
+                                  //   ),
+                                  // ],
+                                ),
+                                child: ElevatedButton(
+                                  onPressed: () async {
+                                    Navigator.of(
+                                      context,
+                                    ).pop({'action': 'change_location'});
+                                  },
+                                  style: ElevatedButton.styleFrom(
+                                    padding: const EdgeInsets.symmetric(
+                                      vertical: 12,
+                                    ),
+                                    backgroundColor: primaryColor,
+                                    foregroundColor:
+                                        isDarkMode
+                                            ? Colors.white
+                                            : onPrimaryColor,
+                                    side: BorderSide.none,
+                                    shape: RoundedRectangleBorder(
+                                      borderRadius: BorderRadius.circular(16),
+                                    ),
+                                    elevation: 0,
+                                  ),
+                                  child: const Text('更改'),
+                                ),
+                              ),
+                            ),
+                          ),
 
-                      // 重置按钮
-                      OutlinedButton.icon(
-                        icon: const Icon(Icons.restart_alt, size: 16),
-                        label: const Text('重置保存设置'),
-                        onPressed: () async {
-                          Navigator.of(context).pop({'action': 'reset'});
-                        },
+                          const SizedBox(width: 16),
+                          // 重置按钮 - 使用清空按钮样式
+                          Expanded(
+                            child: MouseRegion(
+                              cursor: SystemMouseCursors.click,
+                              child: Container(
+                                decoration: BoxDecoration(
+                                  borderRadius: BorderRadius.circular(4),
+                                ),
+                                child: TextButton(
+                                  onPressed: () async {
+                                    Navigator.of(
+                                      context,
+                                    ).pop({'action': 'reset'});
+                                  },
+                                  style: TextButton.styleFrom(
+                                    padding: const EdgeInsets.symmetric(
+                                      vertical: 12,
+                                    ),
+                                    backgroundColor:
+                                        isDarkMode
+                                            ? darkClearBgColor
+                                            : lightEnabledBgColor,
+                                    foregroundColor: darkClearTextColor,
+                                    side: BorderSide(
+                                      color: darkClearBorderColor,
+                                      width: 1,
+                                    ),
+                                    shape: RoundedRectangleBorder(
+                                      borderRadius: BorderRadius.circular(16),
+                                    ),
+                                  ),
+                                  child: const Text('重置'),
+                                ),
+                              ),
+                            ),
+                          ),
+                        ],
                       ),
                       const SizedBox(height: 16),
 
@@ -650,23 +888,11 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
                       CheckboxListTile(
                         title: const Text('不再提示保存位置'),
-                        subtitle: const Text('下次直接使用当前设置的位置保存'),
+                        subtitle: const Text('下次直接保存到此位置'),
                         value: tempSkipLocationPrompt,
                         onChanged: (value) {
                           setState(() {
                             tempSkipLocationPrompt = value ?? false;
-                          });
-                        },
-                        dense: true,
-                        contentPadding: EdgeInsets.zero,
-                      ),
-                      CheckboxListTile(
-                        title: const Text('不再提示文件名自定义'),
-                        subtitle: const Text('下次直接保存，不再弹出文件名输入窗口'),
-                        value: tempSkipFilenameCustom,
-                        onChanged: (value) {
-                          setState(() {
-                            tempSkipFilenameCustom = value ?? false;
                           });
                         },
                         dense: true,
@@ -681,15 +907,40 @@ class _SettingsScreenState extends State<SettingsScreen> {
                         () => Navigator.of(context).pop({'action': 'cancel'}),
                     child: const Text('取消'),
                   ),
-                  ElevatedButton(
-                    onPressed: () {
-                      Navigator.of(context).pop({
-                        'action': 'save',
-                        'skipLocationPrompt': tempSkipLocationPrompt,
-                        'skipFilenameCustom': tempSkipFilenameCustom,
-                      });
-                    },
-                    child: const Text('保存'),
+                  Container(
+                    decoration: BoxDecoration(
+                      borderRadius: BorderRadius.circular(4),
+                      // boxShadow: [
+                      //   BoxShadow(
+                      //     color: Colors.black.withOpacity(0.05),
+                      //     blurRadius: 2,
+                      //     offset: const Offset(0, 1),
+                      //   ),
+                      // ],
+                    ),
+                    child: ElevatedButton(
+                      onPressed: () {
+                        Navigator.of(context).pop({
+                          'action': 'save',
+                          'skipLocationPrompt': tempSkipLocationPrompt,
+                        });
+                      },
+                      style: ElevatedButton.styleFrom(
+                        padding: const EdgeInsets.symmetric(
+                          vertical: 12,
+                          horizontal: 16,
+                        ),
+                        backgroundColor: primaryColor,
+                        foregroundColor:
+                            isDarkMode ? Colors.white : onPrimaryColor,
+                        side: BorderSide.none,
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(16),
+                        ),
+                        elevation: 0,
+                      ),
+                      child: const Text('保存'),
+                    ),
                   ),
                 ],
               );
@@ -713,14 +964,12 @@ class _SettingsScreenState extends State<SettingsScreen> {
         await DownloadService.setSkipLocationPrompt(
           result['skipLocationPrompt'] as bool,
         );
-        await DownloadService.setSkipFilenameCustomization(
-          result['skipFilenameCustom'] as bool,
-        );
 
         BotToast.showText(
           text: '设置已保存',
           duration: const Duration(seconds: 2),
-          contentColor: Colors.green,
+          contentColor: Colors.black54,
+          textStyle: const TextStyle(color: Colors.white, fontSize: 16.0),
         );
         return;
       }
@@ -767,9 +1016,35 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     onPressed: () => Navigator.of(context).pop(false),
                     child: const Text('取消'),
                   ),
-                  ElevatedButton(
-                    onPressed: () => Navigator.of(context).pop(true),
-                    child: const Text('重置'),
+                  Container(
+                    decoration: BoxDecoration(
+                      borderRadius: BorderRadius.circular(4),
+                      // boxShadow: [
+                      //   BoxShadow(
+                      //     color: Colors.black.withOpacity(0.05),
+                      //     blurRadius: 2,
+                      //     offset: const Offset(0, 1),
+                      //   ),
+                      // ],
+                    ),
+                    child: ElevatedButton(
+                      onPressed: () => Navigator.of(context).pop(true),
+                      style: ElevatedButton.styleFrom(
+                        padding: const EdgeInsets.symmetric(
+                          vertical: 12,
+                          horizontal: 16,
+                        ),
+                        backgroundColor: primaryColor,
+                        foregroundColor:
+                            isDarkMode ? Colors.white : onPrimaryColor,
+                        side: BorderSide.none,
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(16),
+                        ),
+                        elevation: 0,
+                      ),
+                      child: const Text('重置'),
+                    ),
                   ),
                 ],
               ),
@@ -780,7 +1055,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
           BotToast.showText(
             text: '保存设置已重置',
             duration: const Duration(seconds: 2),
-            contentColor: Colors.green,
+            contentColor: Colors.black54,
+            textStyle: const TextStyle(color: Colors.white, fontSize: 16.0),
           );
           // 重新打开设置对话框
           Future.delayed(const Duration(milliseconds: 300), () {
@@ -825,7 +1101,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
                 ),
                 SizedBox(height: 8),
-                Text('版本: 20260106'),
+                Text('版本: 20260110'),
                 SizedBox(height: 8),
                 Text('功能: 解析抖音视频链接，获取视频下载地址'),
                 SizedBox(height: 8),

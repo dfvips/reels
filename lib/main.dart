@@ -64,7 +64,7 @@ class MyApp extends StatelessWidget {
           return MaterialApp(
             debugShowCheckedModeBanner: false,
             navigatorKey: navigatorKey,
-            title: '抖音视频解析工具',
+            title: '抖音视频解析',
 
             // 添加本地化委托
             localizationsDelegates: const [

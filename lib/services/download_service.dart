@@ -15,6 +15,9 @@ import 'package:shared_preferences/shared_preferences.dart';
 class DownloadService {
   static final Dio _dio = Dio();
   static CancelToken? _currentCancelToken;
+  static const String _downloadCacheDirName = 'douyin_parser_download_cache';
+  static const int _chunkCount = 4;
+  static const int _maxChunkRetries = 3;
 
   // 存储设置的键名
   static const String _rememberLocationKey = 'remember_download_location';
@@ -29,6 +32,322 @@ class DownloadService {
     const suffixes = ["B", "KB", "MB", "GB", "TB"];
     final i = (log(bytes) / log(1024)).floor();
     return '${(bytes / pow(1024, i)).toStringAsFixed(1)} ${suffixes[i]}';
+  }
+
+  static Future<String> getDownloadCacheDirectoryPath() async {
+    return (await _getDownloadCacheDirectory()).path;
+  }
+
+  static Future<void> clearDownloadCache() async {
+    final dir = await _getDownloadCacheDirectory();
+    if (await dir.exists()) {
+      await dir.delete(recursive: true);
+    }
+    await dir.create(recursive: true);
+  }
+
+  static Future<Directory> _getDownloadCacheDirectory() async {
+    Directory baseDir;
+    try {
+      baseDir = await getApplicationSupportDirectory();
+    } catch (_) {
+      baseDir = await getApplicationDocumentsDirectory();
+    }
+    final dir = Directory(path.join(baseDir.path, _downloadCacheDirName));
+    if (!await dir.exists()) {
+      await dir.create(recursive: true);
+    }
+    return dir;
+  }
+
+  static Future<Directory> _createDownloadSessionDirectory(
+    String filePath,
+  ) async {
+    final baseDir = await _getDownloadCacheDirectory();
+    final safeBaseName = _safeFileBaseName(
+      path.basenameWithoutExtension(filePath),
+    );
+    final sessionId =
+        '${DateTime.now().millisecondsSinceEpoch}_${Random().nextInt(1 << 32)}';
+    final dir = Directory(
+      path.join(baseDir.path, '${safeBaseName}_$sessionId'),
+    );
+    await dir.create(recursive: true);
+    return dir;
+  }
+
+  static String _safeFileBaseName(String input) {
+    var name = input.trim();
+    if (name.isEmpty) return 'download';
+    name = name.replaceAll(RegExp(r'[<>:"/\\|?*\x00-\x1F]'), '_');
+    name = name.replaceAll(RegExp(r'\s+'), ' ').trim();
+    if (name.length > 120) {
+      name = name.substring(0, 120);
+    }
+    return name.isEmpty ? 'download' : name;
+  }
+
+  static Map<String, String> _buildCommonHeaders({String? range}) {
+    final headers = <String, String>{
+      'User-Agent':
+          Platform.isIOS
+              ? 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 Mobile/15E148 Safari/604.1'
+              : Platform.isAndroid
+              ? 'Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36'
+              : Platform.isWindows
+              ? 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+              : 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      'Referer': 'https://www.douyin.com/',
+      'Accept': '*/*',
+    };
+    if (range != null && range.isNotEmpty) {
+      headers['Range'] = range;
+    }
+    return headers;
+  }
+
+  static int? _parseTotalSizeFromContentRange(String? contentRange) {
+    if (contentRange == null) return null;
+    final match = RegExp(
+      r'bytes\s+\d+-\d+/(\d+|\*)',
+      caseSensitive: false,
+    ).firstMatch(contentRange);
+    if (match == null) return null;
+    final value = match.group(1);
+    if (value == null || value == '*') return null;
+    return int.tryParse(value);
+  }
+
+  static Future<_RemoteFileInfo> _probeRemoteFileInfo(
+    String url,
+    CancelToken? cancelToken,
+  ) async {
+    try {
+      final response = await _dio.get<List<int>>(
+        url,
+        cancelToken: cancelToken,
+        options: Options(
+          headers: _buildCommonHeaders(range: 'bytes=0-0'),
+          followRedirects: true,
+          maxRedirects: 5,
+          responseType: ResponseType.bytes,
+          validateStatus: (status) => true,
+          receiveTimeout: const Duration(minutes: 2),
+          sendTimeout: const Duration(minutes: 2),
+        ),
+      );
+
+      final status = response.statusCode ?? 0;
+      final contentRange = response.headers.value('content-range');
+      final acceptRanges = response.headers.value('accept-ranges');
+      final contentLengthHeader = response.headers.value('content-length');
+      final contentLength = int.tryParse(contentLengthHeader ?? '');
+      final totalSize =
+          _parseTotalSizeFromContentRange(contentRange) ??
+          (status == 200 ? contentLength : null);
+
+      final supportsRange =
+          status == 206 ||
+          (acceptRanges != null &&
+              acceptRanges.toLowerCase().contains('bytes'));
+
+      return _RemoteFileInfo(
+        supportsRange: supportsRange,
+        totalSize: totalSize,
+      );
+    } catch (_) {
+      return const _RemoteFileInfo(supportsRange: false, totalSize: null);
+    }
+  }
+
+  static Future<void> _downloadSingleToPath(
+    String url,
+    String tempPath,
+    CancelToken? cancelToken,
+    Function(int received, int total)? progressCallback,
+  ) async {
+    await _dio.download(
+      url,
+      tempPath,
+      cancelToken: cancelToken,
+      onReceiveProgress: (received, total) {
+        if (progressCallback != null) {
+          progressCallback(received, total > 0 ? total : received * 2);
+        }
+      },
+      options: Options(
+        headers: _buildCommonHeaders(),
+        receiveTimeout: const Duration(minutes: 10),
+        sendTimeout: const Duration(minutes: 10),
+        followRedirects: true,
+        maxRedirects: 5,
+        responseType: ResponseType.bytes,
+      ),
+    );
+  }
+
+  static Future<void> _downloadChunkToPath({
+    required String url,
+    required int index,
+    required int start,
+    required int end,
+    required String tempPath,
+    required CancelToken? cancelToken,
+    required List<int> partReceived,
+    required int totalSize,
+    required Function(int received, int total)? progressCallback,
+  }) async {
+    final expectedLength = end - start + 1;
+
+    for (var attempt = 1; attempt <= _maxChunkRetries; attempt++) {
+      if (cancelToken?.isCancelled == true) {
+        throw DioException(
+          requestOptions: RequestOptions(path: url),
+          type: DioExceptionType.cancel,
+        );
+      }
+
+      final file = File(tempPath);
+      if (await file.exists()) {
+        await file.delete();
+      }
+
+      await _dio.download(
+        url,
+        tempPath,
+        cancelToken: cancelToken,
+        onReceiveProgress: (received, total) {
+          partReceived[index] = received;
+          if (progressCallback != null) {
+            final sum = partReceived.fold<int>(0, (a, b) => a + b);
+            progressCallback(sum, totalSize);
+          }
+        },
+        options: Options(
+          headers: _buildCommonHeaders(range: 'bytes=$start-$end'),
+          followRedirects: true,
+          maxRedirects: 5,
+          responseType: ResponseType.bytes,
+          validateStatus: (status) => true,
+          receiveTimeout: const Duration(minutes: 10),
+          sendTimeout: const Duration(minutes: 10),
+        ),
+      );
+
+      final actualLength = await file.length();
+      if (actualLength == expectedLength) {
+        return;
+      }
+
+      if (await file.exists()) {
+        await file.delete();
+      }
+    }
+
+    throw Exception('分块 $index 校验失败，重试后仍不正确');
+  }
+
+  static Future<String> _downloadByChunksToTempFile({
+    required String url,
+    required Directory sessionDir,
+    required int totalSize,
+    required CancelToken? cancelToken,
+    required Function(int received, int total)? progressCallback,
+  }) async {
+    final partSize = (totalSize / _chunkCount).floor();
+    final partReceived = List<int>.filled(_chunkCount, 0);
+
+    final tasks = <Future<void>>[];
+    for (var i = 0; i < _chunkCount; i++) {
+      final start = i * partSize;
+      final end =
+          (i == _chunkCount - 1) ? (totalSize - 1) : ((start + partSize) - 1);
+      final expectedLength = end - start + 1;
+      final partPath = path.join(sessionDir.path, 'part_$i.tmp');
+
+      final partFile = File(partPath);
+      if (await partFile.exists()) {
+        final len = await partFile.length();
+        if (len == expectedLength) {
+          partReceived[i] = expectedLength;
+          continue;
+        } else {
+          await partFile.delete();
+        }
+      }
+
+      tasks.add(
+        _downloadChunkToPath(
+          url: url,
+          index: i,
+          start: start,
+          end: end,
+          tempPath: partPath,
+          cancelToken: cancelToken,
+          partReceived: partReceived,
+          totalSize: totalSize,
+          progressCallback: progressCallback,
+        ),
+      );
+    }
+
+    if (progressCallback != null) {
+      final sum = partReceived.fold<int>(0, (a, b) => a + b);
+      progressCallback(sum, totalSize);
+    }
+
+    await Future.wait(tasks);
+
+    final mergedPath = path.join(sessionDir.path, 'merged.tmp');
+    final mergedFile = File(mergedPath);
+    if (await mergedFile.exists()) {
+      await mergedFile.delete();
+    }
+
+    final sink = mergedFile.openWrite(mode: FileMode.writeOnly);
+    try {
+      for (var i = 0; i < _chunkCount; i++) {
+        final partPath = path.join(sessionDir.path, 'part_$i.tmp');
+        final partFile = File(partPath);
+        await sink.addStream(partFile.openRead());
+      }
+    } finally {
+      await sink.close();
+    }
+
+    final mergedSize = await mergedFile.length();
+    if (mergedSize != totalSize) {
+      if (await mergedFile.exists()) {
+        await mergedFile.delete();
+      }
+      throw Exception('合并文件校验失败: $mergedSize != $totalSize');
+    }
+
+    return mergedPath;
+  }
+
+  static Future<void> _ensureParentDirExists(String filePath) async {
+    final dir = Directory(path.dirname(filePath));
+    if (!await dir.exists()) {
+      await dir.create(recursive: true);
+    }
+  }
+
+  static Future<void> _replaceFile(String fromPath, String toPath) async {
+    final from = File(fromPath);
+    final to = File(toPath);
+
+    await _ensureParentDirExists(toPath);
+    if (await to.exists()) {
+      await to.delete();
+    }
+
+    try {
+      await from.rename(toPath);
+    } catch (_) {
+      await from.copy(toPath);
+      await from.delete();
+    }
   }
 
   // 初始化默认设置
@@ -390,7 +709,7 @@ class DownloadService {
 
       // 使用视频标题作为文件名
       final fileName = videoTitle ?? defaultFileName;
-      final filePath = path.join(selectedDir!, '$fileName.mp4');
+      final filePath = path.join(selectedDir, '$fileName.mp4');
       print('直接保存到: $filePath');
 
       // 保存目录设置
@@ -519,46 +838,80 @@ class DownloadService {
       print('开始下载视频，URL: $url');
       print('保存到: $filePath');
 
-      // 确保目录存在
-      final dir = Directory(path.dirname(filePath));
-      if (!await dir.exists()) {
-        print('创建目录: ${dir.path}');
-        await dir.create(recursive: true);
+      final sessionDir = await _createDownloadSessionDirectory(filePath);
+      final probe = await _probeRemoteFileInfo(url, _currentCancelToken);
+
+      String tempDownloadedPath;
+      int? expectedTotalSize = probe.totalSize;
+
+      if (probe.supportsRange &&
+          expectedTotalSize != null &&
+          expectedTotalSize > 0) {
+        try {
+          tempDownloadedPath = await _downloadByChunksToTempFile(
+            url: url,
+            sessionDir: sessionDir,
+            totalSize: expectedTotalSize,
+            cancelToken: _currentCancelToken,
+            progressCallback: progressCallback,
+          );
+        } catch (e) {
+          print('分块下载失败，回退到单线程下载: $e');
+          final singleTempPath = path.join(sessionDir.path, 'single.tmp');
+          int lastTotal = 0;
+          await _downloadSingleToPath(
+            url,
+            singleTempPath,
+            _currentCancelToken,
+            (received, total) {
+              lastTotal = total;
+              if (progressCallback != null) {
+                progressCallback(received, total);
+              }
+            },
+          );
+          tempDownloadedPath = singleTempPath;
+          if (expectedTotalSize <= 0 && lastTotal > 0) {
+            expectedTotalSize = lastTotal;
+          }
+        }
+      } else {
+        final singleTempPath = path.join(sessionDir.path, 'single.tmp');
+        int lastTotal = 0;
+        await _downloadSingleToPath(url, singleTempPath, _currentCancelToken, (
+          received,
+          total,
+        ) {
+          lastTotal = total;
+          if (progressCallback != null) {
+            progressCallback(received, total);
+          }
+        });
+        tempDownloadedPath = singleTempPath;
+        if ((expectedTotalSize == null || expectedTotalSize <= 0) &&
+            lastTotal > 0) {
+          expectedTotalSize = lastTotal;
+        }
       }
 
-      // 使用原来的普通下载方式
-      await _dio.download(
-        url,
-        filePath,
-        cancelToken: _currentCancelToken,
-        onReceiveProgress: (received, total) {
-          print('下载进度: $received / $total');
-          if (progressCallback != null) {
-            // 确保传递有效的进度值
-            progressCallback(received, total > 0 ? total : received * 2);
-          }
-        },
-        options: Options(
-          headers: {
-            'User-Agent':
-                Platform.isIOS
-                    ? 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 Mobile/15E148 Safari/604.1'
-                    : Platform.isAndroid
-                    ? 'Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36'
-                    : Platform.isWindows
-                    ? 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-                    : 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Referer': 'https://www.douyin.com/',
-            'Accept': '*/*',
-            'Range': 'bytes=0-', // 添加Range头，确保可以获取文件大小
-          },
-          receiveTimeout: const Duration(minutes: 10),
-          sendTimeout: const Duration(minutes: 10),
-          followRedirects: true,
-          maxRedirects: 5,
-          responseType: ResponseType.bytes,
-        ),
-      );
+      final tempFile = File(tempDownloadedPath);
+      if (!await tempFile.exists()) {
+        _showErrorToast('下载完成但临时文件未找到');
+        return null;
+      }
+
+      if (expectedTotalSize != null && expectedTotalSize > 0) {
+        final actualSize = await tempFile.length();
+        if (actualSize != expectedTotalSize) {
+          _showErrorToast('下载校验失败: $actualSize != $expectedTotalSize');
+          return null;
+        }
+      }
+
+      await _replaceFile(tempDownloadedPath, filePath);
+      try {
+        await sessionDir.delete(recursive: true);
+      } catch (_) {}
 
       // 检查文件是否下载成功
       final downloadedFile = File(filePath);
@@ -700,26 +1053,12 @@ class DownloadService {
   // 获取默认文件路径（移动端）
   static Future<String?> _getDefaultFilePath(String fileName) async {
     try {
-      Directory downloadDir;
-
-      if (Platform.isAndroid) {
-        print('Android设备，获取外部存储目录...');
-        final externalDir = await getExternalStorageDirectory();
-        downloadDir = externalDir ?? await getApplicationDocumentsDirectory();
-
-        // 创建下载文件夹
-        final downloadFolder = Directory('${downloadDir.path}/DouyinVideos');
-        if (!await downloadFolder.exists()) {
-          await downloadFolder.create(recursive: true);
-        }
-        return '${downloadFolder.path}/$fileName.mp4';
-      } else if (Platform.isIOS) {
-        print('iOS设备，获取应用文档目录...');
-        downloadDir = await getApplicationDocumentsDirectory();
-        return '${downloadDir.path}/$fileName.mp4';
+      final baseDir = await _getDownloadCacheDirectory();
+      final downloadFolder = Directory(path.join(baseDir.path, 'downloads'));
+      if (!await downloadFolder.exists()) {
+        await downloadFolder.create(recursive: true);
       }
-
-      return null;
+      return path.join(downloadFolder.path, '$fileName.mp4');
     } catch (e) {
       print('获取默认路径失败: $e');
       return null;
@@ -1154,6 +1493,9 @@ class DownloadService {
 
           print('Gal 保存成功');
           _showSuccessToast('视频已成功保存到相册');
+          try {
+            await file.delete();
+          } catch (_) {}
         } catch (e) {
           print('Gal 保存失败: $e');
           _showErrorToast('保存到相册失败，请重试');
@@ -1202,6 +1544,9 @@ class DownloadService {
             await Gal.putVideo(filePath, album: '抖音视频');
             print('第 ${i + 1} 个视频保存成功: $filePath');
             successCount++;
+            try {
+              await file.delete();
+            } catch (_) {}
           } catch (e) {
             print('第 ${i + 1} 个视频保存失败: $e');
             failCount++;
@@ -1331,4 +1676,11 @@ class DownloadService {
       textStyle: const TextStyle(color: Colors.white, fontSize: 16.0),
     );
   }
+}
+
+class _RemoteFileInfo {
+  final bool supportsRange;
+  final int? totalSize;
+
+  const _RemoteFileInfo({required this.supportsRange, required this.totalSize});
 }

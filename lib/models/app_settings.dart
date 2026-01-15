@@ -2,6 +2,8 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:douyin_parser/services/download_service.dart';
+import 'package:path/path.dart' as path;
 
 class AppSettings extends ChangeNotifier {
   ThemeMode _themeMode = ThemeMode.system;
@@ -71,47 +73,32 @@ class AppSettings extends ChangeNotifier {
   // 获取缓存目录
   Future<void> _getCachePaths() async {
     _cachePaths.clear();
+    try {
+      final cacheDirPath =
+          await DownloadService.getDownloadCacheDirectoryPath();
+      _cachePaths.add('下载缓存目录: $cacheDirPath');
+    } catch (e) {
+      print('获取下载缓存目录失败: $e');
+    }
 
-    if (Platform.isAndroid || Platform.isIOS) {
-      // 移动端
+    if (Platform.isIOS) {
       try {
-        final appDocDir = await getApplicationDocumentsDirectory();
-        _cachePaths.add('文档目录: ${appDocDir.path}');
+        final docDir = await getApplicationDocumentsDirectory();
+        _cachePaths.add('旧下载位置(iOS文档): ${docDir.path}');
       } catch (e) {
-        print('获取应用文档目录失败: $e');
+        print('获取iOS文档目录失败: $e');
       }
+    }
 
+    if (Platform.isAndroid) {
       try {
-        final tempDir = await getTemporaryDirectory();
-        _cachePaths.add('临时目录: ${tempDir.path}');
-      } catch (e) {
-        print('获取临时目录失败: $e');
-      }
-
-      if (Platform.isAndroid) {
-        try {
-          final externalDir = await getExternalStorageDirectory();
-          if (externalDir != null) {
-            _cachePaths.add('外部存储: ${externalDir.path}');
-          }
-        } catch (e) {
-          print('获取外部存储目录失败: $e');
+        final externalDir = await getExternalStorageDirectory();
+        if (externalDir != null) {
+          final legacyFolder = Directory('${externalDir.path}/DouyinVideos');
+          _cachePaths.add('旧下载位置(Android): ${legacyFolder.path}');
         }
-      }
-    } else if (Platform.isMacOS || Platform.isWindows || Platform.isLinux) {
-      // 桌面端
-      try {
-        final appDocDir = await getApplicationDocumentsDirectory();
-        _cachePaths.add('文档目录: ${appDocDir.path}');
       } catch (e) {
-        print('获取应用文档目录失败: $e');
-      }
-
-      try {
-        final tempDir = await getTemporaryDirectory();
-        _cachePaths.add('临时目录: ${tempDir.path}');
-      } catch (e) {
-        print('获取临时目录失败: $e');
+        print('获取Android旧下载目录失败: $e');
       }
     }
   }
@@ -119,30 +106,54 @@ class AppSettings extends ChangeNotifier {
   // 计算缓存大小
   Future<void> _calculateCacheSize() async {
     try {
-      int totalSize = 0;
       await _getCachePaths();
 
-      print('=== 缓存检查目录 ===');
-      for (String cachePath in _cachePaths) {
-        print(cachePath);
-      }
-      print('===================');
+      int totalSize = 0;
 
-      // 计算总缓存大小
-      for (String cachePathInfo in _cachePaths) {
+      final cacheDirPath =
+          await DownloadService.getDownloadCacheDirectoryPath();
+      final cacheDir = Directory(cacheDirPath);
+      if (await cacheDir.exists()) {
+        totalSize += await _calculateDirectorySize(cacheDir);
+      }
+
+      if (Platform.isIOS) {
         try {
-          // 从字符串中提取实际路径
-          final path = cachePathInfo.split(': ')[1];
-          final dir = Directory(path);
-          if (await dir.exists()) {
-            totalSize += await _calculateDirectorySize(dir);
+          final docDir = await getApplicationDocumentsDirectory();
+          if (await docDir.exists()) {
+            final entities = await docDir.list(followLinks: false).toList();
+            for (final entity in entities) {
+              if (entity is File &&
+                  entity.path.toLowerCase().endsWith('.mp4')) {
+                try {
+                  totalSize += await entity.length();
+                } catch (_) {}
+              }
+              if (entity is Directory &&
+                  entity.path.toLowerCase().endsWith('/douyinvideos')) {
+                totalSize += await _calculateDirectorySize(entity);
+              }
+            }
           }
         } catch (e) {
-          print('计算目录大小失败: $cachePathInfo, 错误: $e');
+          print('计算iOS旧下载大小失败: $e');
         }
       }
 
-      // 格式化显示
+      if (Platform.isAndroid) {
+        try {
+          final externalDir = await getExternalStorageDirectory();
+          if (externalDir != null) {
+            final legacyFolder = Directory('${externalDir.path}/DouyinVideos');
+            if (await legacyFolder.exists()) {
+              totalSize += await _calculateDirectorySize(legacyFolder);
+            }
+          }
+        } catch (e) {
+          print('计算Android旧下载大小失败: $e');
+        }
+      }
+
       _cacheSize = _formatSize(totalSize);
 
       notifyListeners();
@@ -168,16 +179,10 @@ class AppSettings extends ChangeNotifier {
             print('无法获取文件大小: ${entity.path}, 错误: $e');
           }
         } else if (entity is Directory) {
-          // 检查是否为需要扫描的子目录
-          final dirName = entity.uri.pathSegments.last.toLowerCase();
-          if (dirName.contains('douyin') ||
-              dirName.contains('cache') ||
-              dirName.contains('temp')) {
-            try {
-              size += await _calculateDirectorySize(entity);
-            } catch (e) {
-              print('无法计算目录大小: ${entity.path}, 错误: $e');
-            }
+          try {
+            size += await _calculateDirectorySize(entity);
+          } catch (e) {
+            print('无法计算目录大小: ${entity.path}, 错误: $e');
           }
         }
       }
@@ -198,26 +203,75 @@ class AppSettings extends ChangeNotifier {
       await _getCachePaths();
 
       print('=== 开始清理缓存 ===');
-      for (String cachePathInfo in _cachePaths) {
-        print('检查目录: $cachePathInfo');
+
+      try {
+        final cacheDirPath =
+            await DownloadService.getDownloadCacheDirectoryPath();
+        final cacheDir = Directory(cacheDirPath);
+        if (await cacheDir.exists()) {
+          final beforeSize = await _calculateDirectorySize(cacheDir);
+          await DownloadService.clearDownloadCache();
+          final detail =
+              '🗑️ [下载缓存目录] 已清理: $cacheDirPath (释放 ${_formatSize(beforeSize)})';
+          cleanedDetails.add(detail);
+          deletedSize += beforeSize;
+        }
+      } catch (e) {
+        cleanedDetails.add('❌ [下载缓存目录] 清理失败: $e');
       }
 
-      for (String cachePathInfo in _cachePaths) {
+      if (Platform.isIOS) {
         try {
-          final path = cachePathInfo.split(': ')[1];
-          final dir = Directory(path);
-          if (await dir.exists()) {
-            final result = await _cleanDirectory(
-              dir,
-              cachePathInfo.split(': ')[0],
-            );
-            deletedCount += (result['count'] as int);
-            deletedSize += (result['size'] as int);
-            cleanedDetails.addAll(result['details']);
+          final docDir = await getApplicationDocumentsDirectory();
+          if (await docDir.exists()) {
+            final entities = await docDir.list(followLinks: false).toList();
+            for (final entity in entities) {
+              if (entity is File &&
+                  entity.path.toLowerCase().endsWith('.mp4')) {
+                try {
+                  final size = await entity.length();
+                  await entity.delete();
+                  deletedCount++;
+                  deletedSize += size;
+                  cleanedDetails.add(
+                    '🗑️ [旧下载位置(iOS文档)] 已删除文件: ${path.basename(entity.path)} (${_formatSize(size)})',
+                  );
+                } catch (_) {}
+              }
+              if (entity is Directory &&
+                  entity.path.toLowerCase().endsWith('/douyinvideos')) {
+                try {
+                  final size = await _calculateDirectorySize(entity);
+                  await entity.delete(recursive: true);
+                  deletedSize += size;
+                  cleanedDetails.add(
+                    '🗑️ [旧下载位置(iOS文档)] 已删除目录: ${path.basename(entity.path)} (${_formatSize(size)})',
+                  );
+                } catch (_) {}
+              }
+            }
           }
         } catch (e) {
-          cleanedDetails.add('❌ ${cachePathInfo.split(': ')[0]}清理失败: $e');
-          print('清理目录失败: $cachePathInfo, 错误: $e');
+          cleanedDetails.add('❌ [旧下载位置(iOS文档)] 清理失败: $e');
+        }
+      }
+
+      if (Platform.isAndroid) {
+        try {
+          final externalDir = await getExternalStorageDirectory();
+          if (externalDir != null) {
+            final legacyFolder = Directory('${externalDir.path}/DouyinVideos');
+            if (await legacyFolder.exists()) {
+              final size = await _calculateDirectorySize(legacyFolder);
+              await legacyFolder.delete(recursive: true);
+              deletedSize += size;
+              cleanedDetails.add(
+                '🗑️ [旧下载位置(Android)] 已删除目录: ${legacyFolder.path} (${_formatSize(size)})',
+              );
+            }
+          }
+        } catch (e) {
+          cleanedDetails.add('❌ [旧下载位置(Android)] 清理失败: $e');
         }
       }
 
@@ -265,59 +319,43 @@ class AppSettings extends ChangeNotifier {
       for (FileSystemEntity entity in entities) {
         try {
           if (entity is File) {
-            // 检查是否为临时文件或缓存文件
-            final fileName = entity.uri.pathSegments.last.toLowerCase();
-            if (fileName.contains('.tmp') ||
-                fileName.contains('.temp') ||
-                fileName.contains('.cache') ||
-                fileName.contains('douyin_') ||
-                fileName.endsWith('.mp4') && fileName.contains('douyin')) {
-              try {
-                final fileSize = await entity.length();
-                await entity.delete();
-                deletedCount++;
-                deletedSize += fileSize;
+            try {
+              final fileSize = await entity.length();
+              await entity.delete();
+              deletedCount++;
+              deletedSize += fileSize;
 
-                final detail =
-                    '🗑️ [$dirName] 已删除文件: ${entity.uri.pathSegments.last} (${_formatSize(fileSize)})';
-                cleanedDetails.add(detail);
-                print(detail);
-              } catch (e) {
-                final detail =
-                    '❌ [$dirName] 删除文件失败: ${entity.uri.pathSegments.last}, 错误: $e';
-                cleanedDetails.add(detail);
-                print(detail);
-              }
+              final detail =
+                  '🗑️ [$dirName] 已删除文件: ${entity.uri.pathSegments.last} (${_formatSize(fileSize)})';
+              cleanedDetails.add(detail);
+              print(detail);
+            } catch (e) {
+              final detail =
+                  '❌ [$dirName] 删除文件失败: ${entity.uri.pathSegments.last}, 错误: $e';
+              cleanedDetails.add(detail);
+              print(detail);
             }
           } else if (entity is Directory) {
-            // 检查是否为抖音相关目录
             final subDirName = entity.uri.pathSegments.last.toLowerCase();
-            if (subDirName.contains('douyin') ||
-                subDirName.contains('cache') ||
-                subDirName.contains('temp') ||
-                subDirName.contains('dart_tool')) {
-              try {
-                final result = await _cleanDirectory(
-                  entity,
-                  '$dirName/$subDirName',
-                );
-                deletedCount += (result['count'] as int);
-                deletedSize += (result['size'] as int);
-                cleanedDetails.addAll(result['details']);
+            try {
+              final result = await _cleanDirectory(
+                entity,
+                '$dirName/$subDirName',
+              );
+              deletedCount += (result['count'] as int);
+              deletedSize += (result['size'] as int);
+              cleanedDetails.addAll(result['details']);
 
-                // 删除空目录
-                final remaining = await entity.list().toList();
-                if (remaining.isEmpty) {
-                  await entity.delete();
-                  final detail = '🗑️ [$dirName] 已删除空目录: $subDirName';
-                  cleanedDetails.add(detail);
-                  print(detail);
-                }
-              } catch (e) {
-                final detail = '❌ [$dirName] 清理子目录失败: $subDirName, 错误: $e';
+              try {
+                await entity.delete(recursive: true);
+                final detail = '🗑️ [$dirName] 已删除目录: $subDirName';
                 cleanedDetails.add(detail);
                 print(detail);
-              }
+              } catch (_) {}
+            } catch (e) {
+              final detail = '❌ [$dirName] 清理子目录失败: $subDirName, 错误: $e';
+              cleanedDetails.add(detail);
+              print(detail);
             }
           }
         } catch (e) {

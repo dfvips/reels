@@ -2,7 +2,6 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import 'package:douyin_parser/models/app_settings.dart';
-import 'package:douyin_parser/widgets/setting_item.dart';
 import 'package:douyin_parser/services/download_service.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:bot_toast/bot_toast.dart';
@@ -24,19 +23,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
     });
   }
 
-  // 使用 BuildContext 的静态方法
-  static Future<void> showSaveLocationSettings(BuildContext context) async {
-    await _showSaveLocationSettings(context);
-  }
-
   @override
   Widget build(BuildContext context) {
     final settings = Provider.of<AppSettings>(context);
     final isDarkMode = Theme.of(context).brightness == Brightness.dark;
-
-    // 获取主题色
-    final primaryColor = Theme.of(context).colorScheme.primary;
-    final onPrimaryColor = Theme.of(context).colorScheme.onPrimary;
 
     // 设置全局背景色
     final backgroundColor = isDarkMode ? Color(0xFF141414) : Colors.white;
@@ -586,7 +576,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   Navigator.pop(context);
 
                   // 显示清理中的提示
-                  final cancel = BotToast.showLoading();
+                  BotToast.showLoading();
 
                   try {
                     final result = await settings.clearCache();
@@ -732,11 +722,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
       // 读取用户偏好设置
       final skipLocationPrompt = await DownloadService.getSkipLocationPrompt();
-      final skipFilenameCustom =
-          await DownloadService.getSkipFilenameCustomization();
+      await DownloadService.getSkipFilenameCustomization();
 
       bool tempSkipLocationPrompt = skipLocationPrompt;
-      bool tempSkipFilenameCustom = skipFilenameCustom;
 
       // 获取主题色
       final isDarkMode = Theme.of(context).brightness == Brightness.dark;

@@ -467,7 +467,11 @@ jobs:
           rm -rf dmg-stage
 
           # DMG 不加签，zip 内含签名后的 .app 与未签名 .dmg
-          zip -qry "${ZIP}" "${PRODUCT_NAME}.app" "${DMG}"
+          # 系统自带 zip 对中文名不写 UTF-8(EFS) 标志，Linux/Windows 解压会乱码；
+          # 改用 Homebrew Info-ZIP 3.0（写入 EFS 标志）
+          brew install zip
+          HOMEZIP="$(brew --prefix)/opt/zip/bin/zip"
+          "$HOMEZIP" -qry "${ZIP}" "${PRODUCT_NAME}.app" "${DMG}"
           ls -lh "${ZIP}"
 
       - name: Delete temporary keychain
@@ -562,9 +566,11 @@ jobs:
           # 并从 arm64 zip 提取 dmg 以中文名单独发布
           cp artifacts/douyin_parser-mac-x64/douyin_parser-mac-x64.zip release/
           cp artifacts/douyin_parser-mac-arm64/douyin_parser-mac-arm64.zip release/
+          # zip 内中文名在 Linux unzip 下可能被解码为乱码（历史产物无 EFS 标志），
+          # 用通配符提取后再统一命名，避免精确匹配失败
           unzip -j artifacts/douyin_parser-mac-arm64/douyin_parser-mac-arm64.zip \
-            "${PRODUCT_NAME}.dmg" -d dmg-arm64
-          mv "dmg-arm64/${PRODUCT_NAME}.dmg" "release/${PRODUCT_NAME}.dmg"
+            "*.dmg" -d dmg-arm64
+          mv "dmg-arm64/"*.dmg "release/${PRODUCT_NAME}.dmg"
           ls -lh release
 
       - name: Publish GitHub Release

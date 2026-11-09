@@ -767,6 +767,9 @@ class _HomeScreenState extends State<HomeScreen> {
                 _buildFormatItem(
                   'https://www.iesdouyin.com/share/video/7588361322312650038',
                 ),
+                _buildFormatItem(
+                  'https://www.douyin.com/jingxuan?modal_id=7701193143558901018',
+                ),
                 const SizedBox(height: 16),
                 Container(
                   padding: const EdgeInsets.all(0),

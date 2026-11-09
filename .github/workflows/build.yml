@@ -105,7 +105,7 @@ jobs:
       - name: Build
         run: flutter build windows --release
 
-      - name: Package (portable single EXE)
+      - name: Package (Enigma Virtual Box single EXE)
         shell: pwsh
         run: |
           $release = Get-ChildItem "build/windows/*/runner/Release" -Directory |
@@ -114,47 +114,110 @@ jobs:
           $exe = Get-ChildItem $release.FullName -Filter *.exe | Select-Object -First 1
           if (-not $exe) { throw "找不到构建产物 exe" }
 
-          $work = Join-Path $env:RUNNER_TEMP "sfx"
-          New-Item -ItemType Directory -Force -Path $work | Out-Null
+          # 下载并静默安装 Enigma Virtual Box（免费版自带 enigmavbconsole.exe 命令行编译器）
+          $evbDir = Join-Path $env:RUNNER_TEMP "evb"
+          $installer = Join-Path $env:RUNNER_TEMP "enigmavb.exe"
+          Invoke-WebRequest "https://enigmaprotector.com/assets/files/enigmavb.exe" -OutFile $installer
+          $setupArgs = '/VERYSILENT', '/NORESTART', '/SUPPRESSMSGBOXES', '/DIR="' + $evbDir + '"'
+          Start-Process -FilePath $installer -ArgumentList $setupArgs -Wait
+          $console = Join-Path $evbDir "enigmavbconsole.exe"
+          if (-not (Test-Path $console)) { throw "EVB 安装失败：未找到 enigmavbconsole.exe" }
 
-          # SFX 模块优先用 runner 预装的 7-Zip，缺失时从官网 extra 包提取
-          $sfx = "C:\Program Files\7-Zip\7z.sfx"
-          if (-not (Test-Path $sfx)) {
-            Invoke-WebRequest "https://www.7-zip.org/a/7z2409-extra.7z" -OutFile "$work\extra.7z"
-            7z x "$work\extra.7z" -o"$work" 7z.sfx | Out-Null
-            $sfx = "$work\7z.sfx"
+          # 递归生成虚拟文件系统 XML（跳过主 exe 本身）
+          function ConvertTo-EvbFilesXml {
+            param([string]$Dir, [string]$MainExe)
+            $parts = @()
+            foreach ($item in (Get-ChildItem -LiteralPath $Dir | Sort-Object Name)) {
+              if ($item.FullName -eq $MainExe) { continue }
+              if ($item.PSIsContainer) {
+                $parts += '<File><Type>3</Type><Name>' + $item.Name + '</Name>' +
+                  '<Action>0</Action><OverwriteDateTime>False</OverwriteDateTime>' +
+                  '<OverwriteAttributes>False</OverwriteAttributes>' +
+                  '<HideFromDialogs>0</HideFromDialogs>' +
+                  '<Files>' + (ConvertTo-EvbFilesXml -Dir $item.FullName -MainExe $MainExe) + '</Files></File>'
+              } else {
+                $parts += '<File><Type>2</Type><Name>' + $item.Name + '</Name>' +
+                  '<File>' + $item.FullName + '</File>' +
+                  '<ActiveX>False</ActiveX><ActiveXInstall>False</ActiveXInstall>' +
+                  '<Action>0</Action><OverwriteDateTime>False</OverwriteDateTime>' +
+                  '<OverwriteAttributes>False</OverwriteAttributes>' +
+                  '<PassCommandLine>False</PassCommandLine>' +
+                  '<HideFromDialogs>0</HideFromDialogs></File>'
+              }
+            }
+            return -join $parts
           }
 
-          # SFX 配置：静默解压到独立临时目录并启动应用，全程无对话框
-          $config = Join-Path $work "config.txt"
-          $configLines = @(
-            ';!@Install@!UTF-8!'
-            'Title="DouyinParser"'
-            'RunProgram="' + $exe.Name + '"'
-            'Directory="X%%T%%"'
-            'GUIMode="2"'
-            ';!@InstallEnd@!'
+          $outputExe = Join-Path (Get-Location) ("${{ env.PROJECT_SLUG }}-${{ matrix.label }}.exe")
+          $filesXml = ConvertTo-EvbFilesXml -Dir $release.FullName -MainExe $exe.FullName
+
+          # .evb 项目文件：UTF-16LE + BOM，与 EVB GUI 保存格式一致
+          $xmlLines = @(
+            '<?xml version="1.0" encoding="utf-16"?>'
+            '<>'
+            '<InputFile>' + $exe.FullName + '</InputFile>'
+            '<OutputFile>' + $outputExe + '</OutputFile>'
+            '<Files>'
+            '<Enabled>True</Enabled>'
+            '<DeleteExtractedOnExit>True</DeleteExtractedOnExit>'
+            '<CompressFiles>True</CompressFiles>'
+            '<Files>'
+            '<File><Type>3</Type><Name>%DEFAULT FOLDER%</Name><Action>0</Action>'
+            '<OverwriteDateTime>False</OverwriteDateTime>'
+            '<OverwriteAttributes>False</OverwriteAttributes>'
+            '<HideFromDialogs>0</HideFromDialogs>'
+            '<Files>' + $filesXml + '</Files>'
+            '</File>'
+            '</Files>'
+            '</Files>'
+            '<Registries>'
+            '<Enabled>False</Enabled>'
+            '<Registries>'
+            '<Registry><Type>1</Type><Virtual>True</Virtual><Name>Classes</Name>' +
+              '<ValueType>0</ValueType><Value/><Registries/></Registry>'
+            '<Registry><Type>1</Type><Virtual>True</Virtual><Name>User</Name>' +
+              '<ValueType>0</ValueType><Value/><Registries/></Registry>'
+            '<Registry><Type>1</Type><Virtual>True</Virtual><Name>Machine</Name>' +
+              '<ValueType>0</ValueType><Value/><Registries/></Registry>'
+            '<Registry><Type>1</Type><Virtual>True</Virtual><Name>Users</Name>' +
+              '<ValueType>0</ValueType><Value/><Registries/></Registry>'
+            '<Registry><Type>1</Type><Virtual>True</Virtual><Name>Config</Name>' +
+              '<ValueType>0</ValueType><Value/><Registries/></Registry>'
+            '</Registries>'
+            '</Registries>'
+            '<Packaging>'
+            '<Enabled>False</Enabled>'
+            '</Packaging>'
+            '<Options>'
+            '<ShareVirtualSystem>False</ShareVirtualSystem>'
+            '<MapExecutableWithTemporaryFile>True</MapExecutableWithTemporaryFile>'
+            '<TemporaryFileMask/>'
+            '<AllowRunningOfVirtualExeFiles>True</AllowRunningOfVirtualExeFiles>'
+            '<ProcessesOfAnyPlatforms>False</ProcessesOfAnyPlatforms>'
+            '</Options>'
+            '<Storage>'
+            '<Files>'
+            '<Enabled>False</Enabled>'
+            '<Folder>%DEFAULTFOLDER%\</Folder>'
+            '<RandomFileNames>False</RandomFileNames>'
+            '<EncryptContent>False</EncryptContent>'
+            '</Files>'
+            '</Storage>'
+            '</>'
           )
-          $configText = ($configLines -join "`r`n") + "`r`n"
-          [System.IO.File]::WriteAllText(
-            $config,
-            $configText,
-            [System.Text.UTF8Encoding]::new($false))
+          $xml = $xmlLines -join "`r`n"
+          $project = Join-Path $env:RUNNER_TEMP "douyin_parser.evb"
+          [System.IO.File]::WriteAllText($project, $xml, [System.Text.Encoding]::Unicode)
 
-          $archive = Join-Path $work "app.7z"
-          7z a -t7z $archive "$($release.FullName)\*" | Out-Null
+          # 命令行编译为虚拟化单文件 exe：依赖打包进虚拟文件系统，运行时内存挂载，
+          # 无解压过程、无对话框，双击直接打开软件
+          & $console $project
+          $consoleExit = $LASTEXITCODE
+          if ($consoleExit -ne 0) { throw "enigmavbconsole 失败，退出码 $consoleExit" }
+          if (-not (Test-Path $outputExe)) { throw "未生成打包后的 exe" }
 
-          # 模块 + 配置 + 7z 归档按顺序拼接成绿色单文件 exe
-          $sfxBytes = [System.IO.File]::ReadAllBytes($sfx)
-          $configBytes = [System.IO.File]::ReadAllBytes($config)
-          $archiveBytes = [System.IO.File]::ReadAllBytes($archive)
-          $all = New-Object byte[] ($sfxBytes.Length + $configBytes.Length + $archiveBytes.Length)
-          [Array]::Copy($sfxBytes, 0, $all, 0, $sfxBytes.Length)
-          [Array]::Copy($configBytes, 0, $all, $sfxBytes.Length, $configBytes.Length)
-          [Array]::Copy($archiveBytes, 0, $all, $sfxBytes.Length + $configBytes.Length, $archiveBytes.Length)
-          [System.IO.File]::WriteAllBytes("${{ env.PROJECT_SLUG }}-${{ matrix.label }}.exe", $all)
-          "{0} 已生成（{1:N1} MB）" -f "${{ env.PROJECT_SLUG }}-${{ matrix.label }}.exe",
-            ((Get-Item "${{ env.PROJECT_SLUG }}-${{ matrix.label }}.exe").Length / 1MB) | Write-Host
+          "{0} 已生成（{1:N1} MB）" -f (Split-Path $outputExe -Leaf),
+            ((Get-Item $outputExe).Length / 1MB) | Write-Host
 
       - uses: actions/upload-artifact@v4
         with:

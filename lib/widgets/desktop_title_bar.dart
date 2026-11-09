@@ -228,10 +228,13 @@ class _CaptionIconPainter extends CustomPainter {
 
   @override
   void paint(Canvas canvas, Size size) {
+    // 关闭按钮的 45° 斜线在抗锯齿下视觉宽度会放大约 1.4 倍，
+    // 缩小线宽使其与另外两个按钮的线条粗细一致
+    final strokeWidth = type == _CaptionButtonType.close ? 0.75 : 1.0;
     final paint = Paint()
       ..color = color
       ..style = PaintingStyle.stroke
-      ..strokeWidth = 1;
+      ..strokeWidth = strokeWidth;
     switch (type) {
       case _CaptionButtonType.minimize:
         canvas.drawLine(const Offset(4, 8), const Offset(12, 8), paint);

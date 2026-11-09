@@ -102,7 +102,8 @@ class _DesktopTitleBarState extends State<DesktopTitleBar> with WindowListener {
     return Container(
       height: DesktopTitleBar.titleRowHeight,
       color: Colors.transparent,
-      padding: const EdgeInsets.only(left: 12),
+      // 左右留白与内容区 16px 对齐：左 16，右 = 按钮内边距 8 + 此处 8
+      padding: const EdgeInsets.only(left: 16),
       child: Row(
         children: [
           if (widget.leading != null) widget.leading!,

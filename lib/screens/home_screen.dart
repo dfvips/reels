@@ -903,16 +903,13 @@ class _HomeScreenState extends State<HomeScreen> {
         onPressed: _showSupportedFormats,
         tooltip: '帮助',
       ),
-      Padding(
-        padding: const EdgeInsets.only(right: 10),
-        child: IconButton(
-          icon: const Icon(Icons.settings),
-          color: const Color(0xFF3586F9),
-          onPressed: () {
-            Navigator.pushNamed(context, '/settings');
-          },
-          tooltip: '设置',
-        ),
+      IconButton(
+        icon: const Icon(Icons.settings),
+        color: const Color(0xFF3586F9),
+        onPressed: () {
+          Navigator.pushNamed(context, '/settings');
+        },
+        tooltip: '设置',
       ),
     ];
 

@@ -1,7 +1,7 @@
 name: Build
 
-# push / PR 自动触发只构建 win-x64；手动 workflow_dispatch 构建全部目标。
-run-name: ${{ github.event_name == 'workflow_dispatch' && 'Build · all platforms' || 'Build · win-x64' }}
+# push / PR / 手动触发均构建全部平台目标。
+run-name: Build · all platforms
 
 on:
   push:
@@ -23,25 +23,8 @@ env:
   FLUTTER_VERSION: "3.38.5"
 
 jobs:
-  # ================================================================== 触发目标
-  # push / PR 只构建 win-x64；手动 workflow_dispatch 构建全部目标。
-  prep:
-    name: resolve targets
-    runs-on: ubuntu-latest
-    outputs:
-      windows: ${{ steps.targets.outputs.windows }}
-    steps:
-      - id: targets
-        run: |
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            echo 'windows={"include":[{"label":"win-x64","os":"windows-latest"},{"label":"win-arm64","os":"windows-11-arm"}]}' >> "$GITHUB_OUTPUT"
-          else
-            echo 'windows={"include":[{"label":"win-x64","os":"windows-latest"}]}' >> "$GITHUB_OUTPUT"
-          fi
-
   # ================================================================== Android
   android:
-    if: github.event_name == 'workflow_dispatch'
     name: ${{ matrix.label }}
     runs-on: ubuntu-latest
     strategy:
@@ -87,12 +70,16 @@ jobs:
   # Flutter 没有 32 位 Windows 引擎产物，win-x86 无法构建；
   # win-arm64 需要在 ARM64 机器上原生构建，使用 windows-11-arm runner。
   windows:
-    needs: prep
     name: ${{ matrix.label }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
-      matrix: ${{ fromJSON(needs.prep.outputs.windows) }}
+      matrix:
+        include:
+          - label: win-x64
+            os: windows-latest
+          - label: win-arm64
+            os: windows-11-arm
     steps:
       - uses: actions/checkout@v4
 
@@ -247,7 +234,6 @@ jobs:
   # 导入临时钥匙串后 codesign；未配置证书时回退 ad-hoc 签名。
   # DMG 按 requirement 不加签。
   macos:
-    if: github.event_name == 'workflow_dispatch'
     name: ${{ matrix.label }}
     runs-on: ${{ matrix.os }}
     strategy:
@@ -374,7 +360,6 @@ jobs:
 
   # ================================================================== iOS
   ios:
-    if: github.event_name == 'workflow_dispatch'
     name: ios-unsigned
     runs-on: macos-latest
     steps:

@@ -451,7 +451,7 @@ jobs:
           echo "SIGN_IDENTITY=${SIGN_IDENTITY}" >> "$GITHUB_ENV"
           echo "KEYCHAIN_PATH=${KEYCHAIN}" >> "$GITHUB_ENV"
 
-      - name: Package (app + unsigned DMG + zip)
+      - name: Package (unsigned DMG + zip)
         run: |
           set -euo pipefail
           APP="${GITHUB_WORKSPACE}/${PRODUCT_NAME}.app"
@@ -466,12 +466,13 @@ jobs:
             -ov -format UDZO "${DMG}" > /dev/null
           rm -rf dmg-stage
 
-          # DMG 不加签，zip 内含签名后的 .app 与未签名 .dmg
+          # DMG 不加签；zip 内仅含未签名 .dmg（挂载后的 dmg 内含签名后的 .app）
           # 系统自带 zip 对中文名不写 UTF-8(EFS) 标志，Linux/Windows 解压会乱码；
           # 改用 Homebrew Info-ZIP 3.0（写入 EFS 标志）
           brew install zip
           HOMEZIP="$(brew --prefix)/opt/zip/bin/zip"
-          "$HOMEZIP" -qry "${ZIP}" "${PRODUCT_NAME}.app" "${DMG}"
+          # 用相对文件名打包：绝对路径会被 zip 原样存成 Users/runner/... 层级
+          "$HOMEZIP" -qry "${ZIP}" "${PRODUCT_NAME}.dmg"
           ls -lh "${ZIP}"
 
       - name: Delete temporary keychain
@@ -527,8 +528,8 @@ jobs:
 
   # ================================================================== Release
   # push（main / v* tag）构建成功后自动发布 Release。
-  # 资产以「抖音视频解析 + 扩展名」命名；架构后缀仅用于 zip 文件名，
-  # 多架构变体放入对应 zip，解压后均为纯净名称。
+  # 资产全部为「英文 + 架构」命名的 zip；zip 内文件统一为
+  # 「抖音视频解析 + 扩展名」，架构后缀仅体现在 zip 文件名上。
   release:
     name: publish release
     needs: [version, android, windows, macos, ios]
@@ -542,35 +543,35 @@ jobs:
       - name: Prepare release assets
         run: |
           mkdir -p release
-          # Windows：x64 单文件 exe 直接发布；arm64 便携 zip（EVB 不支持 ARM64 输入）
+
+          # Windows：x64 单文件 exe 装入 zip；
+          # arm64 便携 zip（EVB 不支持 ARM64 输入），内部 exe 已命名「抖音视频解析.exe」
+          mkdir -p exe-x64
           cp artifacts/douyin_parser-win-x64/douyin_parser-win-x64.exe \
-            "release/抖音视频解析.exe"
+            "exe-x64/${PRODUCT_NAME}.exe"
+          (cd exe-x64 && zip -qry \
+            "../release/douyin_parser-win-x64.zip" "${PRODUCT_NAME}.exe")
           cp artifacts/douyin_parser-win-arm64/douyin_parser-win-arm64.zip release/
 
-          # Android：universal 直接发布，armv7/armv8 装入对应 zip
-          cp artifacts/douyin_parser-android-universal/douyin_parser-android-universal.apk \
-            "release/抖音视频解析.apk"
-          for abi in armv7 armv8; do
+          # Android：三个 apk 均装入对应 zip
+          for abi in universal armv7 armv8; do
             mkdir -p "apk-$abi"
             cp "artifacts/douyin_parser-android-$abi/douyin_parser-android-$abi.apk" \
-              "apk-$abi/抖音视频解析.apk"
+              "apk-$abi/${PRODUCT_NAME}.apk"
             (cd "apk-$abi" && zip -qry \
-              "../release/douyin_parser-android-$abi.zip" "抖音视频解析.apk")
+              "../release/douyin_parser-android-$abi.zip" "${PRODUCT_NAME}.apk")
           done
 
-          # iOS
+          # iOS：ipa 装入 zip
+          mkdir -p ipa-stage
           cp artifacts/douyin_parser-ios-unsigned/douyin_parser-ios-unsigned.ipa \
-            "release/抖音视频解析.ipa"
+            "ipa-stage/${PRODUCT_NAME}.ipa"
+          (cd ipa-stage && zip -qry \
+            "../release/douyin_parser-ios.zip" "${PRODUCT_NAME}.ipa")
 
-          # macOS：zip 保持现有命名（内含中文名 .app/.dmg），
-          # 并从 arm64 zip 提取 dmg 以中文名单独发布
+          # macOS：zip 保持现有命名（内含「抖音视频解析.app」与「抖音视频解析.dmg」）
           cp artifacts/douyin_parser-mac-x64/douyin_parser-mac-x64.zip release/
           cp artifacts/douyin_parser-mac-arm64/douyin_parser-mac-arm64.zip release/
-          # zip 内中文名在 Linux unzip 下可能被解码为乱码（历史产物无 EFS 标志），
-          # 用通配符提取后再统一命名，避免精确匹配失败
-          unzip -j artifacts/douyin_parser-mac-arm64/douyin_parser-mac-arm64.zip \
-            "*.dmg" -d dmg-arm64
-          mv "dmg-arm64/"*.dmg "release/${PRODUCT_NAME}.dmg"
           ls -lh release
 
       - name: Publish GitHub Release

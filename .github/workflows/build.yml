@@ -105,45 +105,54 @@ jobs:
       - name: Build
         run: flutter build windows --release
 
-      - name: Install Inno Setup
-        run: choco install innosetup -y
-
-      - name: Package (single EXE installer)
+      - name: Package (portable single EXE)
         shell: pwsh
         run: |
-          $version = ((Select-String -Path pubspec.yaml -Pattern '^version:').Line -replace '^version:\s*', '' -split '\+')[0]
           $release = Get-ChildItem "build/windows/*/runner/Release" -Directory |
             Select-Object -First 1
           if (-not $release) { throw "找不到 Release 输出目录" }
           $exe = Get-ChildItem $release.FullName -Filter *.exe | Select-Object -First 1
           if (-not $exe) { throw "找不到构建产物 exe" }
-          $exeName = $exe.Name
 
-          $issContent = @(
-            "[Setup]",
-            "AppName=抖音视频解析",
-            "AppVersion=$version",
-            "DefaultDirName={pf}\抖音视频解析",
-            "OutputBaseFilename=${{ env.PROJECT_SLUG }}-${{ matrix.label }}-v$version",
-            "Compression=lzma",
-            "SolidCompression=yes",
-            "SetupIconFile=windows\runner\resources\app.ico",
-            "UninstallDisplayIcon={app}\$exeName",
-            "",
-            "[Files]",
-            "Source: ""$($release.FullName)\*""; DestDir: ""{app}""; Flags: recursesubdirs",
-            "",
-            "[Icons]",
-            "Name: ""{group}\抖音视频解析""; Filename: ""{app}\$exeName""; IconFilename: ""{app}\$exeName""",
-            "Name: ""{commondesktop}\抖音视频解析""; Filename: ""{app}\$exeName""; IconFilename: ""{app}\$exeName""",
-            "",
-            "[Run]",
-            "Filename: ""{app}\$exeName""; Description: ""启动 抖音视频解析""; Flags: nowait postinstall skipifsilent"
+          $work = Join-Path $env:RUNNER_TEMP "sfx"
+          New-Item -ItemType Directory -Force -Path $work | Out-Null
+
+          # SFX 模块优先用 runner 预装的 7-Zip，缺失时从官网 extra 包提取
+          $sfx = "C:\Program Files\7-Zip\7z.sfx"
+          if (-not (Test-Path $sfx)) {
+            Invoke-WebRequest "https://www.7-zip.org/a/7z2409-extra.7z" -OutFile "$work\extra.7z"
+            7z x "$work\extra.7z" -o"$work" 7z.sfx | Out-Null
+            $sfx = "$work\7z.sfx"
+          }
+
+          # SFX 配置：静默解压到独立临时目录并启动应用，全程无对话框
+          $config = Join-Path $work "config.txt"
+          $configLines = @(
+            ';!@Install@!UTF-8!'
+            'Title="DouyinParser"'
+            'RunProgram="' + $exe.Name + '"'
+            'Directory="X%%T%%"'
+            'GUIMode="2"'
+            ';!@InstallEnd@!'
           )
-          $issContent | Set-Content -Path installer.iss -Encoding UTF8
-          iscc installer.iss
-          Move-Item "Output/${{ env.PROJECT_SLUG }}-${{ matrix.label }}-v$version.exe" `
-            "${{ env.PROJECT_SLUG }}-${{ matrix.label }}.exe"
+          $configText = ($configLines -join "`r`n") + "`r`n"
+          [System.IO.File]::WriteAllText(
+            $config,
+            $configText,
+            [System.Text.UTF8Encoding]::new($false))
+
+          $archive = Join-Path $work "app.7z"
+          7z a -t7z $archive "$($release.FullName)\*" | Out-Null
+
+          # 模块 + 配置 + 7z 归档按顺序拼接成绿色单文件 exe
+          $sfxBytes = [System.IO.File]::ReadAllBytes($sfx)
+          $configBytes = [System.IO.File]::ReadAllBytes($config)
+          $archiveBytes = [System.IO.File]::ReadAllBytes($archive)
+          $all = New-Object byte[] ($sfxBytes.Length + $configBytes.Length + $archiveBytes.Length)
+          [Array]::Copy($sfxBytes, 0, $all, 0, $sfxBytes.Length)
+          [Array]::Copy($configBytes, 0, $all, $sfxBytes.Length, $configBytes.Length)
+          [Array]::Copy($archiveBytes, 0, $all, $sfxBytes.Length + $configBytes.Length, $archiveBytes.Length)
+          [System.IO.File]::WriteAllBytes("${{ env.PROJECT_SLUG }}-${{ matrix.label }}.exe", $all)
           "{0} 已生成（{1:N1} MB）" -f "${{ env.PROJECT_SLUG }}-${{ matrix.label }}.exe",
             ((Get-Item "${{ env.PROJECT_SLUG }}-${{ matrix.label }}.exe").Length / 1MB) | Write-Host
 

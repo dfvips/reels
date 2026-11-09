@@ -104,9 +104,10 @@ jobs:
           retention-days: 30
 
   # ================================================================== Windows
-  # Flutter 没有 32 位 Windows 引擎产物，win-x86 无法构建；
-  # win-arm64 官方各 stable 版本均未发布 windows-arm64 SDK 与引擎产物
-  # （ARM64 原生构建与交叉编译均不可行），暂不支持。
+  # Flutter 没有 32 位 Windows 引擎产物，win-x86 无法构建。
+  # win-arm64 采用 windows-11-arm 原生 runner + flutter main 固定 commit
+  # 构建（参考 Gopeed 的成熟方案：llvm-mingw 提供 C/C++ 工具链，
+  # 构建后补齐 clang-mingw 与 VC 运行库 DLL）。
   windows:
     needs: version
     name: ${{ matrix.label }}
@@ -117,13 +118,44 @@ jobs:
         include:
           - label: win-x64
             os: windows-latest
+          - label: win-arm64
+            os: windows-11-arm
+            flutter_channel: main
+            flutter_version: "7e1c8868"
+            llvm_ver: "20251202"
     steps:
       - uses: actions/checkout@v4
 
+      - name: Enable long paths (flutter main checkout)
+        if: matrix.label == 'win-arm64'
+        run: git config --global core.longpaths true
+
+      - name: Install llvm-mingw-ucrt-aarch64 (win-arm64 only)
+        if: matrix.label == 'win-arm64'
+        shell: pwsh
+        run: |
+          $ver = "${{ matrix.llvm_ver }}"
+          $url = "https://github.com/mstorsjo/llvm-mingw/releases/download/$ver/llvm-mingw-$ver-ucrt-aarch64.zip"
+          $zip = "$env:RUNNER_TEMP\llvm.zip"
+          $extract = "$env:RUNNER_TEMP\extract"
+          $target = "C:\clangarm64"
+          Invoke-WebRequest $url -OutFile $zip
+          foreach ($dir in @($extract, $target)) {
+            if (Test-Path $dir) { Remove-Item -Recurse -Force $dir }
+          }
+          New-Item -ItemType Directory -Force -Path $extract | Out-Null
+          tar -xf $zip -C $extract
+          Move-Item (Get-ChildItem $extract)[0].FullName $target
+          $b = "$target\bin"
+          "CC=$b\clang.exe" >> $env:GITHUB_ENV
+          "CXX=$b\clang++.exe" >> $env:GITHUB_ENV
+          "CLANGARM64_ROOT=$target" >> $env:GITHUB_ENV
+          $b >> $env:GITHUB_PATH
+
       - uses: subosito/flutter-action@v2
         with:
-          flutter-version: ${{ env.FLUTTER_VERSION }}
-          channel: stable
+          flutter-version: ${{ matrix.flutter_version || env.FLUTTER_VERSION }}
+          channel: ${{ matrix.flutter_channel || 'stable' }}
           cache: true
 
       - name: Inject version
@@ -138,6 +170,20 @@ jobs:
         env:
           APP_VERSION: ${{ needs.version.outputs.full }}
         run: flutter build windows --release --dart-define="APP_VERSION=$env:APP_VERSION"
+
+      - name: Copy runtime DLLs (win-arm64 only)
+        if: matrix.label == 'win-arm64'
+        shell: pwsh
+        run: |
+          $release = "build\windows\arm64\runner\Release\"
+          if (-not (Test-Path $release)) { throw "未找到 arm64 Release 目录" }
+          $mingw = "$env:CLANGARM64_ROOT\aarch64-w64-mingw32\bin"
+          foreach ($dll in @("libc++.dll", "libunwind.dll", "libwinpthread-1.dll")) {
+            Copy-Item "$mingw\$dll" $release
+          }
+          foreach ($dll in @("msvcp140.dll", "vcruntime140.dll", "vcruntime140_1.dll")) {
+            Copy-Item "C:\Windows\System32\$dll" $release
+          }
 
       - name: Package (Enigma Virtual Box single EXE)
         shell: pwsh
@@ -454,9 +500,14 @@ jobs:
       - name: Prepare release assets
         run: |
           mkdir -p release
-          # Windows：x64 直接发布
+          # Windows：x64 直接发布，arm64 装入带架构后缀的 zip
           cp artifacts/douyin_parser-win-x64/douyin_parser-win-x64.exe \
             "release/抖音视频解析.exe"
+          mkdir -p win-arm64
+          cp artifacts/douyin_parser-win-arm64/douyin_parser-win-arm64.exe \
+            "win-arm64/抖音视频解析.exe"
+          (cd win-arm64 && zip -qry ../release/douyin_parser-win-arm64.zip \
+            "抖音视频解析.exe")
 
           # Android：universal 直接发布，armv7/armv8 装入对应 zip
           cp artifacts/douyin_parser-android-universal/douyin_parser-android-universal.apk \

@@ -105,21 +105,52 @@ jobs:
       - name: Build
         run: flutter build windows --release
 
-      - name: Package
+      - name: Install Inno Setup
+        run: choco install innosetup -y
+
+      - name: Package (single EXE installer)
         shell: pwsh
         run: |
+          $version = ((Select-String -Path pubspec.yaml -Pattern '^version:').Line -replace '^version:\s*', '' -split '\+')[0]
           $release = Get-ChildItem "build/windows/*/runner/Release" -Directory |
             Select-Object -First 1
           if (-not $release) { throw "找不到 Release 输出目录" }
-          Compress-Archive -Path "$($release.FullName)/*" `
-            -DestinationPath "${{ env.PROJECT_SLUG }}-${{ matrix.label }}.zip" -Force
-          "{0} 已生成（{1:N1} MB）" -f "${{ env.PROJECT_SLUG }}-${{ matrix.label }}.zip",
-            ((Get-Item "${{ env.PROJECT_SLUG }}-${{ matrix.label }}.zip").Length / 1MB) | Write-Host
+          $exe = Get-ChildItem $release.FullName -Filter *.exe | Select-Object -First 1
+          if (-not $exe) { throw "找不到构建产物 exe" }
+          $exeName = $exe.Name
+
+          $issContent = @(
+            "[Setup]",
+            "AppName=抖音视频解析",
+            "AppVersion=$version",
+            "DefaultDirName={pf}\抖音视频解析",
+            "OutputBaseFilename=${{ env.PROJECT_SLUG }}-${{ matrix.label }}-v$version",
+            "Compression=lzma",
+            "SolidCompression=yes",
+            "SetupIconFile=windows\runner\resources\app.ico",
+            "UninstallDisplayIcon={app}\$exeName",
+            "",
+            "[Files]",
+            "Source: ""$($release.FullName)\*""; DestDir: ""{app}""; Flags: recursesubdirs",
+            "",
+            "[Icons]",
+            "Name: ""{group}\抖音视频解析""; Filename: ""{app}\$exeName""; IconFilename: ""{app}\$exeName""",
+            "Name: ""{commondesktop}\抖音视频解析""; Filename: ""{app}\$exeName""; IconFilename: ""{app}\$exeName""",
+            "",
+            "[Run]",
+            "Filename: ""{app}\$exeName""; Description: ""启动 抖音视频解析""; Flags: nowait postinstall skipifsilent"
+          )
+          $issContent | Set-Content -Path installer.iss -Encoding UTF8
+          iscc installer.iss
+          Move-Item "Output/${{ env.PROJECT_SLUG }}-${{ matrix.label }}-v$version.exe" `
+            "${{ env.PROJECT_SLUG }}-${{ matrix.label }}.exe"
+          "{0} 已生成（{1:N1} MB）" -f "${{ env.PROJECT_SLUG }}-${{ matrix.label }}.exe",
+            ((Get-Item "${{ env.PROJECT_SLUG }}-${{ matrix.label }}.exe").Length / 1MB) | Write-Host
 
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ env.PROJECT_SLUG }}-${{ matrix.label }}
-          path: ${{ env.PROJECT_SLUG }}-${{ matrix.label }}.zip
+          path: ${{ env.PROJECT_SLUG }}-${{ matrix.label }}.exe
           if-no-files-found: error
           retention-days: 30
 

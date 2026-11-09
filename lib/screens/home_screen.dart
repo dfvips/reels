@@ -896,6 +896,7 @@ class _HomeScreenState extends State<HomeScreen> {
     final actions = [
       IconButton(
         icon: const Icon(Icons.contact_support),
+        color: const Color(0xFF3586F9),
         onPressed: _showSupportedFormats,
         tooltip: '帮助',
       ),
@@ -903,6 +904,7 @@ class _HomeScreenState extends State<HomeScreen> {
         padding: const EdgeInsets.only(right: 10),
         child: IconButton(
           icon: const Icon(Icons.settings),
+          color: const Color(0xFF3586F9),
           onPressed: () {
             Navigator.pushNamed(context, '/settings');
           },

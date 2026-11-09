@@ -93,7 +93,6 @@ class _DesktopTitleBarState extends State<DesktopTitleBar> with WindowListener {
         children: [
           Expanded(child: DragToMoveArea(child: const SizedBox.expand())),
           if (_isWindows) _buildWindowsCaptionButtons(),
-          const SizedBox(width: 8),
         ],
       ),
     );
@@ -186,12 +185,10 @@ class _CaptionButtonState extends State<_CaptionButton> {
       iconColor =
           _hovering || _pressed || isDark ? Colors.white : const Color(0xFF1A1A1A);
     } else {
-      background = isDark ? const Color(0xFF2D2D2D) : const Color(0xFFE5E5E5);
-      if (_hovering) {
-        background = isDark ? const Color(0xFF383838) : const Color(0xFFDADADA);
-      }
-      if (_pressed) {
-        background = isDark ? const Color(0xFF333333) : const Color(0xFFDFDFDF);
+      // 不 hover 时无背景色，hover/按下时才显示主题底色
+      background = Colors.transparent;
+      if (_hovering || _pressed) {
+        background = isDark ? const Color(0xFF2D2D2D) : const Color(0xFFE5E5E5);
       }
       iconColor = isDark ? Colors.white : const Color(0xFF1A1A1A);
     }
@@ -241,8 +238,19 @@ class _CaptionIconPainter extends CustomPainter {
       case _CaptionButtonType.maximize:
         canvas.drawRect(const Rect.fromLTWH(4, 4, 8, 8), paint);
       case _CaptionButtonType.restore:
-        canvas.drawRect(const Rect.fromLTWH(6, 3, 7, 7), paint);
-        canvas.drawRect(const Rect.fromLTWH(3, 6, 7, 7), paint);
+        // 前方圆角方块遮挡后方圆角方块的左下部分，形成 Windows 11 还原图标
+        const radius = Radius.circular(1.5);
+        final front = Path()
+          ..addRRect(RRect.fromRectAndRadius(
+              const Rect.fromLTWH(3, 6, 7, 7), radius));
+        final back = Path()
+          ..addRRect(RRect.fromRectAndRadius(
+              const Rect.fromLTWH(6, 3, 7, 7), radius));
+        canvas.drawPath(
+          Path.combine(PathOperation.difference, back, front),
+          paint,
+        );
+        canvas.drawPath(front, paint);
       case _CaptionButtonType.close:
         canvas.drawLine(const Offset(4, 4), const Offset(12, 12), paint);
         canvas.drawLine(const Offset(12, 4), const Offset(4, 12), paint);

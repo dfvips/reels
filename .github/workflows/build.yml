@@ -105,7 +105,8 @@ jobs:
 
   # ================================================================== Windows
   # Flutter 没有 32 位 Windows 引擎产物，win-x86 无法构建；
-  # win-arm64 需要在 ARM64 机器上原生构建，使用 windows-11-arm runner。
+  # win-arm64 官方各 stable 版本均未发布 windows-arm64 SDK 与引擎产物
+  # （ARM64 原生构建与交叉编译均不可行），暂不支持。
   windows:
     needs: version
     name: ${{ matrix.label }}
@@ -116,8 +117,6 @@ jobs:
         include:
           - label: win-x64
             os: windows-latest
-          - label: win-arm64
-            os: windows-11-arm
     steps:
       - uses: actions/checkout@v4
 
@@ -455,14 +454,9 @@ jobs:
       - name: Prepare release assets
         run: |
           mkdir -p release
-          # Windows：x64 直接发布，arm64 装入带架构后缀的 zip
+          # Windows：x64 直接发布
           cp artifacts/douyin_parser-win-x64/douyin_parser-win-x64.exe \
             "release/抖音视频解析.exe"
-          mkdir -p win-arm64
-          cp artifacts/douyin_parser-win-arm64/douyin_parser-win-arm64.exe \
-            "win-arm64/抖音视频解析.exe"
-          (cd win-arm64 && zip -qry ../release/douyin_parser-win-arm64.zip \
-            "抖音视频解析.exe")
 
           # Android：universal 直接发布，armv7/armv8 装入对应 zip
           cp artifacts/douyin_parser-android-universal/douyin_parser-android-universal.apk \

@@ -23,8 +23,38 @@ env:
   FLUTTER_VERSION: "3.38.5"
 
 jobs:
+  # ================================================================== 版本
+  # 发布版本在构建时自动生成：v* tag 推送沿用 tag 版本；
+  # main 推送用「日期.运行序号」。build number 固定为 run_number 保证递增。
+  version:
+    name: resolve version
+    runs-on: ubuntu-latest
+    outputs:
+      base: ${{ steps.v.outputs.base }}
+      build: ${{ steps.v.outputs.build }}
+      full: ${{ steps.v.outputs.full }}
+      tag: ${{ steps.v.outputs.tag }}
+    steps:
+      - id: v
+        run: |
+          BUILD="${{ github.run_number }}"
+          if [[ "${{ github.event_name }}" == "push" && "${{ github.ref_type }}" == "tag" ]]; then
+            BASE="${GITHUB_REF_NAME#v}"
+            TAG="${GITHUB_REF_NAME}"
+          else
+            BASE="$(date +%Y.%-m.%-d)"
+            TAG="v${BASE}.${BUILD}"
+          fi
+          {
+            echo "base=${BASE}"
+            echo "build=${BUILD}"
+            echo "full=${BASE}+${BUILD}"
+            echo "tag=${TAG}"
+          } >> "$GITHUB_OUTPUT"
+
   # ================================================================== Android
   android:
+    needs: version
     name: ${{ matrix.label }}
     runs-on: ubuntu-latest
     strategy:
@@ -51,8 +81,15 @@ jobs:
           channel: stable
           cache: true
 
+      - name: Inject version
+        run: |
+          sed -i.bak "s/^version: .*/version: ${{ needs.version.outputs.full }}/" pubspec.yaml
+          rm pubspec.yaml.bak
+          grep '^version:' pubspec.yaml
+
       - name: Build APK
-        run: flutter build apk --release --target-platform ${{ matrix.target }}
+        run: flutter build apk --release --target-platform ${{ matrix.target }} \
+          --dart-define=APP_VERSION=${{ needs.version.outputs.full }}
 
       - name: Rename APK
         run: |
@@ -70,6 +107,7 @@ jobs:
   # Flutter 没有 32 位 Windows 引擎产物，win-x86 无法构建；
   # win-arm64 需要在 ARM64 机器上原生构建，使用 windows-11-arm runner。
   windows:
+    needs: version
     name: ${{ matrix.label }}
     runs-on: ${{ matrix.os }}
     strategy:
@@ -89,8 +127,18 @@ jobs:
           channel: stable
           cache: true
 
+      - name: Inject version
+        shell: pwsh
+        run: |
+          $full = '${{ needs.version.outputs.full }}'
+          (Get-Content pubspec.yaml) -replace '^version: .*', ('version: ' + $full) |
+            Set-Content pubspec.yaml
+          Select-String '^version:' pubspec.yaml | Write-Host
+
       - name: Build
-        run: flutter build windows --release
+        env:
+          APP_VERSION: ${{ needs.version.outputs.full }}
+        run: flutter build windows --release --dart-define="APP_VERSION=$env:APP_VERSION"
 
       - name: Package (Enigma Virtual Box single EXE)
         shell: pwsh
@@ -234,6 +282,7 @@ jobs:
   # 导入临时钥匙串后 codesign；未配置证书时回退 ad-hoc 签名。
   # DMG 按 requirement 不加签。
   macos:
+    needs: version
     name: ${{ matrix.label }}
     runs-on: ${{ matrix.os }}
     strategy:
@@ -253,8 +302,14 @@ jobs:
           channel: stable
           cache: true
 
+      - name: Inject version
+        run: |
+          sed -i.bak "s/^version: .*/version: ${{ needs.version.outputs.full }}/" pubspec.yaml
+          rm pubspec.yaml.bak
+          grep '^version:' pubspec.yaml
+
       - name: Build
-        run: flutter build macos --release
+        run: flutter build macos --release --dart-define=APP_VERSION=${{ needs.version.outputs.full }}
 
       - name: Assemble & sign macOS app bundle
         env:
@@ -331,7 +386,8 @@ jobs:
         run: |
           set -euo pipefail
           APP="${GITHUB_WORKSPACE}/${PRODUCT_NAME}.app"
-          DMG="${GITHUB_WORKSPACE}/${PROJECT_SLUG}-${{ matrix.label }}.dmg"
+          # zip 内 dmg 用纯净中文名；架构区分只体现在 zip 文件名上
+          DMG="${GITHUB_WORKSPACE}/${PRODUCT_NAME}.dmg"
           ZIP="${GITHUB_WORKSPACE}/${PROJECT_SLUG}-${{ matrix.label }}.zip"
 
           mkdir -p dmg-stage
@@ -360,6 +416,7 @@ jobs:
 
   # ================================================================== iOS
   ios:
+    needs: version
     name: ios-unsigned
     runs-on: macos-latest
     steps:
@@ -371,8 +428,78 @@ jobs:
           channel: stable
           cache: true
 
+      - name: Inject version
+        run: |
+          sed -i.bak "s/^version: .*/version: ${{ needs.version.outputs.full }}/" pubspec.yaml
+          rm pubspec.yaml.bak
+          grep '^version:' pubspec.yaml
+
       - name: Build (no codesign)
-        run: flutter build ios --release --no-codesign
+        run: flutter build ios --release --no-codesign \
+          --dart-define=APP_VERSION=${{ needs.version.outputs.full }}
+
+  # ================================================================== Release
+  # push（main / v* tag）构建成功后自动发布 Release。
+  # 资产以「抖音视频解析 + 扩展名」命名；架构后缀仅用于 zip 文件名，
+  # 多架构变体放入对应 zip，解压后均为纯净名称。
+  release:
+    name: publish release
+    needs: [version, android, windows, macos, ios]
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Prepare release assets
+        run: |
+          mkdir -p release
+          # Windows：x64 直接发布，arm64 装入带架构后缀的 zip
+          cp artifacts/douyin_parser-win-x64/douyin_parser-win-x64.exe \
+            "release/抖音视频解析.exe"
+          mkdir -p win-arm64
+          cp artifacts/douyin_parser-win-arm64/douyin_parser-win-arm64.exe \
+            "win-arm64/抖音视频解析.exe"
+          (cd win-arm64 && zip -qry ../release/douyin_parser-win-arm64.zip \
+            "抖音视频解析.exe")
+
+          # Android：universal 直接发布，armv7/armv8 装入对应 zip
+          cp artifacts/douyin_parser-android-universal/douyin_parser-android-universal.apk \
+            "release/抖音视频解析.apk"
+          for abi in armv7 armv8; do
+            mkdir -p "apk-$abi"
+            cp "artifacts/douyin_parser-android-$abi/douyin_parser-android-$abi.apk" \
+              "apk-$abi/抖音视频解析.apk"
+            (cd "apk-$abi" && zip -qry \
+              "../release/douyin_parser-android-$abi.zip" "抖音视频解析.apk")
+          done
+
+          # iOS
+          cp artifacts/douyin_parser-ios-unsigned/douyin_parser-ios-unsigned.ipa \
+            "release/抖音视频解析.ipa"
+
+          # macOS：zip 保持现有命名（内含中文名 .app/.dmg），
+          # 并从 arm64 zip 提取 dmg 以中文名单独发布
+          cp artifacts/douyin_parser-mac-x64/douyin_parser-mac-x64.zip release/
+          cp artifacts/douyin_parser-mac-arm64/douyin_parser-mac-arm64.zip release/
+          unzip -j artifacts/douyin_parser-mac-arm64/douyin_parser-mac-arm64.zip \
+            "${PRODUCT_NAME}.dmg" -d dmg-arm64
+          mv "dmg-arm64/${PRODUCT_NAME}.dmg" "release/${PRODUCT_NAME}.dmg"
+          ls -lh release
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.version.outputs.tag }}
+          VERSION: ${{ needs.version.outputs.base }}
+        run: |
+          gh release create "$TAG" release/* \
+            -R "$GITHUB_REPOSITORY" \
+            --target "${{ github.sha }}" \
+            --title "抖音视频解析 $VERSION" \
+            --notes "自动构建 ${{ github.event_name }} @ ${{ github.sha }}" \
+            --latest
 
       - name: Package unsigned IPA
         run: |

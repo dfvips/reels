@@ -7,6 +7,13 @@ import 'package:file_picker/file_picker.dart';
 import 'package:bot_toast/bot_toast.dart';
 import 'package:douyin_parser/widgets/desktop_title_bar.dart';
 
+/// 应用版本号，CI 构建时通过 --dart-define=APP_VERSION 注入，
+/// 本地开发时回退为 dev
+const String kAppVersion = String.fromEnvironment(
+  'APP_VERSION',
+  defaultValue: 'dev',
+);
+
 class SettingsScreen extends StatefulWidget {
   const SettingsScreen({super.key});
 
@@ -203,7 +210,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                             ),
                             const SizedBox(height: 4),
                             Text(
-                              '应用版本: 20260110',
+                              '应用版本: $kAppVersion',
                               style: TextStyle(
                                 fontSize: 14,
                                 color:
@@ -1112,7 +1119,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
                 ),
                 SizedBox(height: 8),
-                Text('版本: 20260110'),
+                Text('版本: $kAppVersion'),
                 SizedBox(height: 8),
                 Text('功能: 解析抖音视频链接，获取视频下载地址'),
                 SizedBox(height: 8),

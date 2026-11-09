@@ -1,7 +1,7 @@
 name: douyin_parser
 description: 解析抖音视频链接的工具
 
-version: 1.0.1
+version: 1.0.2
 
 environment:
   sdk: ^3.7.2

@@ -118,10 +118,26 @@ jobs:
           $evbDir = Join-Path $env:RUNNER_TEMP "evb"
           $installer = Join-Path $env:RUNNER_TEMP "enigmavb.exe"
           Invoke-WebRequest "https://enigmaprotector.com/assets/files/enigmavb.exe" -OutFile $installer
-          $setupArgs = '/VERYSILENT', '/NORESTART', '/SUPPRESSMSGBOXES', '/DIR="' + $evbDir + '"'
-          Start-Process -FilePath $installer -ArgumentList $setupArgs -Wait
-          $console = Join-Path $evbDir "enigmavbconsole.exe"
-          if (-not (Test-Path $console)) { throw "EVB 安装失败：未找到 enigmavbconsole.exe" }
+          # /CU 走当前用户安装、免提权；/DIR 按 Inno Setup 文档要求不带引号
+          # 注意：逗号优先级低于 +，/DIR 参数必须先拼接好再放进数组，否则会被拆成独立元素
+          $dirArg = '/DIR=' + $evbDir
+          $setupArgs = '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/CU', $dirArg
+          $setup = Start-Process -FilePath $installer -ArgumentList $setupArgs -Wait -PassThru
+          "EVB 安装器退出码：$($setup.ExitCode)" | Write-Host
+
+          # 安装器偶尔落到默认目录，做兜底定位
+          $console = $null
+          foreach ($candidate in @(
+              (Join-Path $evbDir "enigmavbconsole.exe"),
+              "C:\Program Files (x86)\Enigma Virtual Box\enigmavbconsole.exe",
+              "C:\Program Files\Enigma Virtual Box\enigmavbconsole.exe")) {
+            if (Test-Path $candidate) { $console = $candidate; break }
+          }
+          if (-not $console) {
+            Get-ChildItem $evbDir -ErrorAction SilentlyContinue |
+              Select-Object -ExpandProperty Name | Write-Host
+            throw "EVB 安装失败：未找到 enigmavbconsole.exe（安装器退出码 $($setup.ExitCode)）"
+          }
 
           # 递归生成虚拟文件系统 XML（跳过主 exe 本身）
           function ConvertTo-EvbFilesXml {

@@ -506,6 +506,21 @@ jobs:
       - name: Build (no codesign)
         run: flutter build ios --release --no-codesign --dart-define=APP_VERSION=${{ needs.version.outputs.base }}
 
+      - name: Package unsigned IPA
+        run: |
+          mkdir -p Payload
+          cp -R build/ios/iphoneos/Runner.app Payload/
+          zip -qry "${{ env.PROJECT_SLUG }}-ios-unsigned.ipa" Payload
+          rm -rf Payload
+          ls -lh "${{ env.PROJECT_SLUG }}-ios-unsigned.ipa"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.PROJECT_SLUG }}-ios-unsigned
+          path: ${{ env.PROJECT_SLUG }}-ios-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 30
+
   # ================================================================== Release
   # push（main / v* tag）构建成功后自动发布 Release。
   # 资产以「抖音视频解析 + 扩展名」命名；架构后缀仅用于 zip 文件名，
@@ -564,18 +579,3 @@ jobs:
             --title "抖音视频解析 $VERSION" \
             --notes "自动构建 ${{ github.event_name }} @ ${{ github.sha }}" \
             --latest
-
-      - name: Package unsigned IPA
-        run: |
-          mkdir -p Payload
-          cp -R build/ios/iphoneos/Runner.app Payload/
-          zip -qry "${{ env.PROJECT_SLUG }}-ios-unsigned.ipa" Payload
-          rm -rf Payload
-          ls -lh "${{ env.PROJECT_SLUG }}-ios-unsigned.ipa"
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: ${{ env.PROJECT_SLUG }}-ios-unsigned
-          path: ${{ env.PROJECT_SLUG }}-ios-unsigned.ipa
-          if-no-files-found: error
-          retention-days: 30

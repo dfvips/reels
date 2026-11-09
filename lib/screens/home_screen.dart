@@ -9,6 +9,8 @@ import 'package:douyin_parser/widgets/result_display.dart';
 import 'package:bot_toast/bot_toast.dart';
 import 'package:dio/dio.dart';
 import 'package:permission_handler/permission_handler.dart';
+import 'package:window_manager/window_manager.dart';
+import 'package:douyin_parser/widgets/desktop_title_bar.dart';
 
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
@@ -830,40 +832,8 @@ class _HomeScreenState extends State<HomeScreen> {
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(
-        title: Row(
-          children: [
-            Icon(Icons.play_circle_filled, color: Color(0xFF3586F9), size: 26),
-            SizedBox(width: 4),
-            const Text(
-              '抖音视频解析',
-              style: TextStyle(
-                color: Color(0xFF3586F9),
-                fontSize: 20,
-                fontWeight: FontWeight.bold,
-              ),
-            ),
-          ],
-        ),
-        actions: [
-          IconButton(
-            icon: const Icon(Icons.contact_support),
-            onPressed: _showSupportedFormats,
-            tooltip: '帮助',
-          ),
-          Padding(
-            padding: const EdgeInsets.only(right: 10),
-            child: IconButton(
-              icon: const Icon(Icons.settings),
-              onPressed: () {
-                Navigator.pushNamed(context, '/settings');
-              },
-              tooltip: '设置',
-            ),
-          ),
-        ],
-      ),
+    final scaffold = Scaffold(
+      appBar: _buildAppBar(),
       body: SingleChildScrollView(
         padding: const EdgeInsets.fromLTRB(16, 16, 16, 16),
         child: Column(
@@ -893,9 +863,64 @@ class _HomeScreenState extends State<HomeScreen> {
                 onCopy: _copyLinks,
                 onDownload: _handleDownload,
               ),
-          ],
+            ],
+          ),
+        ),
+      );
+
+    // Windows 无边框窗口需要自绘边缘拖拽缩放
+    if (Platform.isWindows) {
+      return DragToResizeArea(
+        resizeEdgeSize: 8,
+        child: scaffold,
+      );
+    }
+    return scaffold;
+  }
+
+  PreferredSizeWidget _buildAppBar() {
+    final title = Row(
+      children: [
+        Icon(Icons.play_circle_filled, color: Color(0xFF3586F9), size: 26),
+        SizedBox(width: 4),
+        const Text(
+          '抖音视频解析',
+          style: TextStyle(
+            color: Color(0xFF3586F9),
+            fontSize: 20,
+            fontWeight: FontWeight.bold,
+          ),
+        ),
+      ],
+    );
+    final actions = [
+      IconButton(
+        icon: const Icon(Icons.contact_support),
+        onPressed: _showSupportedFormats,
+        tooltip: '帮助',
+      ),
+      Padding(
+        padding: const EdgeInsets.only(right: 10),
+        child: IconButton(
+          icon: const Icon(Icons.settings),
+          onPressed: () {
+            Navigator.pushNamed(context, '/settings');
+          },
+          tooltip: '设置',
         ),
       ),
+    ];
+
+    if (Platform.isWindows || Platform.isMacOS) {
+      return PreferredSize(
+        preferredSize: const Size.fromHeight(DesktopTitleBar.totalHeight),
+        child: DesktopTitleBar(title: title, actions: actions),
+      );
+    }
+
+    return AppBar(
+      title: title,
+      actions: actions,
     );
   }
 

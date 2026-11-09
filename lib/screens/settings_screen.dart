@@ -5,6 +5,7 @@ import 'package:douyin_parser/models/app_settings.dart';
 import 'package:douyin_parser/services/download_service.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:bot_toast/bot_toast.dart';
+import 'package:douyin_parser/widgets/desktop_title_bar.dart';
 
 class SettingsScreen extends StatefulWidget {
   const SettingsScreen({super.key});
@@ -32,11 +33,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     final backgroundColor = isDarkMode ? Color(0xFF141414) : Colors.white;
 
     return Scaffold(
-      appBar: AppBar(
-        title: const Text('设置'),
-        centerTitle: true,
-        backgroundColor: isDarkMode ? Color(0xFF141414) : Colors.white,
-      ),
+      appBar: _buildAppBar(isDarkMode),
       backgroundColor: backgroundColor, // 设置页面背景色
       body: Container(
         color: backgroundColor, // 设置列表容器背景色
@@ -308,6 +305,32 @@ class _SettingsScreenState extends State<SettingsScreen> {
           ],
         ),
       ),
+    );
+  }
+
+  PreferredSizeWidget _buildAppBar(bool isDarkMode) {
+    if (Platform.isWindows || Platform.isMacOS) {
+      return PreferredSize(
+        preferredSize: const Size.fromHeight(DesktopTitleBar.totalHeight),
+        child: DesktopTitleBar(
+          leading: IconButton(
+            icon: const Icon(Icons.arrow_back),
+            onPressed: () => Navigator.of(context).pop(),
+          ),
+          title: const Center(
+            child: Text(
+              '设置',
+              style: TextStyle(fontSize: 17, fontWeight: FontWeight.w600),
+            ),
+          ),
+        ),
+      );
+    }
+
+    return AppBar(
+      title: const Text('设置'),
+      centerTitle: true,
+      backgroundColor: isDarkMode ? Color(0xFF141414) : Colors.white,
     );
   }
 

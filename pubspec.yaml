@@ -18,8 +18,9 @@ dependencies:
   # 移除或替换 flutter_js
   # flutter_js: 0.8.2  # 这个插件有问题，使用替代方案
   
-  # 使用 webview 或 js_eval 替代
-  webview_flutter: ^4.2.2  # 或者使用 js_eval: ^0.8.1
+  # 抖音网页接口签名（纯 Dart 实现，无需 WebView）
+  # 桌面端窗口控制（无边框、拖拽、最大化等）
+  window_manager: ^0.5.1
   
   cached_network_image: ^3.4.1
   path_provider: ^2.1.1

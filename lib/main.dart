@@ -1,6 +1,5 @@
 import 'package:bot_toast/bot_toast.dart';
 import 'package:douyin_parser/services/download_service.dart';
-import 'package:douyin_parser/services/http_service.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_localizations/flutter_localizations.dart'; // 添加本地化
 import 'package:provider/provider.dart';
@@ -10,6 +9,7 @@ import 'package:douyin_parser/screens/settings_screen.dart';
 import 'package:douyin_parser/utils/theme_manager.dart';
 import 'package:permission_handler/permission_handler.dart'; // 添加权限处理
 import 'dart:io'; // 添加平台判断
+import 'package:window_manager/window_manager.dart';
 
 final GlobalKey<NavigatorState> navigatorKey = GlobalKey<NavigatorState>();
 
@@ -18,13 +18,28 @@ void main() async {
   await ThemeManager.init();
   await DownloadService.initializeDefaultSettings();
 
+  // 桌面端窗口初始化：无边框标题栏，默认居中显示
+  if (Platform.isWindows || Platform.isMacOS) {
+    await windowManager.ensureInitialized();
+    const windowOptions = WindowOptions(
+      size: Size(1024, 720),
+      minimumSize: Size(460, 600),
+      center: true,
+      title: '抖音视频解析',
+      titleBarStyle: TitleBarStyle.hidden,
+    );
+    await windowManager.waitUntilReadyToShow(windowOptions, () async {
+      await windowManager.show();
+      await windowManager.focus();
+    });
+  }
+
   // 在应用启动时请求网络权限（仅移动端）
   if (Platform.isAndroid || Platform.isIOS) {
     await _requestNetworkPermission();
   }
 
   runApp(const MyApp());
-  await HttpService.fetchHtml("https://v.douyin.com", showTip: false);
 }
 
 // 添加网络权限请求函数

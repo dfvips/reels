@@ -1,26 +1,70 @@
 class UrlParser {
+  /// 短链（v.douyin.com/xxxx），需要跟随重定向后才能确定视频 ID。
+  static final RegExp _shortLinkPattern = RegExp(
+    r'https?://v\.douyin\.com/[A-Za-z0-9_-]+',
+    caseSensitive: false,
+  );
+
+  /// 带视频 ID 的页面链接（video/note/share 以及 jingxuan 等 modal_id 页面）。
+  static final RegExp _pageLinkPattern = RegExp(
+    r'''https?://(?!v\.)[a-z0-9-]*(?:\.[a-z0-9-]+)*\.douyin\.com/[^\s"'<>]+''',
+    caseSensitive: false,
+  );
+
+  /// iesdouyin 分享页链接。
+  static final RegExp _shareLinkPattern = RegExp(
+    r'https?://(?:www\.)?iesdouyin\.com/share/(?:video|note)/(\d+)',
+    caseSensitive: false,
+  );
+
   /// 从文本中提取所有抖音视频链接
   static List<String> extractUrls(String text) {
-    // 改进的正则表达式：匹配所有抖音URL
-    final regex = RegExp(
-      r'(?:https?://v\.douyin\.com/[A-Za-z0-9_-]+|https?://(?:www\.|m\.)?douyin\.com/(?:video/[0-9]+|share/video/[0-9]+)|https?://www\.iesdouyin\.com/share/video/[0-9]+/?)',
-      caseSensitive: false,
-    );
-
-    final matches = regex.allMatches(text);
     final urls = <String>[];
 
-    for (final match in matches) {
-      if (match.group(0) != null) {
-        final url = match.group(0)!;
-        // 去重
-        if (!urls.contains(url)) {
-          urls.add(convertDouyinVideoUrl(url));
-        }
-      }
+    for (final match in _shortLinkPattern.allMatches(text)) {
+      final url = match.group(0)!;
+      if (!urls.contains(url)) urls.add(url);
+    }
+    for (final match in _pageLinkPattern.allMatches(text)) {
+      final url = match.group(0)!;
+      if (!urls.contains(url)) urls.add(url);
+    }
+    for (final match in _shareLinkPattern.allMatches(text)) {
+      final url = match.group(0)!;
+      if (!urls.contains(url)) urls.add(url);
     }
 
-    return urls;
+    final result = <String>[];
+    for (final url in urls) {
+      // 短链需要先跟随重定向才能拿到 ID，原样保留交给后续解析。
+      if (_shortLinkPattern.hasMatch(url)) {
+        if (!result.contains(url)) result.add(url);
+        continue;
+      }
+      final id = extractAwemeId(url);
+      if (id == null) continue;
+      final normalized = 'https://www.iesdouyin.com/share/video/$id/';
+      if (!result.contains(normalized)) result.add(normalized);
+    }
+    return result;
+  }
+
+  /// 从链接中提取数字视频 ID。
+  ///
+  /// 支持 `jingxuan?modal_id=`、`discover?modal_id=`、`video/{id}`、
+  /// `note/{id}` 等页面形式；短链需先跟随重定向。
+  static String? extractAwemeId(String url) {
+    final modalMatch =
+        RegExp(r'modal_id=(\d+)', caseSensitive: false).firstMatch(url);
+    if (modalMatch != null) {
+      return modalMatch.group(1);
+    }
+    final videoMatch =
+        RegExp(r'/(?:video|note)/(\d+)', caseSensitive: false).firstMatch(url);
+    if (videoMatch != null) {
+      return videoMatch.group(1);
+    }
+    return null;
   }
 
   /// 从单个文本中提取链接（保持向后兼容）

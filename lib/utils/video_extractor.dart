@@ -1,67 +1,8 @@
 import 'package:douyin_parser/services/http_service.dart';
+import 'package:douyin_parser/services/douyin_api_service.dart';
 import 'package:douyin_parser/utils/url_parser.dart';
 
 class VideoExtractor {
-  /// 提取单个视频URL
-  static Future<ExtractionResult> extractVideoUrl(String input) async {
-    try {
-      // 提取URL
-      final urls = UrlParser.extractUrls(input);
-      if (urls.isEmpty) {
-        return ExtractionResult(success: false, error: '链接无效或格式不正确');
-      }
-
-      final url = urls.first;
-      print('提取到的URL: $url');
-
-      // 获取HTML
-      final html = await HttpService.fetchHtml(url);
-
-      // 提取视频ID
-      final videoId = UrlParser.extractVideoId(html);
-
-      if (videoId == null) {
-        return ExtractionResult(
-          success: false,
-          error: '无法从页面中提取视频ID',
-          originalUrl: url,
-        );
-      }
-
-      print('提取到的视频ID: $videoId');
-
-      // 提取视频标题
-      final videoTitle = UrlParser.extractVideoTitle(html);
-      print('提取到的视频标题: $videoTitle');
-
-      // 生成视频URL并获取最终重定向链接
-      final finalVideoUrl = await HttpService.getFinalVideoUrl(videoId);
-
-      if (finalVideoUrl == null) {
-        return ExtractionResult(
-          success: false,
-          error: '无法获取视频播放链接',
-          originalUrl: url,
-          videoId: videoId,
-          videoTitle: videoTitle,
-        );
-      }
-
-      print('最终视频URL: $finalVideoUrl');
-
-      return ExtractionResult(
-        success: true,
-        originalUrl: url,
-        videoId: videoId,
-        videoTitle: videoTitle,
-        videoUrl: finalVideoUrl,
-      );
-    } catch (e) {
-      print('提取视频失败: $e');
-      return ExtractionResult(success: false, error: '解析失败: $e');
-    }
-  }
-
   /// 批量提取多个视频URL
   static Future<List<ExtractionResult>> extractMultipleVideoUrls(
     String input,
@@ -72,69 +13,92 @@ class VideoExtractor {
     print('找到 ${urls.length} 个链接需要解析');
 
     for (var i = 0; i < urls.length; i++) {
-      final url = urls[i];
+      var url = urls[i];
       print('正在解析第 ${i + 1}/${urls.length} 个链接: $url');
 
-      try {
-        // 获取HTML
-        final html = await HttpService.fetchHtml(url);
-
-        // 提取视频ID
-        final videoId = UrlParser.extractVideoId(html);
-
-        if (videoId == null) {
-          results.add(
-            ExtractionResult(
-              success: false,
-              originalUrl: url,
-              error: '无法从页面中提取视频ID',
-            ),
-          );
-          continue;
-        }
-
-        print('第 ${i + 1} 个链接提取到的视频ID: $videoId');
-
-        // 提取视频标题
-        final videoTitle = UrlParser.extractVideoTitle(html);
-        print('第 ${i + 1} 个链接提取到的视频标题: $videoTitle');
-
-        // 生成视频URL并获取最终重定向链接
-        final finalVideoUrl = await HttpService.getFinalVideoUrl(videoId);
-
-        if (finalVideoUrl == null) {
-          results.add(
-            ExtractionResult(
-              success: false,
-              originalUrl: url,
-              videoId: videoId,
-              videoTitle: videoTitle,
-              error: '无法获取视频播放链接',
-            ),
-          );
-          continue;
-        }
-
-        print('第 ${i + 1} 个链接最终视频URL: $finalVideoUrl');
-
-        results.add(
-          ExtractionResult(
-            success: true,
-            originalUrl: url,
-            videoId: videoId,
-            videoTitle: videoTitle,
-            videoUrl: finalVideoUrl,
-          ),
-        );
-      } catch (e) {
-        print('解析第 ${i + 1} 个链接失败: $e');
-        results.add(
-          ExtractionResult(success: false, originalUrl: url, error: '解析失败: $e'),
-        );
-      }
+      results.add(await _extractOne(url));
     }
 
     return results;
+  }
+
+  static Future<ExtractionResult> _extractOne(String url) async {
+    try {
+      // 短链需要先跟随重定向拿到真实页面地址
+      var pageUrl = url;
+      var awemeId = UrlParser.extractAwemeId(url);
+      if (awemeId == null && url.contains('v.douyin.com')) {
+        var current = url;
+        for (var hop = 0; hop < 5 && awemeId == null; hop++) {
+          final redirected = await HttpService.getRedirectUrl(current);
+          if (redirected == null || redirected.isEmpty) break;
+          current = redirected.startsWith('http')
+              ? redirected
+              : Uri.parse(current).resolve(redirected).toString();
+          pageUrl = current;
+          awemeId = UrlParser.extractAwemeId(current);
+        }
+      }
+
+      if (awemeId == null) {
+        return ExtractionResult(
+          success: false,
+          originalUrl: url,
+          error: '链接无效或格式不正确',
+        );
+      }
+
+      // 首选：签名接口（不依赖页面结构）
+      final detail = await DouyinApiService.fetchAwemeDetail(awemeId);
+      if (detail != null) {
+        return ExtractionResult(
+          success: true,
+          originalUrl: url,
+          videoId: detail.playUri,
+          videoTitle: detail.desc,
+          videoUrl: detail.playUrls.first,
+        );
+      }
+
+      // 回退：分享页 HTML 流程
+      final html = await HttpService.fetchHtml(pageUrl);
+      final videoId = UrlParser.extractVideoId(html);
+      if (videoId == null) {
+        return ExtractionResult(
+          success: false,
+          originalUrl: url,
+          videoId: awemeId,
+          error: '无法获取视频播放链接',
+        );
+      }
+
+      final videoTitle = UrlParser.extractVideoTitle(html);
+      final finalVideoUrl = await HttpService.getFinalVideoUrl(videoId);
+      if (finalVideoUrl == null) {
+        return ExtractionResult(
+          success: false,
+          originalUrl: url,
+          videoId: awemeId,
+          videoTitle: videoTitle,
+          error: '无法获取视频播放链接',
+        );
+      }
+
+      return ExtractionResult(
+        success: true,
+        originalUrl: url,
+        videoId: awemeId,
+        videoTitle: videoTitle,
+        videoUrl: finalVideoUrl,
+      );
+    } catch (e) {
+      print('解析链接失败: $e');
+      return ExtractionResult(
+        success: false,
+        originalUrl: url,
+        error: '解析失败: $e',
+      );
+    }
   }
 }
 

@@ -42,7 +42,8 @@ jobs:
             BASE="${GITHUB_REF_NAME#v}"
             TAG="${GITHUB_REF_NAME}"
           else
-            BASE="$(date +%Y.%-m.%-d)"
+            # 以北京时间为准
+            BASE="$(TZ=Asia/Shanghai date +%Y.%-m.%-d)"
             TAG="v${BASE}.${BUILD}"
           fi
           {
@@ -88,7 +89,7 @@ jobs:
           grep '^version:' pubspec.yaml
 
       - name: Build APK
-        run: flutter build apk --release --target-platform ${{ matrix.target }} --dart-define=APP_VERSION=${{ needs.version.outputs.full }}
+        run: flutter build apk --release --target-platform ${{ matrix.target }} --dart-define=APP_VERSION=${{ needs.version.outputs.base }}
 
       - name: Rename APK
         run: |
@@ -117,11 +118,13 @@ jobs:
         include:
           - label: win-x64
             os: windows-latest
+            package: exe
           - label: win-arm64
             os: windows-11-arm
             flutter_channel: main
             flutter_version: "7e1c8868"
             llvm_ver: "20251202"
+            package: zip
     steps:
       - uses: actions/checkout@v4
 
@@ -167,7 +170,7 @@ jobs:
 
       - name: Build
         env:
-          APP_VERSION: ${{ needs.version.outputs.full }}
+          APP_VERSION: ${{ needs.version.outputs.base }}
         run: flutter build windows --release --dart-define="APP_VERSION=$env:APP_VERSION"
 
       - name: Copy runtime DLLs (win-arm64 only)
@@ -184,7 +187,9 @@ jobs:
             Copy-Item "C:\Windows\System32\$dll" $release
           }
 
+      # EVB 仅支持 x86/x64 PE 输入，无法处理 ARM64 exe
       - name: Package (Enigma Virtual Box single EXE)
+        if: matrix.label == 'win-x64'
         shell: pwsh
         run: |
           $release = Get-ChildItem "build/windows/*/runner/Release" -Directory |
@@ -314,10 +319,30 @@ jobs:
           "{0} 已生成（{1:N1} MB）" -f (Split-Path $outputExe -Leaf),
             ((Get-Item $outputExe).Length / 1MB) | Write-Host
 
+      # ARM64：便携 zip（exe 改为纯净中文名，依赖全部随包）
+      - name: Package (portable zip)
+        if: matrix.label == 'win-arm64'
+        shell: pwsh
+        run: |
+          $release = Get-ChildItem "build/windows/*/runner/Release" -Directory |
+            Select-Object -First 1
+          if (-not $release) { throw "找不到 Release 输出目录" }
+          $stage = Join-Path $env:RUNNER_TEMP "portable"
+          if (Test-Path $stage) { Remove-Item -Recurse -Force $stage }
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item "$($release.FullName)\*" $stage -Recurse -Force
+          $exe = Get-ChildItem $stage -Filter *.exe | Select-Object -First 1
+          Rename-Item $exe.FullName "抖音视频解析.exe"
+          Compress-Archive -Path "$stage\*" `
+            -DestinationPath "${{ env.PROJECT_SLUG }}-${{ matrix.label }}.zip" -Force
+          "douyin_parser-win-arm64.zip 已生成（{0:N1} MB）" -f `
+            ((Get-Item "${{ env.PROJECT_SLUG }}-${{ matrix.label }}.zip").Length / 1MB) |
+            Write-Host
+
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ env.PROJECT_SLUG }}-${{ matrix.label }}
-          path: ${{ env.PROJECT_SLUG }}-${{ matrix.label }}.exe
+          path: ${{ env.PROJECT_SLUG }}-${{ matrix.label }}.${{ matrix.package }}
           if-no-files-found: error
           retention-days: 30
 
@@ -353,7 +378,7 @@ jobs:
           grep '^version:' pubspec.yaml
 
       - name: Build
-        run: flutter build macos --release --dart-define=APP_VERSION=${{ needs.version.outputs.full }}
+        run: flutter build macos --release --dart-define=APP_VERSION=${{ needs.version.outputs.base }}
 
       - name: Assemble & sign macOS app bundle
         env:
@@ -479,7 +504,7 @@ jobs:
           grep '^version:' pubspec.yaml
 
       - name: Build (no codesign)
-        run: flutter build ios --release --no-codesign --dart-define=APP_VERSION=${{ needs.version.outputs.full }}
+        run: flutter build ios --release --no-codesign --dart-define=APP_VERSION=${{ needs.version.outputs.base }}
 
   # ================================================================== Release
   # push（main / v* tag）构建成功后自动发布 Release。
@@ -498,14 +523,10 @@ jobs:
       - name: Prepare release assets
         run: |
           mkdir -p release
-          # Windows：x64 直接发布，arm64 装入带架构后缀的 zip
+          # Windows：x64 单文件 exe 直接发布；arm64 便携 zip（EVB 不支持 ARM64 输入）
           cp artifacts/douyin_parser-win-x64/douyin_parser-win-x64.exe \
             "release/抖音视频解析.exe"
-          mkdir -p win-arm64
-          cp artifacts/douyin_parser-win-arm64/douyin_parser-win-arm64.exe \
-            "win-arm64/抖音视频解析.exe"
-          (cd win-arm64 && zip -qry ../release/douyin_parser-win-arm64.zip \
-            "抖音视频解析.exe")
+          cp artifacts/douyin_parser-win-arm64/douyin_parser-win-arm64.zip release/
 
           # Android：universal 直接发布，armv7/armv8 装入对应 zip
           cp artifacts/douyin_parser-android-universal/douyin_parser-android-universal.apk \

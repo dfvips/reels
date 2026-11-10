@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
 import 'package:dio/dio.dart';
@@ -76,16 +77,48 @@ class DownloadService {
     return dir;
   }
 
-  static String _safeFileBaseName(String input) {
+  /// 生成跨平台安全的文件基础名（不含扩展名）。
+  ///
+  /// 抖音标题可能超长且包含非法字符，直接作为文件名会触发
+  /// Windows 的路径长度 / 非法名称错误（errno 123），这里统一清洗：
+  /// 替换非法与控制字符、压缩空白、去掉结尾的点与空格，并按字符数截断。
+  static String safeFileName(
+    String input, {
+    int maxLength = 100,
+    int maxBytes = 200,
+  }) {
     var name = input.trim();
-    if (name.isEmpty) return 'download';
     name = name.replaceAll(RegExp(r'[<>:"/\\|?*\x00-\x1F]'), '_');
     name = name.replaceAll(RegExp(r'\s+'), ' ').trim();
-    if (name.length > 120) {
-      name = name.substring(0, 120);
+    name = name.replaceFirst(RegExp(r'[. ]+$'), '');
+
+    // 同时限制字符数与 UTF-8 字节数：ext4（Android）单个文件名上限
+    // 为 255 字节，100 个汉字可达 300 字节，必须按字节截断。
+    final buffer = StringBuffer();
+    var runeCount = 0;
+    var byteCount = 0;
+    for (final rune in name.runes) {
+      if (runeCount >= maxLength) break;
+      final char = String.fromCharCode(rune);
+      final charBytes = utf8.encode(char).length;
+      if (byteCount + charBytes > maxBytes) break;
+      buffer.write(char);
+      runeCount++;
+      byteCount += charBytes;
+    }
+    name = buffer.toString().trimRight();
+
+    if (RegExp(
+      r'^(con|prn|aux|nul|com[1-9]|lpt[1-9])$',
+      caseSensitive: false,
+    ).hasMatch(name)) {
+      name = '_$name';
     }
     return name.isEmpty ? 'download' : name;
   }
+
+  static String _safeFileBaseName(String input) =>
+      safeFileName(input, maxLength: 100);
 
   static Map<String, String> _buildCommonHeaders({String? range}) {
     final headers = <String, String>{
@@ -707,8 +740,8 @@ class DownloadService {
         print('使用现有目录: $selectedDir');
       }
 
-      // 使用视频标题作为文件名
-      final fileName = videoTitle ?? defaultFileName;
+      // 使用视频标题作为文件名（清洗非法字符并截断超长标题）
+      final fileName = safeFileName(videoTitle ?? defaultFileName);
       final filePath = path.join(selectedDir, '$fileName.mp4');
       print('直接保存到: $filePath');
 
@@ -761,8 +794,8 @@ class DownloadService {
             saveDirectory.isNotEmpty) {
           print('批量下载，使用已有目录: $saveDirectory');
 
-          // 直接使用视频标题作为文件名
-          final name = videoTitle ?? fileName;
+          // 直接使用视频标题作为文件名（清洗非法字符并截断超长标题）
+          final name = safeFileName(videoTitle ?? fileName);
           filePath = path.join(saveDirectory, '$name.mp4');
         } else {
           // 单个下载或没有保存目录，显示完整的保存对话框
@@ -783,12 +816,12 @@ class DownloadService {
       } else if (Platform.isAndroid || Platform.isIOS) {
         // 移动端：使用默认路径，优先使用视频标题作为文件名
         print('移动端平台，使用默认路径...');
-        final name = videoTitle ?? fileName;
+        final name = safeFileName(videoTitle ?? fileName);
         filePath = await _getDefaultFilePath(name);
       } else {
         // 其他平台
         print('其他平台，使用下载目录...');
-        final name = videoTitle ?? fileName;
+        final name = safeFileName(videoTitle ?? fileName);
         filePath = await _getDesktopFilePath(name);
       }
 
@@ -805,7 +838,7 @@ class DownloadService {
 
         // 批量下载时不询问覆盖，自动使用新文件名
         if (isBatchDownload) {
-          final baseName = videoTitle ?? fileName;
+          final baseName = safeFileName(videoTitle ?? fileName);
           final newFileName = await _generateUniqueFileName(
             path.dirname(filePath),
             baseName,

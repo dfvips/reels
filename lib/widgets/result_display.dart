@@ -7,6 +7,7 @@ class ResultDisplay extends StatefulWidget {
   final List<String> titles; // 新增：视频标题列表
   final VoidCallback onCopy;
   final VoidCallback onDownload;
+  final VoidCallback? onExportScripts; // 仅 PC 端传入
 
   const ResultDisplay({
     super.key,
@@ -14,6 +15,7 @@ class ResultDisplay extends StatefulWidget {
     required this.titles,
     required this.onCopy,
     required this.onDownload,
+    this.onExportScripts,
   });
 
   @override
@@ -38,10 +40,15 @@ class _ResultDisplayState extends State<ResultDisplay> {
 
     // 浅色模式颜色定义
     const Color lightEnabledColor = Color(0xFF409EFF);
+    const Color lightActiveBgColor = Color(0xFFECF5FF);
+    const Color lightActiveBorderColor = Color(0xFFB3D8FF);
     // 深色模式颜色定义
     const Color darkCopyBgColor = Color(0xFF141414);
     const Color darkCopyBorderColor = Color(0xFF4C4D4F);
     const Color darkCopyTextColor = Colors.white;
+    const Color darkActiveBgColor = Color(0xFF18232B);
+    const Color darkActiveBorderColor = Color(0xFF409EFF);
+    const Color darkActiveTextColor = Color(0xFF409EFF);
 
     return Card(
       color: isDarkMode ? const Color(0xFF141414) : Colors.white,
@@ -141,6 +148,46 @@ class _ResultDisplayState extends State<ResultDisplay> {
                   ),
                 ),
                 const SizedBox(width: 12),
+                // 导出下载脚本按钮（仅 PC 端显示）
+                if (widget.onExportScripts != null) ...[
+                  Expanded(
+                    child: TextButton.icon(
+                      onPressed: widget.onExportScripts,
+                      style: TextButton.styleFrom(
+                        padding: const EdgeInsets.symmetric(vertical: 12),
+                        backgroundColor:
+                            isDarkMode
+                                ? darkActiveBgColor
+                                : lightActiveBgColor,
+                        foregroundColor:
+                            isDarkMode
+                                ? darkActiveTextColor
+                                : lightEnabledColor,
+                        side: BorderSide(
+                          color:
+                              isDarkMode
+                                  ? darkActiveBorderColor
+                                  : lightActiveBorderColor,
+                          width: 1,
+                        ),
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(4),
+                        ),
+                        overlayColor: lightEnabledColor.withOpacity(0.2),
+                      ),
+                      icon: Icon(
+                        Icons.terminal,
+                        size: 16,
+                        color:
+                            isDarkMode
+                                ? darkActiveTextColor
+                                : lightEnabledColor,
+                      ),
+                      label: const Text('导出下载脚本'),
+                    ),
+                  ),
+                  const SizedBox(width: 12),
+                ],
                 // 下载所有按钮
                 Expanded(
                   child: Container(

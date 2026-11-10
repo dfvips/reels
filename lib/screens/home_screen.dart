@@ -3,6 +3,7 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:douyin_parser/utils/clipboard_utils.dart';
 import 'package:douyin_parser/services/download_service.dart';
+import 'package:douyin_parser/services/script_export_service.dart';
 import 'package:douyin_parser/utils/video_extractor.dart';
 import 'package:douyin_parser/widgets/url_input.dart';
 import 'package:douyin_parser/widgets/result_display.dart';
@@ -131,6 +132,28 @@ class _HomeScreenState extends State<HomeScreen> {
       await ClipboardUtils.copyToClipboard(formattedText);
     } else {
       _showErrorToast('没有可复制的内容');
+    }
+  }
+
+  // 导出下载脚本（仅 PC 端）：aria2c / downloader / RobustDownloader
+  Future<void> _exportDownloadScripts() async {
+    if (_videoUrls.isEmpty) {
+      _showErrorToast('没有可导出的内容');
+      return;
+    }
+    try {
+      final paths = await ScriptExportService.exportAll(
+        urls: _videoUrls,
+        titles: _videoTitles,
+      );
+      if (paths.isEmpty) {
+        _showErrorToast('导出下载脚本失败');
+        return;
+      }
+      final outputDir = File(paths.first).parent.path;
+      _showSuccessToast('已导出 ${paths.length} 个下载脚本到 $outputDir');
+    } catch (e) {
+      _showErrorToast('导出下载脚本失败: $e');
     }
   }
 
@@ -865,6 +888,10 @@ class _HomeScreenState extends State<HomeScreen> {
                 titles: _videoTitles,
                 onCopy: _copyLinks,
                 onDownload: _handleDownload,
+                onExportScripts:
+                    (Platform.isWindows || Platform.isMacOS)
+                        ? _exportDownloadScripts
+                        : null,
               ),
             ],
           ),
@@ -923,6 +950,9 @@ class _HomeScreenState extends State<HomeScreen> {
     return AppBar(
       title: title,
       actions: actions,
+      // IconButton 自带 12 的视觉内边距，这里补 4 使右侧视觉间距
+      // 与 titleSpacing(16) 的左侧间距一致
+      actionsPadding: const EdgeInsets.only(right: 4),
     );
   }
 

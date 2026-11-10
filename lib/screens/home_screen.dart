@@ -147,7 +147,7 @@ class _HomeScreenState extends State<HomeScreen> {
         titles: _videoTitles,
       );
       if (paths.isEmpty) {
-        _showErrorToast('导出下载脚本失败');
+        _showInfoToast('导出已取消');
         return;
       }
       final outputDir = File(paths.first).parent.path;

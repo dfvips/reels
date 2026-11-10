@@ -1,5 +1,6 @@
 import 'dart:io';
 
+import 'package:file_picker/file_picker.dart';
 import 'package:path/path.dart' as path;
 import 'package:path_provider/path_provider.dart';
 
@@ -27,20 +28,21 @@ class ScriptExportService {
   static Future<List<String>> exportAll({
     required List<String> urls,
     required List<String> titles,
-    String baseName = '抖音视频解析',
   }) async {
     if (urls.isEmpty) return [];
 
     final isWindows = Platform.isWindows;
-    final outputDir = await _resolveOutputDirectory();
-    final safeBaseName = DownloadService.safeFileName(baseName);
+    final outputDirPath = await _resolveOutputDirectory();
+    if (outputDirPath == null) return [];
+    final outputDir = Directory(outputDirPath);
+    final baseName = buildScriptBaseName(titles, count: urls.length);
     final paths = <String>[];
 
     for (final tool in _tools) {
       final content = _buildScript(tool, urls, titles, isWindows);
       final extension = isWindows ? '.bat' : '.sh';
       final file = File(
-        path.join(outputDir.path, '${safeBaseName}_$tool$extension'),
+        path.join(outputDir.path, '${baseName}_$tool$extension'),
       );
       await file.writeAsString(content, flush: true);
       if (!isWindows) {
@@ -56,18 +58,62 @@ class ScriptExportService {
     return paths;
   }
 
-  /// 优先导出到系统「下载」目录，不可用时退回应用文档目录。
-  static Future<Directory> _resolveOutputDirectory() async {
-    try {
-      final downloadsDir = await getDownloadsDirectory();
-      if (downloadsDir != null) {
-        await downloadsDir.create(recursive: true);
-        return downloadsDir;
-      }
-    } catch (_) {}
-    final docsDir = await getApplicationDocumentsDirectory();
-    await docsDir.create(recursive: true);
-    return docsDir;
+  /// 脚本文件名规则：第一个标题前 10 个字 + "..."，
+  /// 多个视频时再拼「 - 最后一个标题前 10 个字 + "..."」。
+  static String buildScriptBaseName(
+    List<String> titles, {
+    required int count,
+  }) {
+    String shorten(String title) {
+      final safe = DownloadService.safeFileName(title);
+      final runes = safe.runes.toList();
+      if (runes.length <= 10) return safe;
+      return '${String.fromCharCodes(runes.take(10))}...';
+    }
+
+    final firstTitle = titles.isNotEmpty ? titles.first : '抖音视频';
+    var baseName = shorten(firstTitle);
+    if (count > 1) {
+      final lastIndex = count - 1;
+      final lastTitle =
+          lastIndex < titles.length
+              ? titles[lastIndex]
+              : (titles.isNotEmpty ? titles.last : '抖音视频');
+      baseName = '$baseName - ${shorten(lastTitle)}';
+    }
+    return baseName;
+  }
+
+  /// 解析导出目录，行为与下载保持一致：
+  /// 优先复用已验证可写的上次目录；首次导出时弹出目录选择框，
+  /// 由用户选择（如系统「下载」目录）并记住。
+  ///
+  /// 注意：macOS 沙盒下 getDownloadsDirectory() 返回容器内路径，
+  /// 直接写入会报 Operation not permitted，必须走用户选择授权。
+  static Future<String?> _resolveOutputDirectory() async {
+    final lastDirectory = await DownloadService.getLastDirectory();
+    if (lastDirectory.isNotEmpty &&
+        await DownloadService.checkDirectoryAccess(lastDirectory)) {
+      return lastDirectory;
+    }
+
+    String? initialDirectory;
+    if (Platform.isWindows || Platform.isLinux) {
+      try {
+        initialDirectory = (await getDownloadsDirectory())?.path;
+      } catch (_) {}
+    }
+
+    final picked = await FilePicker.platform.getDirectoryPath(
+      dialogTitle: '选择下载脚本保存位置',
+      initialDirectory: initialDirectory,
+    );
+    if (picked == null || picked.isEmpty) return null;
+    if (!await DownloadService.checkDirectoryAccess(picked)) {
+      throw Exception('没有该目录的写入权限，请重新选择保存位置');
+    }
+    await DownloadService.setLastDirectory(picked);
+    return picked;
   }
 
   static String _buildScript(

@@ -24,8 +24,9 @@ env:
 
 jobs:
   # ================================================================== 版本
-  # 发布版本在构建时自动生成：v* tag 推送沿用 tag 版本；
-  # main 推送用「日期.运行序号」。build number 固定为 run_number 保证递增。
+  # 版本使用语义化版本 X.Y.Z：以 pubspec.yaml 的版本为种子，
+  # 每次构建基于最新的 vX.Y.Z tag 自动 +1；手动调大 pubspec 版本
+  # 时以 pubspec 为准。build number 固定为 run_number 保证递增。
   version:
     name: resolve version
     runs-on: ubuntu-latest
@@ -35,23 +36,59 @@ jobs:
       full: ${{ steps.v.outputs.full }}
       tag: ${{ steps.v.outputs.tag }}
     steps:
+      - uses: actions/checkout@v4
+
       - id: v
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          BUILD_NUMBER: ${{ github.run_number }}
         run: |
-          BUILD="${{ github.run_number }}"
-          if [[ "${{ github.event_name }}" == "push" && "${{ github.ref_type }}" == "tag" ]]; then
-            BASE="${GITHUB_REF_NAME#v}"
-            TAG="${GITHUB_REF_NAME}"
+          set -euo pipefail
+
+          pubspec_base="$(sed -n 's/^version: *\([0-9][0-9.]*\).*/\1/p' pubspec.yaml | head -n 1)"
+
+          if [[ "$EVENT_NAME" == "push" && "$REF_TYPE" == "tag" ]]; then
+            # 手动打 v* tag 时沿用 tag 版本
+            BASE="${REF_NAME#v}"
+            TAG="v${BASE}"
           else
-            # 以北京时间为准
-            BASE="$(TZ=Asia/Shanghai date +%Y.%-m.%-d)"
-            TAG="v${BASE}.${BUILD}"
+            # 取仓库中最新的语义化 tag（忽略日期等旧格式）
+            latest_tag="$(git ls-remote --tags origin 'v*' \
+              | sed 's#.*refs/tags/##' \
+              | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+              | sort -V | tail -n 1 || true)"
+
+            if [[ -n "$latest_tag" ]]; then
+              latest="${latest_tag#v}"
+              if [[ "$(printf '%s\n%s\n' "$latest" "$pubspec_base" | sort -V | tail -n 1)" == "$pubspec_base" && "$pubspec_base" != "$latest" ]]; then
+                # pubspec 手动调大（如 1.1.0）：直接沿用
+                BASE="$pubspec_base"
+              else
+                IFS=. read -r MAJOR MINOR PATCH <<< "$latest"
+                BASE="$MAJOR.$MINOR.$((PATCH + 1))"
+              fi
+            else
+              BASE="$pubspec_base"
+            fi
+
+            TAG="v${BASE}"
+            # tag 已被占用（并发构建）时继续递增，避免发布冲突
+            while git ls-remote --tags origin "refs/tags/${TAG}" | grep -q .; do
+              IFS=. read -r MAJOR MINOR PATCH <<< "${TAG#v}"
+              BASE="$MAJOR.$MINOR.$((PATCH + 1))"
+              TAG="v${BASE}"
+            done
           fi
+
           {
             echo "base=${BASE}"
-            echo "build=${BUILD}"
-            echo "full=${BASE}+${BUILD}"
+            echo "build=${BUILD_NUMBER}"
+            echo "full=${BASE}+${BUILD_NUMBER}"
             echo "tag=${TAG}"
           } >> "$GITHUB_OUTPUT"
+          echo "版本: ${BASE}（tag ${TAG}，build ${BUILD_NUMBER}）"
 
   # ================================================================== Android
   android:

@@ -155,13 +155,13 @@ jobs:
         include:
           - label: win-x64
             os: windows-latest
-            package: exe
+            portable_zip: douyin_parser-win-x64-portable.zip
           - label: win-arm64
             os: windows-11-arm
             flutter_channel: main
             flutter_version: "7e1c8868"
             llvm_ver: "20251202"
-            package: zip
+            portable_zip: douyin_parser-win-arm64.zip
     steps:
       - uses: actions/checkout@v4
 
@@ -356,9 +356,8 @@ jobs:
           "{0} 已生成（{1:N1} MB）" -f (Split-Path $outputExe -Leaf),
             ((Get-Item $outputExe).Length / 1MB) | Write-Host
 
-      # ARM64：便携 zip（exe 改为纯净中文名，依赖全部随包）
+      # 便携 zip（x64 / arm64）：exe 改为纯净中文名，依赖全部随包
       - name: Package (portable zip)
-        if: matrix.label == 'win-arm64'
         shell: pwsh
         run: |
           $release = Get-ChildItem "build/windows/*/runner/Release" -Directory |
@@ -371,15 +370,55 @@ jobs:
           $exe = Get-ChildItem $stage -Filter *.exe | Select-Object -First 1
           Rename-Item $exe.FullName "抖音视频解析.exe"
           Compress-Archive -Path "$stage\*" `
-            -DestinationPath "${{ env.PROJECT_SLUG }}-${{ matrix.label }}.zip" -Force
-          "douyin_parser-win-arm64.zip 已生成（{0:N1} MB）" -f `
-            ((Get-Item "${{ env.PROJECT_SLUG }}-${{ matrix.label }}.zip").Length / 1MB) |
+            -DestinationPath "${{ matrix.portable_zip }}" -Force
+          "${{ matrix.portable_zip }} 已生成（{0:N1} MB）" -f `
+            ((Get-Item "${{ matrix.portable_zip }}").Length / 1MB) |
             Write-Host
+
+      # 安装包：Inno Setup 6.3+ 原生支持 arm64（choco 安装）
+      - name: Package (setup installer)
+        shell: pwsh
+        run: |
+          $arch = if ("${{ matrix.label }}" -eq "win-arm64") { "arm64" } else { "x64" }
+
+          # 固定 Inno Setup 6.7.4（>=6.5 支持 x64compatible 标识与 arm64 安装包）
+          $installer = Join-Path $env:RUNNER_TEMP "innosetup-6.7.4.exe"
+          Invoke-WebRequest "https://github.com/jrsoftware/issrc/releases/download/is-6_7_4/innosetup-6.7.4.exe" -OutFile $installer
+          $setupArgs = '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-'
+          $p = Start-Process -FilePath $installer -ArgumentList $setupArgs -Wait -PassThru
+          "Inno Setup 安装器退出码：$($p.ExitCode)" | Write-Host
+
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            $found = Get-ChildItem "C:\Program Files*\Inno Setup*\ISCC.exe" `
+              -ErrorAction SilentlyContinue | Select-Object -First 1
+            if (-not $found) { throw "未找到 ISCC.exe（Inno Setup 安装失败）" }
+            $iscc = $found.FullName
+          }
+
+          $stage = Join-Path $env:RUNNER_TEMP "portable"
+          if (-not (Test-Path $stage)) { throw "未找到便携打包目录" }
+
+          $iss = Join-Path (Get-Location) "windows\installer\setup.iss"
+          # .iss 含中文，必须带 UTF-8 BOM，否则 Inno Setup 按 ANSI 解析会乱码
+          $content = Get-Content $iss -Raw -Encoding utf8
+          [System.IO.File]::WriteAllText(
+            $iss, $content, (New-Object System.Text.UTF8Encoding($true)))
+
+          $outputDir = (Get-Location).Path
+          & $iscc "/DMyArch=$arch" "/DMyVersion=${{ needs.version.outputs.base }}" `
+            "/DMySourceDir=$stage" "/DMyOutputDir=$outputDir" $iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC 编译失败，退出码 $LASTEXITCODE" }
+
+          $setup = Join-Path $outputDir "${{ env.PROJECT_SLUG }}-${{ matrix.label }}-setup.exe"
+          if (-not (Test-Path $setup)) { throw "未生成安装包" }
+          "{0} 已生成（{1:N1} MB）" -f (Split-Path $setup -Leaf),
+            ((Get-Item $setup).Length / 1MB) | Write-Host
 
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ env.PROJECT_SLUG }}-${{ matrix.label }}
-          path: ${{ env.PROJECT_SLUG }}-${{ matrix.label }}.${{ matrix.package }}
+          path: ${{ env.PROJECT_SLUG }}-${{ matrix.label }}*
           if-no-files-found: error
           retention-days: 30
 
@@ -565,8 +604,8 @@ jobs:
 
   # ================================================================== Release
   # push（main / v* tag）构建成功后自动发布 Release。
-  # 资产全部为「英文 + 架构」命名的 zip；zip 内文件统一为
-  # 「抖音视频解析 + 扩展名」，架构后缀仅体现在 zip 文件名上。
+  # 资产以「英文 + 架构」命名的 zip 为主；zip 内文件统一为
+  # 「抖音视频解析 + 扩展名」。Windows 另附 x64/arm64 安装包（setup.exe）。
   release:
     name: publish release
     needs: [version, android, windows, macos, ios]
@@ -581,14 +620,19 @@ jobs:
         run: |
           mkdir -p release
 
-          # Windows：x64 单文件 exe 装入 zip；
-          # arm64 便携 zip（EVB 不支持 ARM64 输入），内部 exe 已命名「抖音视频解析.exe」
+          # Windows：
+          # - win-x64.zip：EVB 单文件 exe（双击即用）
+          # - win-x64-portable.zip / win-arm64.zip：便携目录（exe 已命名「抖音视频解析.exe」）
+          # - win-x64-setup.exe / win-arm64-setup.exe：安装包
           mkdir -p exe-x64
           cp artifacts/douyin_parser-win-x64/douyin_parser-win-x64.exe \
             "exe-x64/${PRODUCT_NAME}.exe"
           (cd exe-x64 && zip -qry \
             "../release/douyin_parser-win-x64.zip" "${PRODUCT_NAME}.exe")
+          cp artifacts/douyin_parser-win-x64/douyin_parser-win-x64-portable.zip release/
+          cp artifacts/douyin_parser-win-x64/douyin_parser-win-x64-setup.exe release/
           cp artifacts/douyin_parser-win-arm64/douyin_parser-win-arm64.zip release/
+          cp artifacts/douyin_parser-win-arm64/douyin_parser-win-arm64-setup.exe release/
 
           # Android：三个 apk 均装入对应 zip
           for abi in universal armv7 armv8; do

@@ -434,10 +434,9 @@ jobs:
       - name: Build APK
         run: |
           set -euo pipefail
-          GPUI_JAVA="$(find "$HOME/.cargo/git/checkouts" \
-            -path '*gpui-android/android/src/main/java' -type d | head -n 1)"
-          if [[ -z "${GPUI_JAVA}" ]]; then
-            echo "::error::未找到 gpui-android Java 源码"
+          GPUI_JAVA="${GITHUB_WORKSPACE}/rust/gui/vendor/gpui-android/android/src/main/java"
+          if [[ ! -d "${GPUI_JAVA}" ]]; then
+            echo "::error::gpui-android Java 源码目录不存在: ${GPUI_JAVA}"
             exit 1
           fi
           export GPUI_ANDROID_JAVA_DIR="${GPUI_JAVA}"

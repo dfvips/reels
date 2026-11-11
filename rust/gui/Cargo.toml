@@ -17,7 +17,7 @@ gpui-macos = { package = "sotf-gpui-toolkit-gpui-macos", git = "https://github.c
 gpui-miniapp = { git = "https://github.com/pierreaubert/gpui-toolkit", version = "0.11" }
 gpui-ui-kit = { git = "https://github.com/pierreaubert/gpui-toolkit", version = "0.11", default-features = false }
 gpui-ios = { git = "https://github.com/pierreaubert/gpui-toolkit", version = "0.11" }
-gpui-android = { git = "https://github.com/pierreaubert/gpui-toolkit", version = "0.11" }
+gpui-android = { path = "vendor/gpui-android" }
 rfd = "0.15"
 reqwest = { version = "0.12", default-features = false, features = [
     "blocking",

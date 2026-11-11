@@ -1,0 +1,55 @@
+# Vendored from pierreaubert/gpui-toolkit at
+# 8e3a43549c2f8dd6ae43fda875fcf2f2812d1095.
+#
+# Upstream still targets an older GPUI trait surface. Keep this local copy
+# until gpui-toolkit and the sotf-3rdparties GPUI fork are upgraded together.
+[package]
+name = "gpui-android"
+version = "0.11.0"
+edition = "2024"
+license = "ISC"
+description = "Android platform backend for GPUI"
+publish = false
+
+[lib]
+crate-type = ["rlib"]
+
+[features]
+default = []
+autoeq = []
+deeplink = []
+gpu-2d = []
+gpu-3d = []
+media_session = []
+reqwest = []
+showcase = []
+spinorama = []
+tokio = []
+urlencoding = []
+
+[dependencies]
+accesskit = "0.25"
+anyhow = "1.0"
+futures = "0.3"
+gpui = { package = "sotf-gpui-toolkit-gpui", git = "https://github.com/pierreaubert/sotf-3rdparties", version = "0.2.3", default-features = false }
+gpui-foreign-parent = { git = "https://github.com/pierreaubert/gpui-toolkit", version = "0.11" }
+gpui_wgpu = { package = "sotf-gpui-toolkit-gpui-wgpu", git = "https://github.com/pierreaubert/sotf-3rdparties", version = "0.1.3" }
+log = { version = "0.4.28", features = ["kv_unstable_serde", "serde"] }
+parking_lot = "0.13.0"
+raw-window-handle = "0.6"
+smallvec = { version = "1.6", features = ["union", "const_new"] }
+serde_json = "1.0"
+
+[target.'cfg(target_os = "android")'.dependencies]
+android-activity = { version = "0.6", features = ["native-activity"] }
+android_logger = "0.15"
+jni = "0.22"
+# Must match ndk's jni-sys (0.3); jni 0.22 re-exports jni-sys 0.4, whose
+# JNIEnv/jobject are different types than the ones `from_surface` takes.
+jni-sys = "0.3"
+libc = "0.2"
+ndk = { version = "0.9", features = ["nativewindow"] }
+ndk-context = "0.1"
+ndk-sys = "0.6"
+rustc-hash = "2"
+uuid = { version = "1", features = ["v5"] }

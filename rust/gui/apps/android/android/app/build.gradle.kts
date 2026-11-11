@@ -9,6 +9,10 @@ fun findGpuiAndroidJava(): File {
     if (!explicit.isNullOrBlank()) {
         return file(explicit)
     }
+    val vendored = file("../../../../vendor/gpui-android/android/src/main/java")
+    if (vendored.isDirectory) {
+        return vendored
+    }
     val checkouts = File(System.getProperty("user.home"), ".cargo/git/checkouts")
     return checkouts.walkTopDown()
         .firstOrNull { it.isDirectory && it.path.endsWith("gpui-android/android/src/main/java") }

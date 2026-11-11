@@ -1608,7 +1608,7 @@ dependencies = [
  "android-activity",
  "android_logger",
  "douyin-ui",
- "gpui-android",
+ "gpui-android 0.11.0",
  "log",
  "sotf-gpui-toolkit-gpui",
 ]
@@ -2303,6 +2303,33 @@ dependencies = [
 [[package]]
 name = "gpui-android"
 version = "0.11.0"
+dependencies = [
+ "accesskit",
+ "android-activity",
+ "android_logger",
+ "anyhow",
+ "futures",
+ "gpui-foreign-parent",
+ "jni",
+ "jni-sys 0.3.1",
+ "libc",
+ "log",
+ "ndk",
+ "ndk-context",
+ "ndk-sys",
+ "parking_lot 0.13.0",
+ "raw-window-handle",
+ "rustc-hash 2.1.3",
+ "serde_json",
+ "smallvec",
+ "sotf-gpui-toolkit-gpui",
+ "sotf-gpui-toolkit-gpui-wgpu",
+ "uuid",
+]
+
+[[package]]
+name = "gpui-android"
+version = "0.11.0"
 source = "git+https://github.com/pierreaubert/gpui-toolkit#8e3a43549c2f8dd6ae43fda875fcf2f2812d1095"
 dependencies = [
  "accesskit",
@@ -2414,7 +2441,7 @@ version = "0.11.0"
 source = "git+https://github.com/pierreaubert/gpui-toolkit#8e3a43549c2f8dd6ae43fda875fcf2f2812d1095"
 dependencies = [
  "console_error_panic_hook",
- "gpui-android",
+ "gpui-android 0.11.0 (git+https://github.com/pierreaubert/gpui-toolkit)",
  "gpui-builder",
  "gpui-design",
  "gpui-ios",

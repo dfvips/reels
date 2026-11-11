@@ -1,0 +1,639 @@
+name: Build Rust
+
+run-name: Build Rust · ${{ github.ref_name }}
+
+on:
+  push:
+    branches: ["rust"]
+    tags: ["v*"]
+  pull_request:
+    paths:
+      - "rust/**"
+      - ".github/workflows/build-rust.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+env:
+  PROJECT_SLUG: douyin_parser
+  PRODUCT_NAME: 抖音视频解析
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ================================================================== 版本
+  version:
+    name: resolve version
+    runs-on: ubuntu-latest
+    outputs:
+      base: ${{ steps.v.outputs.base }}
+      build: ${{ steps.v.outputs.build }}
+      tag: ${{ steps.v.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: v
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          BUILD_NUMBER: ${{ github.run_number }}
+        run: |
+          set -euo pipefail
+          seed="$(tr -d '[:space:]' < rust/VERSION)"
+          seed="${seed:-1.0.2}"
+
+          if [[ "$EVENT_NAME" == "push" && "$REF_TYPE" == "tag" ]]; then
+            BASE="${REF_NAME#v}"
+            TAG="v${BASE}"
+          else
+            latest_tag="$(git ls-remote --tags origin 'v*' \
+              | sed 's#.*refs/tags/##' \
+              | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+              | sort -V | tail -n 1 || true)"
+
+            if [[ -n "$latest_tag" ]]; then
+              latest="${latest_tag#v}"
+              if [[ "$(printf '%s\n%s\n' "$latest" "$seed" | sort -V | tail -n 1)" == "$seed" && "$seed" != "$latest" ]]; then
+                BASE="$seed"
+              else
+                IFS=. read -r MAJOR MINOR PATCH <<< "$latest"
+                BASE="$MAJOR.$MINOR.$((PATCH + 1))"
+              fi
+            else
+              BASE="$seed"
+            fi
+
+            TAG="v${BASE}"
+            while git ls-remote --tags origin "refs/tags/${TAG}" | grep -q .; do
+              IFS=. read -r MAJOR MINOR PATCH <<< "${TAG#v}"
+              BASE="$MAJOR.$MINOR.$((PATCH + 1))"
+              TAG="v${BASE}"
+            done
+          fi
+
+          {
+            echo "base=${BASE}"
+            echo "build=${BUILD_NUMBER}"
+            echo "tag=${TAG}"
+          } >> "$GITHUB_OUTPUT"
+          echo "版本: ${BASE}（tag ${TAG}，build ${BUILD_NUMBER}）"
+
+  # ================================================================== Windows
+  # 三个架构都产出真正的单文件 exe：静态 CRT，无外部 DLL。
+  windows:
+    needs: version
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: win-x64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            msvc_arch: x64
+            dumpbin_arch: x64
+          - label: win-x86
+            os: windows-latest
+            target: i686-pc-windows-msvc
+            msvc_arch: amd64_x86
+            dumpbin_arch: x86
+          - label: win-arm64
+            os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            dumpbin_arch: arm64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up MSVC toolchain
+        if: matrix.label != 'win-arm64'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: ${{ matrix.msvc_arch }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust/gui -> target
+
+      - name: Locate DirectX shader compiler
+        shell: pwsh
+        run: |
+          $kits = "${env:ProgramFiles(x86)}\Windows Kits\10\bin"
+          $fxc = Get-ChildItem $kits -Recurse -Filter fxc.exe -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -match '\\x64\\fxc\.exe$' } |
+            Sort-Object LastWriteTime -Descending |
+            Select-Object -First 1
+          if (-not $fxc) {
+            $fxc = Get-ChildItem $kits -Recurse -Filter fxc.exe -ErrorAction SilentlyContinue |
+              Sort-Object LastWriteTime -Descending |
+              Select-Object -First 1
+          }
+          if ($fxc) {
+            "GPUI_FXC_PATH=$($fxc.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+            Write-Host "GPUI_FXC_PATH=$($fxc.FullName)"
+          } else {
+            Write-Warning "未找到 x64 fxc.exe，GPUI 可能回退到 stub shader"
+          }
+
+      - name: Build single-file exe
+        shell: pwsh
+        env:
+          APP_VERSION: ${{ needs.version.outputs.base }}
+          RUSTFLAGS: "-C target-feature=+crt-static"
+        run: |
+          cargo build --release --manifest-path rust/gui/Cargo.toml `
+            --locked -p douyin-parser --target ${{ matrix.target }}
+          if ($LASTEXITCODE -ne 0) { throw "cargo build 失败" }
+
+          $exe = "rust/gui/target/${{ matrix.target }}/release/${{ env.PRODUCT_NAME }}.exe"
+          if (-not (Test-Path $exe)) { throw "未找到构建产物: $exe" }
+
+          $stage = Join-Path $env:RUNNER_TEMP "stage"
+          if (Test-Path $stage) { Remove-Item -Recurse -Force $stage }
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          $stageExe = Join-Path $stage "${{ env.PRODUCT_NAME }}.exe"
+          Copy-Item $exe $stageExe
+
+          $dumpbin = (Get-Command dumpbin.exe -ErrorAction SilentlyContinue).Source
+          if (-not $dumpbin) {
+            $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+            if (-not (Test-Path $vswhere)) { throw "未找到 vswhere.exe，无法定位 dumpbin.exe" }
+            $vsPath = & $vswhere -latest -products * -property installationPath |
+              Select-Object -First 1
+            if (-not $vsPath) { throw "vswhere 未找到 Visual Studio 安装" }
+            $dumpbinFile = Get-ChildItem $vsPath -Recurse -Filter dumpbin.exe -ErrorAction SilentlyContinue |
+              Where-Object { $_.FullName -match "\\bin\\Host[^\\]+\\${{ matrix.dumpbin_arch }}\\dumpbin\.exe$" } |
+              Sort-Object FullName -Descending |
+              Select-Object -First 1
+            if (-not $dumpbinFile) {
+              throw "未找到 ${{ matrix.dumpbin_arch }} 架构的 dumpbin.exe"
+            }
+            $dumpbin = $dumpbinFile.FullName
+          }
+          $dependencies = @(
+            & $dumpbin /DEPENDENTS $exe |
+              ForEach-Object { $_.Trim() } |
+              Where-Object { $_ -match '^[A-Za-z0-9_.-]+\.dll$' } |
+              Sort-Object -Unique
+          )
+          if ($dependencies.Count -eq 0) { throw "dumpbin 未解析到任何 DLL 依赖" }
+
+          $dynamicCrt = @($dependencies | Where-Object {
+            $_ -match '^(vcruntime|msvcp|concrt|ucrtbase|api-ms-win-crt)'
+          })
+          if ($dynamicCrt.Count -gt 0) {
+            throw "检测到动态 CRT 依赖，不是静态单文件：$($dynamicCrt -join ', ')"
+          }
+
+          $nonSystem = @()
+          foreach ($dll in $dependencies) {
+            if ($dll -match '^(api-ms-win-|ext-ms-)') { continue }
+            if (-not (Test-Path (Join-Path $env:WINDIR "System32\$dll"))) {
+              $nonSystem += $dll
+            }
+          }
+          if ($nonSystem.Count -gt 0) {
+            throw "检测到非系统 DLL 依赖，无法作为绿色单文件运行：$($nonSystem -join ', ')"
+          }
+          Write-Host "单文件依赖校验通过：$($dependencies -join ', ')"
+
+          $zip = "${{ env.PROJECT_SLUG }}-${{ matrix.label }}.zip"
+          Compress-Archive -Path $stageExe `
+            -DestinationPath $zip -Force
+          "{0} 已生成（{1:N1} MB）" -f $zip, ((Get-Item $zip).Length / 1MB) | Write-Host
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.PROJECT_SLUG }}-${{ matrix.label }}
+          path: ${{ env.PROJECT_SLUG }}-${{ matrix.label }}.zip
+          if-no-files-found: error
+          retention-days: 30
+
+  # ================================================================== macOS
+  macos:
+    needs: version
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: mac-x64
+            os: macos-15-intel
+            target: x86_64-apple-darwin
+          - label: mac-arm64
+            os: macos-latest
+            target: aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust/gui -> target
+
+      - name: Build
+        env:
+          APP_VERSION: ${{ needs.version.outputs.base }}
+        run: |
+          cargo build --release --manifest-path rust/gui/Cargo.toml \
+            --locked -p douyin-parser --target ${{ matrix.target }}
+
+      - name: Assemble & sign macOS app bundle
+        env:
+          SIGNING_CERT: ${{ secrets.SIGNING_CERT }}
+          SIGNING_CERT_PASSWORD: ${{ secrets.SIGNING_CERT_PASSWORD }}
+          VERSION: ${{ needs.version.outputs.base }}
+          BUILD_NUMBER: ${{ needs.version.outputs.build }}
+        run: |
+          set -euo pipefail
+          APP="${GITHUB_WORKSPACE}/${PRODUCT_NAME}.app"
+          mkdir -p "${APP}/Contents/MacOS" "${APP}/Contents/Resources"
+          cp "rust/gui/target/${{ matrix.target }}/release/${PRODUCT_NAME}" \
+            "${APP}/Contents/MacOS/${PRODUCT_NAME}"
+          cp rust/assets/macos.icns \
+            "${APP}/Contents/Resources/AppIcon.icns"
+
+          cat > "${APP}/Contents/Info.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleDevelopmentRegion</key><string>zh_CN</string>
+            <key>CFBundleDisplayName</key><string>${PRODUCT_NAME}</string>
+            <key>CFBundleExecutable</key><string>${PRODUCT_NAME}</string>
+            <key>CFBundleIconFile</key><string>AppIcon</string>
+            <key>CFBundleIdentifier</key><string>com.dreamfly.douyinParser</string>
+            <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+            <key>CFBundleName</key><string>${PRODUCT_NAME}</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleShortVersionString</key><string>${VERSION}</string>
+            <key>CFBundleVersion</key><string>${BUILD_NUMBER}</string>
+            <key>LSApplicationCategoryType</key><string>public.app-category.utilities</string>
+            <key>LSMinimumSystemVersion</key><string>10.15.7</string>
+            <key>NSHighResolutionCapable</key><true/>
+            <key>NSPrincipalClass</key><string>NSApplication</string>
+          </dict>
+          </plist>
+          PLIST
+          plutil -lint "${APP}/Contents/Info.plist"
+
+          SIGN_IDENTITY="-"
+          KEYCHAIN=""
+          if [[ -n "${SIGNING_CERT:-}" ]]; then
+            echo "==> 使用 Secrets 中的 SIGNING_CERT（Base64 PKCS#12）签名"
+            if [[ -z "${SIGNING_CERT_PASSWORD:-}" ]]; then
+              echo "::error::缺少 SIGNING_CERT_PASSWORD"
+              exit 1
+            fi
+            KEYCHAIN="${RUNNER_TEMP}/build.keychain-db"
+            CERT_PATH="${RUNNER_TEMP}/macos_cert.p12"
+
+            printf '%s' "${SIGNING_CERT}" | base64 --decode > "${CERT_PATH}"
+            if [[ ! -s "${CERT_PATH}" ]]; then
+              echo "::error::SIGNING_CERT 解码后为空"
+              exit 1
+            fi
+
+            security create-keychain -p "" "${KEYCHAIN}"
+            security set-keychain-settings -lut 21600 "${KEYCHAIN}"
+            security unlock-keychain -p "" "${KEYCHAIN}"
+            security import "${CERT_PATH}" -P "${SIGNING_CERT_PASSWORD}" \
+              -A -t cert -f pkcs12 -k "${KEYCHAIN}"
+            security set-key-partition-list -S apple-tool:,apple: -s -k "" "${KEYCHAIN}"
+            security list-keychains -d user -s "${KEYCHAIN}"
+
+            SIGN_IDENTITY="$(security find-identity -v -p codesigning "${KEYCHAIN}" | head -n 1 | awk '{print $2}')"
+            if [[ -z "${SIGN_IDENTITY}" ]]; then
+              echo "::error::PKCS#12 已导入，但没有可用的 codesigning identity"
+              security find-identity -v -p codesigning "${KEYCHAIN}"
+              exit 1
+            fi
+            echo "==> codesigning identity：${SIGN_IDENTITY}"
+          else
+            echo "::warning::未配置 SIGNING_CERT，使用 ad-hoc 签名"
+          fi
+
+          if [[ "${SIGN_IDENTITY}" == "-" ]]; then
+            codesign --force --deep --options runtime --sign "-" "${APP}"
+          else
+            codesign --force --deep --options runtime --timestamp \
+              --sign "${SIGN_IDENTITY}" "${APP}"
+          fi
+          codesign --verify --deep --strict --verbose=2 "${APP}"
+
+          echo "KEYCHAIN_PATH=${KEYCHAIN}" >> "$GITHUB_ENV"
+
+      - name: Package (unsigned DMG + zip)
+        run: |
+          set -euo pipefail
+          APP="${GITHUB_WORKSPACE}/${PRODUCT_NAME}.app"
+          DMG="${GITHUB_WORKSPACE}/${PRODUCT_NAME}.dmg"
+          ZIP="${GITHUB_WORKSPACE}/${PROJECT_SLUG}-${{ matrix.label }}.zip"
+
+          mkdir -p dmg-stage
+          cp -R "${APP}" dmg-stage/
+          ln -s /Applications dmg-stage/Applications
+          hdiutil create -volname "${PRODUCT_NAME}" -srcfolder dmg-stage \
+            -ov -format UDZO "${DMG}" > /dev/null
+          rm -rf dmg-stage
+
+          # Python zipfile 会为中文名写入 UTF-8(EFS) 标志，避免 Windows 解压乱码。
+          python3 - "${ZIP}" "${DMG}" <<'PY'
+          import os
+          import sys
+          import zipfile
+
+          archive, dmg = sys.argv[1], sys.argv[2]
+          with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zf:
+              zf.write(dmg, arcname=os.path.basename(dmg))
+          PY
+          ls -lh "${ZIP}"
+
+      - name: Delete temporary keychain
+        if: env.KEYCHAIN_PATH != ''
+        run: |
+          security delete-keychain "${KEYCHAIN_PATH}" || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.PROJECT_SLUG }}-${{ matrix.label }}
+          path: ${{ env.PROJECT_SLUG }}-${{ matrix.label }}.zip
+          if-no-files-found: error
+          retention-days: 30
+
+  # ================================================================== Android
+  android:
+    needs: version
+    name: ${{ matrix.label }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: android-armv7
+            abis: "armeabi-v7a"
+          - label: android-armv8
+            abis: "arm64-v8a"
+          - label: android-universal
+            abis: "armeabi-v7a,arm64-v8a"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r28c
+          add-to-path: true
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: armv7-linux-androideabi,aarch64-linux-android
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-ndk
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust/gui -> target
+
+      - name: Build native libraries
+        env:
+          APP_VERSION: ${{ needs.version.outputs.base }}
+        run: |
+          set -euo pipefail
+          ABI_ARGS=""
+          ABI_LIST="${{ matrix.abis }}"
+          ABI_LIST="${ABI_LIST//,/ }"
+          for abi in ${ABI_LIST}; do
+            ABI_ARGS="${ABI_ARGS} -t ${abi}"
+          done
+          cd rust/gui
+          cargo ndk ${ABI_ARGS} -P 26 \
+            -o apps/android/android/app/src/main/jniLibs \
+            build --release --locked -p douyin-parser-android
+
+      - name: Build APK
+        run: |
+          set -euo pipefail
+          GPUI_JAVA="$(find "$HOME/.cargo/git/checkouts" \
+            -path '*gpui-android/android/src/main/java' -type d | head -n 1)"
+          if [[ -z "${GPUI_JAVA}" ]]; then
+            echo "::error::未找到 gpui-android Java 源码"
+            exit 1
+          fi
+          export GPUI_ANDROID_JAVA_DIR="${GPUI_JAVA}"
+          echo "GPUI_ANDROID_JAVA_DIR=${GPUI_JAVA}" >> "$GITHUB_ENV"
+
+          cd rust/gui/apps/android/android
+          chmod +x gradlew
+          ./gradlew --no-daemon assembleRelease \
+            -PdouyinVersionName=${{ needs.version.outputs.base }} \
+            -PdouyinVersionCode=${{ needs.version.outputs.build }} \
+            -PdouyinAbiFilters="${{ matrix.abis }}"
+
+          APK="app/build/outputs/apk/release/app-release.apk"
+          if [[ ! -f "${APK}" ]]; then
+            echo "::error::未生成 APK"
+            exit 1
+          fi
+          cp "${APK}" "${GITHUB_WORKSPACE}/${PROJECT_SLUG}-${{ matrix.label }}.apk"
+          ls -lh "${GITHUB_WORKSPACE}/${PROJECT_SLUG}-${{ matrix.label }}.apk"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.PROJECT_SLUG }}-${{ matrix.label }}
+          path: ${{ env.PROJECT_SLUG }}-${{ matrix.label }}.apk
+          if-no-files-found: error
+          retention-days: 30
+
+  # ================================================================== iOS
+  ios:
+    needs: version
+    name: ios-unsigned
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust/gui -> target
+
+      - name: Build static library
+        env:
+          APP_VERSION: ${{ needs.version.outputs.base }}
+        run: |
+          cargo build --release --manifest-path rust/gui/Cargo.toml \
+            --locked -p douyin-parser-ios --target aarch64-apple-ios
+          mkdir -p rust/gui/apps/ios/ios/lib
+          cp rust/gui/target/aarch64-apple-ios/release/libdouyin_parser_ios.a \
+            rust/gui/apps/ios/ios/lib/
+
+      - name: Build unsigned IPA
+        env:
+          VERSION: ${{ needs.version.outputs.base }}
+          BUILD_NUMBER: ${{ needs.version.outputs.build }}
+        run: |
+          set -euo pipefail
+          brew install xcodegen >/dev/null
+          cd rust/gui/apps/ios/ios
+          xcodegen generate
+          xcodebuild \
+            -project DouyinParser.xcodeproj \
+            -scheme DouyinParser \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            MARKETING_VERSION="${VERSION}" \
+            CURRENT_PROJECT_VERSION="${BUILD_NUMBER}" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build
+
+          APP="$(find build/Build/Products/Release-iphoneos -maxdepth 1 -name '*.app' -type d | head -n 1)"
+          if [[ -z "${APP}" ]]; then
+            echo "::error::未找到 .app 产物"
+            exit 1
+          fi
+          rm -rf Payload
+          mkdir Payload
+          cp -R "${APP}" Payload/
+          IPA="${GITHUB_WORKSPACE}/${PROJECT_SLUG}-ios-unsigned.ipa"
+          python3 - "${IPA}" <<'PY'
+          import os
+          import sys
+          import zipfile
+
+          archive = sys.argv[1]
+          with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zf:
+              for root, dirs, files in os.walk("Payload"):
+                  for name in dirs:
+                      path = os.path.join(root, name)
+                      zf.write(path, arcname=path + "/")
+                  for name in files:
+                      path = os.path.join(root, name)
+                      zf.write(path, arcname=path)
+          PY
+          ls -lh "${IPA}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.PROJECT_SLUG }}-ios-unsigned
+          path: ${{ env.PROJECT_SLUG }}-ios-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 30
+
+  # ================================================================== Release
+  release:
+    name: publish release
+    needs: [version, windows, macos, android, ios]
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Prepare release assets
+        run: |
+          set -euo pipefail
+          mkdir -p release
+
+          # Windows：zip 内只有一个「抖音视频解析.exe」
+          cp artifacts/douyin_parser-win-x64/douyin_parser-win-x64.zip release/
+          cp artifacts/douyin_parser-win-x86/douyin_parser-win-x86.zip release/
+          cp artifacts/douyin_parser-win-arm64/douyin_parser-win-arm64.zip release/
+
+          # macOS：zip 内只有一个「抖音视频解析.dmg」
+          cp artifacts/douyin_parser-mac-x64/douyin_parser-mac-x64.zip release/
+          cp artifacts/douyin_parser-mac-arm64/douyin_parser-mac-arm64.zip release/
+
+          # Android / iOS：内部文件统一为中文名，zip 名保持英文+架构。
+          python3 - <<'PY'
+          import os
+          import pathlib
+          import zipfile
+
+          product = os.environ["PRODUCT_NAME"]
+          root = pathlib.Path("artifacts")
+          release = pathlib.Path("release")
+
+          for abi in ("armv7", "armv8", "universal"):
+              source = root / f"douyin_parser-android-{abi}" / f"douyin_parser-android-{abi}.apk"
+              target = release / f"douyin_parser-android-{abi}.zip"
+              with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as zf:
+                  zf.write(source, arcname=f"{product}.apk")
+
+          source = root / "douyin_parser-ios-unsigned" / "douyin_parser-ios-unsigned.ipa"
+          with zipfile.ZipFile(release / "douyin_parser-ios.zip", "w", zipfile.ZIP_DEFLATED) as zf:
+              zf.write(source, arcname=f"{product}.ipa")
+          PY
+
+          # 发布前逐项校验：每个 zip 必须只有一个文件，且文件名正确。
+          python3 - <<'PY'
+          import os
+          import pathlib
+          import zipfile
+
+          product = os.environ["PRODUCT_NAME"]
+          expected = {
+              "douyin_parser-win-x64.zip": [f"{product}.exe"],
+              "douyin_parser-win-x86.zip": [f"{product}.exe"],
+              "douyin_parser-win-arm64.zip": [f"{product}.exe"],
+              "douyin_parser-mac-x64.zip": [f"{product}.dmg"],
+              "douyin_parser-mac-arm64.zip": [f"{product}.dmg"],
+              "douyin_parser-android-armv7.zip": [f"{product}.apk"],
+              "douyin_parser-android-armv8.zip": [f"{product}.apk"],
+              "douyin_parser-android-universal.zip": [f"{product}.apk"],
+              "douyin_parser-ios.zip": [f"{product}.ipa"],
+          }
+
+          for name, files in expected.items():
+              path = pathlib.Path("release") / name
+              if not path.is_file():
+                  raise SystemExit(f"缺少发布资产: {path}")
+              with zipfile.ZipFile(path) as zf:
+                  actual = [item for item in zf.namelist() if not item.endswith("/")]
+              if actual != files:
+                  raise SystemExit(f"{name} 内容错误: 期望 {files}，实际 {actual}")
+          print("发布资产校验通过")
+          PY
+
+          ls -lh release
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.version.outputs.tag }}
+          VERSION: ${{ needs.version.outputs.base }}
+        run: |
+          gh release create "$TAG" release/* \
+            -R "$GITHUB_REPOSITORY" \
+            --target "${{ github.sha }}" \
+            --title "抖音视频解析 $VERSION" \
+            --notes "GPUI 重写版自动构建 · ${{ github.event_name }} @ ${{ github.sha }}" \
+            --latest

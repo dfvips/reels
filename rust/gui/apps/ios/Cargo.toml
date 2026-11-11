@@ -1,0 +1,16 @@
+[package]
+name = "douyin-parser-ios"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "douyin_parser_ios"
+crate-type = ["staticlib"]
+
+[dependencies]
+gpui.workspace = true
+gpui-ios.workspace = true
+douyin-ui = { path = "../../crates/ui" }
+log = "0.4"
+oslog = "0.2"

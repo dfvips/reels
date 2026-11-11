@@ -1,0 +1,8 @@
+target/
+**/build/
+**/lib/*.a
+**/DouyinParser.xcodeproj/
+**/jniLibs/
+**/.gradle/
+**/local.properties
+**/*.iml

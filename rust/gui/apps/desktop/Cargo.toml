@@ -1,0 +1,18 @@
+[package]
+name = "douyin-parser"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "抖音视频解析"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+gpui.workspace = true
+gpui-miniapp.workspace = true
+douyin-ui = { path = "../../crates/ui" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+gpui-macos = { workspace = true, features = ["runtime_shaders"] }

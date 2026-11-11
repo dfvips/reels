@@ -1,0 +1,19 @@
+[package]
+name = "douyin-parser-android"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "douyin_parser_android"
+crate-type = ["cdylib"]
+
+[dependencies]
+gpui.workspace = true
+gpui-android.workspace = true
+douyin-ui = { path = "../../crates/ui" }
+log = "0.4"
+
+[target.'cfg(target_os = "android")'.dependencies]
+android-activity = { version = "0.6", features = ["native-activity"] }
+android_logger = "0.15"

@@ -1,0 +1,21 @@
+[package]
+name = "douyin-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+gpui.workspace = true
+douyin-core.workspace = true
+douyin-input = { path = "../input" }
+gpui-ui-kit.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+reqwest.workspace = true
+
+[target.'cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))'.dependencies]
+rfd.workspace = true
+
+[target.'cfg(target_os = "ios")'.dependencies]
+gpui-ios.workspace = true

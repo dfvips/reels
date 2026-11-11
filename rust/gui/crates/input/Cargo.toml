@@ -1,0 +1,9 @@
+[package]
+name = "douyin-input"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[dependencies]
+gpui.workspace = true
+gpui-ui-kit.workspace = true

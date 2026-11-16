@@ -14,5 +14,5 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "DouyinParserAndroid"
+rootProject.name = "ReelsAndroid"
 include(":app")

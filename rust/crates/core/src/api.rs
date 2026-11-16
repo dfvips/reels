@@ -21,11 +21,21 @@ pub struct AwemeDetail {
     pub desc: Option<String>,
     pub play_uri: Option<String>,
     pub play_urls: Vec<String>,
+    pub bit_rates: Vec<AwemeBitRate>,
     pub duration_ms: Option<u64>,
     pub width: Option<u64>,
     pub height: Option<u64>,
     pub size_bytes: Option<u64>,
     pub quality: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AwemeBitRate {
+    pub quality: Option<String>,
+    pub url: Option<String>,
+    pub width: Option<u64>,
+    pub height: Option<u64>,
+    pub size_bytes: Option<u64>,
 }
 
 pub struct DouyinApi {
@@ -162,6 +172,47 @@ impl DouyinApi {
         let width = video.get("width").and_then(Value::as_u64);
         let height = video.get("height").and_then(Value::as_u64);
         let play_uri = play_addr.get("uri").and_then(Value::as_str);
+        let bit_rates = video
+            .get("bit_rate")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| {
+                        let play_addr = item.get("play_addr");
+                        let url = play_addr
+                            .and_then(|addr| addr.get("url_list"))
+                            .and_then(Value::as_array)?
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .find(|url| !url.is_empty())?
+                            .to_string();
+                        Some(AwemeBitRate {
+                            quality: item
+                                .get("gear_name")
+                                .and_then(Value::as_str)
+                                .map(str::to_string),
+                            url: Some(url),
+                            width: item.get("width").and_then(Value::as_u64).or_else(|| {
+                                play_addr
+                                    .and_then(|addr| addr.get("width"))
+                                    .and_then(Value::as_u64)
+                            }),
+                            height: item.get("height").and_then(Value::as_u64).or_else(|| {
+                                play_addr
+                                    .and_then(|addr| addr.get("height"))
+                                    .and_then(Value::as_u64)
+                            }),
+                            size_bytes: item.get("size").and_then(Value::as_u64).or_else(|| {
+                                play_addr
+                                    .and_then(|addr| addr.get("data_size"))
+                                    .and_then(Value::as_u64)
+                            }),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         let mut size_bytes = None;
         let mut quality = video
             .get("video_quality")
@@ -193,6 +244,7 @@ impl DouyinApi {
                 .map(str::to_string),
             play_uri: play_uri.map(str::to_string),
             play_urls: urls,
+            bit_rates,
             duration_ms,
             width,
             height,

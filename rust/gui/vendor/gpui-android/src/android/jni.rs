@@ -41,11 +41,13 @@
 use std::{
     ffi::c_void,
     sync::{
-        Arc, OnceLock,
+        Arc, LazyLock, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
 };
+
+use parking_lot::Mutex;
 
 /// Whether the deferred init-window callback has already been invoked.
 ///
@@ -53,12 +55,65 @@ use std::{
 /// recreated on resume the init callbacks run again.
 static INIT_WINDOW_DONE: AtomicBool = AtomicBool::new(false);
 
+/// Logical-pixel bounds `(x, y, w, h)` of the active native editor takeover.
+///
+/// Touches landing inside these bounds are routed to the real `EditText`
+/// instead of GPUI so the system owns the caret, selection handles, and its
+/// own edit menu.
+pub(crate) static NATIVE_EDITOR_BOUNDS: LazyLock<Mutex<Option<(f32, f32, f32, f32)>>> =
+    LazyLock::new(|| Mutex::new(None));
+
+/// Whether the current touch gesture is being routed to the native editor.
+static EDITOR_TOUCH_CLAIMED: AtomicBool = AtomicBool::new(false);
+
+/// Record (or clear) the native editor takeover bounds, in logical pixels.
+pub fn record_native_editor_bounds(bounds: Option<(f32, f32, f32, f32)>) {
+    *NATIVE_EDITOR_BOUNDS.lock() = bounds;
+}
+
 /// Whether the GPUI native library has completed initialization.
 ///
 /// Set to `true` after the first frame is rendered. This can be queried
 /// via JNI by a custom Activity to dismiss the splash screen, although
 /// with NativeActivity the system splash handles this automatically.
 pub static NATIVE_INITIALIZED: AtomicBool = AtomicBool::new(false);
+
+/// Set after the renderer has submitted the first real GPUI frame.
+///
+/// `NATIVE_INITIALIZED` is published before the first frame is requested.
+/// The Android host uses this second signal to keep its launch cover above
+/// the NativeActivity surface until that surface contains app pixels.
+pub static NATIVE_FIRST_FRAME_PRESENTED: AtomicBool = AtomicBool::new(false);
+
+/// Editor window operation dispatched during paint, parked until the frame
+/// that produced it has been submitted by `AndroidWindow::draw`.
+///
+/// Editor dispatches run in the middle of GPUI's paint phase, before the
+/// frame is submitted. Applying them immediately lets the EditText window
+/// move, attach, or detach while the screen still shows the previous frame —
+/// most visibly as a lone input box floating over a black surface right
+/// after the app resumes from a frozen background. Parking and replaying
+/// right after `draw` keeps the editor window in lockstep with the frame
+/// that defines its geometry.
+enum PendingEditorOp {
+    Show(crate::NativeEditorParams),
+    Hide,
+}
+static PENDING_EDITOR_OP: Mutex<Option<PendingEditorOp>> = Mutex::new(None);
+
+/// Set when Java finishes an IME animation during the Cookie dialog handoff.
+/// The next submitted GPUI frame reveals the real editor at its final place.
+static IME_ANIMATION_END_PENDING: AtomicBool = AtomicBool::new(false);
+static NATIVE_EDITOR_IME_PREVIEW_VISIBLE: AtomicBool = AtomicBool::new(false);
+
+/// Set when the app resumes; the Java host shows a theme-colored cover until
+/// the first resumed GPUI frame is submitted (see `apply_resume`).
+pub static RESUME_COVER_PENDING: AtomicBool = AtomicBool::new(false);
+/// True from resume until the cover fade starts. While set, editor ops stay
+/// parked so the native editor panel never renders above the opaque cover
+/// before the GPUI UI is revealed (Java flushes via
+/// `nativeOnResumeCoverFadeStart`).
+pub static RESUME_COVER_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 /// Deferred lifecycle flags.
 ///
@@ -80,6 +135,13 @@ static TERM_WINDOW_PENDING: AtomicBool = AtomicBool::new(false);
 static INIT_WINDOW_PENDING: AtomicBool = AtomicBool::new(false);
 static WINDOW_RESIZED_PENDING: AtomicBool = AtomicBool::new(false);
 static CONFIG_CHANGED_PENDING: AtomicBool = AtomicBool::new(false);
+
+/// Interval at which a visible-but-idle app presents a keep-alive frame.
+/// MIUI's dynamic-FPS controller stops compositing layers that stop
+/// submitting buffers, and the first buffer release after that freeze can
+/// stall `eglSwapBuffers` for hundreds of milliseconds — the perceived
+/// 1-2 s click delay. Regular submissions keep the layer out of that state.
+const FRAME_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(1);
 
 use android_activity::{AndroidApp, MainEvent, PollEvent};
 
@@ -162,6 +224,12 @@ pub fn get_string(env: &mut jni::Env<'_>, obj: &JObject<'_>) -> String {
 /// retain the Intent beyond the call.
 pub fn launch_intent_string_extra(name: &str) -> Option<String> {
     with_env(|env| {
+        // Platform-feature probes intentionally leave benign Java exceptions
+        // pending on this thread. Clear them before this unrelated JNI call;
+        // otherwise jni-rs refuses the call with JavaException.
+        if env.exception_check() {
+            env.exception_clear();
+        }
         let activity = activity(env)?;
         let intent = env
             .call_method(
@@ -330,15 +398,36 @@ pub fn invalidate_app_class_cache(class_name: &str) {
 
 // ── global state ─────────────────────────────────────────────────────────────
 
-/// The `AndroidApp` handle from `android-activity`.
+/// A replaceable process-global slot.
 ///
-/// Set once in `android_main`; read-only thereafter.
-static ANDROID_APP: OnceLock<AndroidApp> = OnceLock::new();
+/// Android may destroy and recreate a `NativeActivity` without killing the
+/// process.  Each recreated Activity gets a new `android_main` thread with a
+/// new looper, so slot values tied to the previous Activity must be replaced
+/// rather than initialized once for the lifetime of the process.
+struct GlobalSlot<T>(Mutex<Option<T>>);
 
-/// Process-global `AndroidPlatform` instance.
+impl<T: Clone> GlobalSlot<T> {
+    const fn new() -> Self {
+        Self(Mutex::new(None))
+    }
+
+    fn get(&self) -> Option<T> {
+        self.0.lock().clone()
+    }
+
+    fn replace(&self, value: T) -> Option<T> {
+        self.0.lock().replace(value)
+    }
+}
+
+/// The `AndroidApp` handle for the current Activity instance.
+static ANDROID_APP: GlobalSlot<AndroidApp> = GlobalSlot::new();
+
+/// The `AndroidPlatform` for the current Activity instance.
 ///
-/// Initialised once during `android_main`; read-only thereafter.
-static PLATFORM: OnceLock<Arc<AndroidPlatform>> = OnceLock::new();
+/// Replaced when Android recreates the Activity; its dispatcher is bound to
+/// that Activity's `android_main` thread and looper.
+static PLATFORM: GlobalSlot<Arc<AndroidPlatform>> = GlobalSlot::new();
 
 /// Immutable virtual-keyboard character map shared by hardware key events.
 static KEY_CHARACTER_MAP: OnceLock<Global<JObject<'static>>> = OnceLock::new();
@@ -393,8 +482,7 @@ pub fn unicode_char_for_key_event(key_code: i32, _action: i32, meta_state: i32) 
 /// Uses `AndroidApp::vm_as_ptr()` from the stored `AndroidApp`.
 /// Used by `platform.rs` for JNI calls.
 pub fn java_vm() -> *mut c_void {
-    ANDROID_APP
-        .get()
+    android_app()
         .map(|app| app.vm_as_ptr())
         .unwrap_or(std::ptr::null_mut())
 }
@@ -409,21 +497,20 @@ pub fn java_vm() -> *mut c_void {
 /// Code that previously used `(*activity).clazz` should use this directly
 /// as the activity jobject.
 pub fn activity_as_ptr() -> *mut c_void {
-    ANDROID_APP
-        .get()
+    android_app()
         .map(|app| app.activity_as_ptr())
         .unwrap_or(std::ptr::null_mut())
 }
 
 /// Returns a clone of the stored `AndroidApp`, if initialised.
 pub fn android_app() -> Option<AndroidApp> {
-    ANDROID_APP.get().cloned()
+    ANDROID_APP.get()
 }
 
-/// Returns a reference to the global `AndroidPlatform`, if initialised.
+/// Returns the current Activity's `AndroidPlatform`, if initialised.
 ///
 /// Returns `None` before `android_main` has set it up.
-pub fn platform() -> Option<&'static Arc<AndroidPlatform>> {
+pub fn platform() -> Option<Arc<AndroidPlatform>> {
     PLATFORM.get()
 }
 
@@ -438,9 +525,7 @@ pub fn platform() -> Option<&'static Arc<AndroidPlatform>> {
 ///
 /// Returns `None` before `init_platform` has been called.
 pub fn shared_platform() -> Option<SharedPlatform> {
-    PLATFORM
-        .get()
-        .map(|arc| SharedPlatform::new(Arc::clone(arc)))
+    platform().map(SharedPlatform::new)
 }
 
 // ── input event types ─────────────────────────────────────────────────────────
@@ -451,6 +536,54 @@ pub fn shared_platform() -> Option<SharedPlatform> {
 ///
 /// Returns `true` if the system is in dark mode.
 pub fn query_night_mode_via_jni() -> bool {
+    let via_system_resources = with_env(|env| {
+        let resources_class = env
+            .find_class(jni::jni_str!("android/content/res/Resources"))
+            .e()?;
+        let resources = env
+            .call_static_method(
+                &resources_class,
+                jni::jni_str!("getSystem"),
+                jni::jni_sig!("()Landroid/content/res/Resources;"),
+                &[],
+            )
+            .and_then(|value| value.l())
+            .map_err(|error| {
+                env.exception_clear();
+                error.to_string()
+            })?;
+        if resources.is_null() {
+            return Err("system Resources not available".into());
+        }
+        let configuration = env
+            .call_method(
+                &resources,
+                jni::jni_str!("getConfiguration"),
+                jni::jni_sig!("()Landroid/content/res/Configuration;"),
+                &[],
+            )
+            .and_then(|value| value.l())
+            .map_err(|error| {
+                env.exception_clear();
+                error.to_string()
+            })?;
+        if configuration.is_null() {
+            return Err("system Configuration not available".into());
+        }
+        let ui_mode = env
+            .get_field(&configuration, jni::jni_str!("uiMode"), jni::jni_sig!("I"))
+            .and_then(|value| value.i())
+            .map_err(|error| {
+                env.exception_clear();
+                error.to_string()
+            })?;
+        Ok(ui_mode & 0x30 == 0x20)
+    });
+    if let Ok(is_dark) = via_system_resources {
+        log::debug!("query_night_mode (system resources): is_dark={}", is_dark);
+        return is_dark;
+    }
+
     let app = match android_app() {
         Some(app) => app,
         None => return false,
@@ -462,6 +595,56 @@ pub fn query_night_mode_via_jni() -> bool {
 
     log::debug!("query_night_mode (ndk): is_dark={}", is_dark);
     is_dark
+}
+
+fn query_display_scale_factor_via_jni() -> Option<f32> {
+    let scale = with_env(|env| {
+        let activity = activity(env)?;
+        let resources = env
+            .call_method(
+                &activity,
+                jni::jni_str!("getResources"),
+                jni::jni_sig!("()Landroid/content/res/Resources;"),
+                &[],
+            )
+            .and_then(|value| value.l())
+            .map_err(|error| {
+                env.exception_clear();
+                error.to_string()
+            })?;
+        if resources.is_null() {
+            return Err("Activity Resources not available".into());
+        }
+        let metrics = env
+            .call_method(
+                &resources,
+                jni::jni_str!("getDisplayMetrics"),
+                jni::jni_sig!("()Landroid/util/DisplayMetrics;"),
+                &[],
+            )
+            .and_then(|value| value.l())
+            .map_err(|error| {
+                env.exception_clear();
+                error.to_string()
+            })?;
+        if metrics.is_null() {
+            return Err("Activity DisplayMetrics not available".into());
+        }
+        env.get_field(&metrics, jni::jni_str!("density"), jni::jni_sig!("F"))
+            .and_then(|value| value.f())
+            .map_err(|error| {
+                env.exception_clear();
+                error.to_string()
+            })
+    });
+    match scale {
+        Ok(scale) if scale.is_finite() && scale > 0.0 => Some(scale),
+        Ok(_) => None,
+        Err(error) => {
+            log::warn!("query_display_scale_factor failed: {error}");
+            None
+        }
+    }
 }
 
 // ── input event processing ────────────────────────────────────────────────────
@@ -517,7 +700,70 @@ fn process_input_events(app: &AndroidApp) {
                             let action = motion_event.action();
                             let pointer_count = motion_event.pointer_count();
 
-                            log::debug!(
+                            // Native editor takeover: let Android's view
+                            // hierarchy dispatch the real MotionEvent to the
+                            // EditText. Synthetic re-dispatch bypasses the
+                            // ViewRoot timing that drives native selection and
+                            // ActionMode, so avoid fabricating events here.
+                            {
+                                let claimed =
+                                    EDITOR_TOUCH_CLAIMED.load(Ordering::Acquire);
+                                let is_hand_action = matches!(
+                                    action,
+                                    MotionAction::Down
+                                        | MotionAction::Up
+                                        | MotionAction::Move
+                                        | MotionAction::Cancel
+                                        | MotionAction::PointerDown
+                                        | MotionAction::PointerUp
+                                );
+                                if is_hand_action {
+                                    let claimed_now = if action == MotionAction::Down {
+                                        let in_bounds = {
+                                            let bounds_opt =
+                                                *NATIVE_EDITOR_BOUNDS.lock();
+                                            bounds_opt
+                                                .map(|(bx, by, bw, bh)| {
+                                                    let scale =
+                                                        win.scale_factor();
+                                                    let primary = motion_event
+                                                        .pointer_at_index(0);
+                                                    let logical_x =
+                                                        primary.x() / scale;
+                                                    let logical_y =
+                                                        primary.y() / scale;
+                                                    logical_x >= bx
+                                                        && logical_x < bx + bw
+                                                        && logical_y >= by
+                                                        && logical_y < by + bh
+                                                })
+                                                .unwrap_or(false)
+                                        };
+                                        EDITOR_TOUCH_CLAIMED.store(
+                                            in_bounds,
+                                            Ordering::Release,
+                                        );
+                                        in_bounds
+                                    } else {
+                                        claimed
+                                    };
+                                    if claimed_now {
+                                        if matches!(
+                                            action,
+                                            MotionAction::Up
+                                                | MotionAction::Cancel
+                                        ) {
+                                            EDITOR_TOUCH_CLAIMED.store(
+                                                false,
+                                                Ordering::Release,
+                                            );
+                                        }
+                                        return android_activity::InputStatus::Unhandled;
+                                    }
+                                }
+                            }
+
+                            log::info!(
                                 "process_input_events: MotionEvent action={:?} pointers={}",
                                 action,
                                 pointer_count,
@@ -637,7 +883,22 @@ fn process_input_events(app: &AndroidApp) {
                             debug_assert_eq!(decode_key_action(action), Some(direction));
 
                             let key_code: u32 = key_event.key_code().into();
+                            if key_code as i32 == crate::android::AKEYCODE_BACK {
+                                if matches!(direction, KeyDirection::Press) {
+                                    crate::dispatch_back_handler();
+                                }
+                                return android_activity::InputStatus::Handled;
+                            }
                             let meta_state: u32 = key_event.meta_state().0;
+
+                            if crate::native_editor_active() {
+                                dispatch_native_editor_key_android(
+                                    action,
+                                    key_code as i32,
+                                    meta_state as i32,
+                                );
+                                return android_activity::InputStatus::Handled;
+                            }
 
                             let unicode_char = unicode_char_for_key_event(
                                 key_code as i32,
@@ -718,6 +979,34 @@ fn apply_term_window(iteration: u64) {
     }
 }
 
+/// Apply the current system-bar/cutout safe area to a freshly opened window.
+///
+/// Activity recreation (for example after a system font change) can deliver
+/// `WindowInsets` before the new GPUI window exists. That Java-side event is
+/// then dropped, and the content rect fallback below reports a zero top inset.
+/// Re-read the live insets here, after the window has been created, so the
+/// first rendered frame already starts below the status bar/cutout.
+fn update_safe_area_after_window_init(
+    app: &AndroidApp,
+    window: &crate::android::window::AndroidWindow,
+) {
+    match with_env(window_system_bar_insets) {
+        Ok((left, top, right, bottom)) => {
+            window.update_safe_area_insets(left, top, right, bottom);
+        }
+        Err(error) => {
+            log::debug!("WindowInsets unavailable after window init: {error}");
+            let content_rect = app.content_rect();
+            window.update_safe_area_from_content_rect(
+                content_rect.left,
+                content_rect.top,
+                content_rect.right,
+                content_rect.bottom,
+            );
+        }
+    }
+}
+
 /// Deferred `InitWindow` stage: bind the new surface onto the existing
 /// renderer, or open the primary window when there is none yet.
 fn apply_init_window(app: &AndroidApp, attempted_existing_window_init: &mut bool, iteration: u64) {
@@ -731,10 +1020,10 @@ fn apply_init_window(app: &AndroidApp, attempted_existing_window_init: &mut bool
 
             platform.update_primary_display(&native_window, &app.asset_manager());
 
-            let scale_factor = platform
-                .primary_display()
-                .map(|d| d.scale_factor())
+            let scale_factor = query_display_scale_factor_via_jni()
+                .or_else(|| platform.primary_display().map(|d| d.scale_factor()))
                 .unwrap_or(1.0);
+            platform.update_primary_display_scale(scale_factor);
 
             if let Some(existing) = platform.primary_window() {
                 let gpu_ctx = platform.gpu_context();
@@ -742,6 +1031,8 @@ fn apply_init_window(app: &AndroidApp, attempted_existing_window_init: &mut bool
                     Ok(()) => {
                         log::info!("InitWindow: reinitialised existing window");
                         existing.set_active(true);
+                        existing.set_appearance(current_window_appearance());
+                        existing.request_frame();
                     }
                     Err(e) => {
                         log::error!("failed to reinit window surface: {e:#}");
@@ -749,12 +1040,13 @@ fn apply_init_window(app: &AndroidApp, attempted_existing_window_init: &mut bool
                 }
 
                 // Trigger GPUI resize so layout adapts to new dimensions.
+                existing.update_scale_factor(scale_factor);
                 existing.handle_resize();
 
-                let cr = app.content_rect();
-                existing.update_safe_area_from_content_rect(cr.left, cr.top, cr.right, cr.bottom);
+                update_safe_area_after_window_init(app, &existing);
 
                 INIT_WINDOW_DONE.store(true, Ordering::Relaxed);
+                existing.request_frame();
             } else {
                 match platform.open_window(native_window, scale_factor, false) {
                     Ok(win) => {
@@ -764,11 +1056,9 @@ fn apply_init_window(app: &AndroidApp, attempted_existing_window_init: &mut bool
                             scale_factor
                         );
                         win.set_active(true);
+                        win.set_appearance(current_window_appearance());
 
-                        let cr = app.content_rect();
-                        win.update_safe_area_from_content_rect(
-                            cr.left, cr.top, cr.right, cr.bottom,
-                        );
+                        update_safe_area_after_window_init(app, &win);
                     }
                     Err(e) => {
                         log::error!("failed to open window: {e:#}");
@@ -787,6 +1077,7 @@ fn apply_window_resized(app: &AndroidApp) {
             win.handle_resize();
             let cr = app.content_rect();
             win.update_safe_area_from_content_rect(cr.left, cr.top, cr.right, cr.bottom);
+            win.request_frame();
         }
     }
 }
@@ -796,15 +1087,26 @@ fn apply_config_changed() {
     log::debug!("deferred: ConfigChanged");
     if let Some(platform) = PLATFORM.get() {
         platform.notify_keyboard_layout_change();
-        let is_dark = query_night_mode_via_jni();
-        if let Some(win) = platform.primary_window() {
-            let appearance = if is_dark {
-                crate::android::window::WindowAppearance::Dark
-            } else {
-                crate::android::window::WindowAppearance::Light
-            };
-            win.set_appearance(appearance);
+        if let Some(scale_factor) = query_display_scale_factor_via_jni() {
+            platform.update_primary_display_scale(scale_factor);
+            if let Some(win) = platform.primary_window() {
+                win.update_scale_factor(scale_factor);
+            }
         }
+        if let Some(win) = platform.primary_window() {
+            win.set_appearance(current_window_appearance());
+        }
+        if let Some(win) = platform.primary_window() {
+            win.request_frame();
+        }
+    }
+}
+
+fn current_window_appearance() -> crate::android::window::WindowAppearance {
+    if query_night_mode_via_jni() {
+        crate::android::window::WindowAppearance::Dark
+    } else {
+        crate::android::window::WindowAppearance::Light
     }
 }
 
@@ -824,10 +1126,16 @@ fn apply_pause(iteration: u64) {
 /// Deferred `Resume` stage: mark foregrounded and resume platform views.
 fn apply_resume(iteration: u64) {
     log::info!("deferred: Resume (iter={})", iteration);
+    // The surface is recreated empty on every resume (the system drops the
+    // buffers at onStop), so the cover must always fill the gap between the
+    // task snapshot dismissing and GPUI's first post-resume frame.
+    RESUME_COVER_PENDING.store(true, Ordering::Release);
+    RESUME_COVER_ACTIVE.store(true, Ordering::Release);
     if let Some(platform) = PLATFORM.get() {
         platform.did_become_active();
         if let Some(win) = platform.primary_window() {
             win.set_active(true);
+            win.request_frame();
         }
     }
     // Resume platform views
@@ -867,6 +1175,9 @@ fn maybe_run_init_callbacks(iteration: u64) {
     if let Some(finish_cb) = platform.take_finish_launching_callback() {
         log::info!("invoking finish_launching callback (iter={})", iteration);
         finish_cb();
+        if let Some(win) = platform.primary_window() {
+            win.refresh_appearance();
+        }
     }
 
     if let Some(init_cb) = platform.take_on_init_window_callback() {
@@ -903,14 +1214,31 @@ fn pump_frame_if_needed(
         return;
     };
     let main_wake = platform.take_main_thread_wake();
-    if !crate::event_stages::should_pump_frame(
-        INIT_WINDOW_DONE.load(Ordering::Relaxed),
-        app_is_active,
+    let keepalive_due = INIT_WINDOW_DONE.load(Ordering::Relaxed)
+        && app_is_active
+        && platform
+            .primary_window()
+            .and_then(|win| win.time_since_last_draw())
+            .is_some_and(|elapsed| elapsed >= FRAME_KEEPALIVE_INTERVAL);
+    let will_pump = keepalive_due
+        || crate::event_stages::should_pump_frame(
+            INIT_WINDOW_DONE.load(Ordering::Relaxed),
+            app_is_active,
+            force_frame_after_poll,
+            platform_event_woke_frame,
+            main_wake,
+            needs_frame_pump,
+        );
+    log::debug!(
+        "pump_frame_if_needed: pump={} keepalive={} force={} event_woke={} main_wake={} needs_pump={}",
+        will_pump,
+        keepalive_due,
         force_frame_after_poll,
         platform_event_woke_frame,
         main_wake,
         needs_frame_pump,
-    ) {
+    );
+    if !will_pump {
         return;
     }
     platform.flush_main_thread_tasks();
@@ -989,11 +1317,27 @@ pub fn run_event_loop(app: &AndroidApp) {
                     && platform
                         .primary_window()
                         .is_some_and(|window| window.needs_frame_pump());
+                let poll_timeout = event_loop_poll_timeout(
+                    needs_frame_pump,
+                    platform.next_delayed_task_in(Instant::now()),
+                );
+                // Wake the loop when the next keep-alive frame is due so an
+                // idle-but-visible app keeps submitting buffers (see
+                // `pump_frame_if_needed` for why).
+                let keepalive_wait = (app_is_active && INIT_WINDOW_DONE.load(Ordering::Relaxed))
+                    .then(|| {
+                        platform
+                            .primary_window()
+                            .and_then(|win| win.time_since_last_draw())
+                            .map(|elapsed| FRAME_KEEPALIVE_INTERVAL.saturating_sub(elapsed))
+                    })
+                    .flatten();
+                let poll_timeout = match (poll_timeout, keepalive_wait) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    (a, b) => a.or(b),
+                };
                 (
-                    event_loop_poll_timeout(
-                        needs_frame_pump,
-                        platform.next_delayed_task_in(Instant::now()),
-                    ),
+                    poll_timeout,
                     !INIT_WINDOW_DONE.load(Ordering::Relaxed),
                     needs_frame_pump,
                 )
@@ -1010,6 +1354,9 @@ pub fn run_event_loop(app: &AndroidApp) {
             platform_event_woke_frame |= !matches!(&event, PollEvent::Timeout);
             match event {
                 PollEvent::Main(main_event) => {
+                    if matches!(main_event, android_activity::MainEvent::InputAvailable) {
+                        log::info!("poll_events: InputAvailable");
+                    }
                     handle_main_event(app, main_event);
                 }
                 PollEvent::Wake => {}
@@ -1171,6 +1518,10 @@ fn handle_main_event(_app: &AndroidApp, event: MainEvent<'_>) {
         }
 
         MainEvent::LostFocus => {
+            if crate::native_editor_owns_window_focus() {
+                log::info!("MainEvent::LostFocus — owned by native editor");
+                return;
+            }
             log::info!("MainEvent::LostFocus");
             PAUSE_PENDING.store(true, Ordering::Relaxed);
         }
@@ -1250,7 +1601,7 @@ pub fn poll_events(timeout_ms: i32) -> bool {
         platform.tick();
     }
 
-    let app = match ANDROID_APP.get() {
+    let app = match android_app() {
         Some(app) => app,
         None => return false,
     };
@@ -1263,13 +1614,13 @@ pub fn poll_events(timeout_ms: i32) -> bool {
 
     app.poll_events(timeout, |event| match event {
         PollEvent::Main(main_event) => {
-            handle_main_event(app, main_event);
+            handle_main_event(&app, main_event);
         }
         PollEvent::Wake => {}
         _ => {}
     });
 
-    process_input_events(app);
+    process_input_events(&app);
 
     // Drive the GPUI rendering pipeline (same as run_event_loop).
     if let Some(platform) = PLATFORM.get() {
@@ -1312,25 +1663,42 @@ pub fn install_panic_hook() {
     }));
 }
 
-/// Store the `AndroidApp` globally and create the `AndroidPlatform`.
+/// Store the current Activity's `AndroidApp` and create its
+/// `AndroidPlatform`.
 ///
-/// Must be called exactly once from `android_main` before
-/// `run_event_loop`.  Returns a reference to the platform so the caller
-/// can register callbacks (e.g. `set_on_init_window`) before entering
-/// the event loop.
-pub fn init_platform(app: &AndroidApp) -> &'static Arc<AndroidPlatform> {
-    let _ = ANDROID_APP.set(app.clone());
-    log::info!("init_platform: stored AndroidApp");
+/// Must be called from `android_main` before `run_event_loop`.  A process can
+/// host multiple successive Activity instances, so this replaces values from
+/// the previous `android_main` thread instead of treating them as immutable
+/// process singletons.
+pub fn init_platform(app: &AndroidApp) -> Arc<AndroidPlatform> {
+    INIT_WINDOW_DONE.store(false, Ordering::Relaxed);
+    INIT_WINDOW_PENDING.store(false, Ordering::Relaxed);
+    TERM_WINDOW_PENDING.store(false, Ordering::Relaxed);
+    WINDOW_RESIZED_PENDING.store(false, Ordering::Relaxed);
+    CONFIG_CHANGED_PENDING.store(false, Ordering::Relaxed);
+    PAUSE_PENDING.store(false, Ordering::Relaxed);
+    RESUME_PENDING.store(false, Ordering::Relaxed);
+    EDITOR_TOUCH_CLAIMED.store(false, Ordering::Relaxed);
+    IME_ANIMATION_END_PENDING.store(false, Ordering::Relaxed);
+    NATIVE_EDITOR_IME_PREVIEW_VISIBLE.store(false, Ordering::Relaxed);
+    record_native_editor_bounds(None);
+    *PENDING_EDITOR_OP.lock() = None;
+
+    let replaced_app = ANDROID_APP.replace(app.clone());
+    log::info!(
+        "init_platform: stored AndroidApp{}",
+        if replaced_app.is_some() {
+            " (replacing previous Activity)"
+        } else {
+            ""
+        }
+    );
 
     let platform = Arc::new(AndroidPlatform::new(false));
     log::info!("init_platform: AndroidPlatform created");
 
-    PLATFORM
-        .set(Arc::clone(&platform))
-        .unwrap_or_else(|_| log::warn!("PLATFORM already set — duplicate init_platform?"));
-
-    // SAFETY: we just set it above.
-    PLATFORM.get().unwrap()
+    PLATFORM.replace(Arc::clone(&platform));
+    platform
 }
 
 // ── system chrome (status bar / navigation bar) ───────────────────────────────
@@ -1346,6 +1714,108 @@ pub fn init_platform(app: &AndroidApp) -> &'static Arc<AndroidPlatform> {
 static LAST_CHROME_STYLE: std::sync::Mutex<
     Option<(Option<u32>, Option<u32>, crate::StatusBarContentStyle)>,
 > = std::sync::Mutex::new(None);
+
+/// Read the current system-bar and display-cutout insets from `WindowInsets`.
+///
+/// `content_rect` can stay at `(0, 0, width, height)` on Android 15 when the
+/// app is rendered edge-to-edge. `WindowInsets` is the authoritative source
+/// for the area that the status/navigation bars occupy.
+fn window_system_bar_insets(env: &mut jni::Env<'_>) -> Result<(i32, i32, i32, i32), String> {
+    let activity_obj = activity(env)?;
+    let window = env
+        .call_method(
+            &activity_obj,
+            jni::jni_str!("getWindow"),
+            jni::jni_sig!("()Landroid/view/Window;"),
+            &[],
+        )
+        .and_then(|v: jni::objects::JValueOwned| v.l())
+        .map_err(|e| {
+            env.exception_clear();
+            e.to_string()
+        })?;
+    if window.is_null() {
+        return Err("getWindow returned null".into());
+    }
+
+    let decor = env
+        .call_method(
+            &window,
+            jni::jni_str!("getDecorView"),
+            jni::jni_sig!("()Landroid/view/View;"),
+            &[],
+        )
+        .and_then(|v: jni::objects::JValueOwned| v.l())
+        .map_err(|e| {
+            env.exception_clear();
+            e.to_string()
+        })?;
+    if decor.is_null() {
+        return Err("getDecorView returned null".into());
+    }
+
+    let insets = env
+        .call_method(
+            &decor,
+            jni::jni_str!("getRootWindowInsets"),
+            jni::jni_sig!("()Landroid/view/WindowInsets;"),
+            &[],
+        )
+        .and_then(|v: jni::objects::JValueOwned| v.l())
+        .map_err(|e| {
+            env.exception_clear();
+            e.to_string()
+        })?;
+    if insets.is_null() {
+        return Err("getRootWindowInsets returned null".into());
+    }
+
+    // API 30+: systemBars() | displayCutout().
+    let typed_insets = env
+        .call_method(
+            &insets,
+            jni::jni_str!("getInsets"),
+            jni::jni_sig!("(I)Landroid/graphics/Insets;"),
+            &[JValue::Int(0x00000087)],
+        )
+        .and_then(|v: jni::objects::JValueOwned| v.l());
+
+    if let Ok(typed_insets) = typed_insets {
+        if !typed_insets.is_null() {
+            let read = |env: &mut jni::Env<'_>, name| {
+                env.get_field(&typed_insets, name, jni::jni_sig!("I"))
+                    .and_then(|v| v.i())
+                    .map_err(|e| {
+                        env.exception_clear();
+                        e.to_string()
+                    })
+            };
+            let left = read(env, jni::jni_str!("left"))?;
+            let top = read(env, jni::jni_str!("top"))?;
+            let right = read(env, jni::jni_str!("right"))?;
+            let bottom = read(env, jni::jni_str!("bottom"))?;
+            return Ok((left, top, right, bottom));
+        }
+    } else {
+        env.exception_clear();
+    }
+
+    // API 26–29 fallback.
+    let read = |env: &mut jni::Env<'_>, name| {
+        env.call_method(&insets, name, jni::jni_sig!("()I"), &[])
+            .and_then(|v| v.i())
+            .map_err(|e| {
+                env.exception_clear();
+                e.to_string()
+            })
+    };
+    Ok((
+        read(env, jni::jni_str!("getSystemWindowInsetLeft"))?,
+        read(env, jni::jni_str!("getSystemWindowInsetTop"))?,
+        read(env, jni::jni_str!("getSystemWindowInsetRight"))?,
+        read(env, jni::jni_str!("getSystemWindowInsetBottom"))?,
+    ))
+}
 
 /// Apply system chrome styling on Android.
 ///
@@ -1475,6 +1945,14 @@ pub fn set_system_chrome(style: &crate::SystemChromeStyle) {
             }
         }
 
+        if let Ok((left, top, right, bottom)) = window_system_bar_insets(env) {
+            if let Some(platform) = PLATFORM.get() {
+                if let Some(window) = platform.primary_window() {
+                    window.update_safe_area_insets(left, top, right, bottom);
+                }
+            }
+        }
+
         Ok(())
     });
 
@@ -1539,6 +2017,621 @@ pub fn hide_keyboard_android() {
     }
 }
 
+/// End the native editor's focus/IME session while keeping it mounted as the
+/// visible renderer, so taps over the input fall through to GPUI again.
+pub fn blur_native_editor_android() {
+    let result = with_env(|env| {
+        let activity = activity(env)?;
+        env.call_method(
+            &activity,
+            jni::jni_str!("gpuiBlurNativeEditor"),
+            jni::jni_sig!("()V"),
+            &[],
+        )
+        .e()?;
+        Ok(())
+    });
+    if let Err(error) = result {
+        log::warn!("gpuiBlurNativeEditor failed: {error}");
+    }
+}
+
+/// Apply an external controlled-value change to the persistent EditText.
+pub fn clear_native_editor_text_android() {
+    let result = with_env(|env| {
+        let activity = activity(env)?;
+        env.call_method(
+            &activity,
+            jni::jni_str!("gpuiClearNativeEditorText"),
+            jni::jni_sig!("()V"),
+            &[],
+        )
+        .e()?;
+        Ok(())
+    });
+    if let Err(error) = result {
+        log::warn!("gpuiClearNativeEditorText failed: {error}");
+    }
+}
+
+/// Reset the persistent EditText and its frame-batched mirror to a saved value.
+pub fn reset_native_editor_text_android(text: &str, session: u64) {
+    let text = text.to_owned();
+    let result = with_env(|env| {
+        let activity = activity(env)?;
+        let value = env.new_string(text.as_str()).e()?;
+        env.call_method(
+            &activity,
+            jni::jni_str!("gpuiResetNativeEditorText"),
+            jni::jni_sig!("(Ljava/lang/String;J)V"),
+            &[JValue::Object(&value), JValue::Long(session as i64)],
+        )
+        .e()?;
+        Ok(())
+    });
+    if let Err(error) = result {
+        log::warn!("gpuiResetNativeEditorText failed: {error}");
+    }
+}
+
+/// Keep the Java editor's queued mirror callbacks on the current session.
+pub fn set_native_editor_session_android(session: u64) {
+    let result = with_env(|env| {
+        let activity = activity(env)?;
+        env.call_method(
+            &activity,
+            jni::jni_str!("gpuiSetNativeEditorSession"),
+            jni::jni_sig!("(J)V"),
+            &[JValue::Long(session as i64)],
+        )
+        .e()?;
+        Ok(())
+    });
+    if let Err(error) = result {
+        log::warn!("gpuiSetNativeEditorSession failed: {error}");
+    }
+}
+
+/// Show (or refresh) the real native editor takeover over the focused input.
+/// The host activity positions a genuine `EditText` on the input's bounds;
+/// the system owns the keyboard, caret, selection handles, and edit menu.
+pub fn show_native_editor_android(params: crate::NativeEditorParams) {
+    // Parked during paint; applied after this frame's draw submits.
+    *PENDING_EDITOR_OP.lock() = Some(PendingEditorOp::Show(params));
+}
+
+/// Apply an editor show immediately. Called from the post-draw flush.
+fn show_native_editor_direct(params: crate::NativeEditorParams) {
+    let result = with_env(|env| {
+        let activity = activity(env)?;
+        let crate::NativeEditorParams {
+            text,
+            selection_utf16: (sel_start_utf16, sel_end_utf16),
+            bounds: (bounds_x, bounds_y, bounds_w, bounds_h),
+            clip_bounds,
+            text_origin: (text_origin_x, text_origin_y),
+            font_size,
+            multiline,
+            wrap_width,
+            line_height,
+            line_ranges_utf16,
+            initial,
+            force_text_sync,
+            text_color,
+            background_color,
+            border_color,
+            focus_border_color,
+            border_width,
+            placeholder,
+            placeholder_color,
+            corner_radius,
+        } = params;
+        let jtext = env.new_string(&text).map_err(|error| error.to_string())?;
+        let jplaceholder = env
+            .new_string(placeholder.as_deref().unwrap_or(""))
+            .map_err(|error| error.to_string())?;
+        let line_ranges = line_ranges_utf16
+            .iter()
+            .map(|(start, end)| format!("{start}:{end}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let jline_ranges = env
+            .new_string(&line_ranges)
+            .map_err(|error| error.to_string())?;
+        let (clip_x, clip_y, clip_width, clip_height) =
+            clip_bounds.map_or((0.0, 0.0, 0.0, 0.0), |bounds| bounds);
+        env.call_method(
+            &activity,
+            jni::jni_str!("gpuiShowNativeEditor"),
+            jni::jni_sig!(
+                "(Ljava/lang/String;IIFFFFFFFFFIIIIFLjava/lang/String;ILjava/lang/String;FFFFFZZZZ)V"
+            ),
+            &[
+                JValue::Object(&jtext),
+                JValue::Int(sel_start_utf16 as i32),
+                JValue::Int(sel_end_utf16 as i32),
+                JValue::Float(bounds_x),
+                JValue::Float(bounds_y),
+                JValue::Float(bounds_w),
+                JValue::Float(bounds_h),
+                JValue::Float(text_origin_x),
+                JValue::Float(text_origin_y),
+                JValue::Float(font_size),
+                JValue::Float(wrap_width),
+                JValue::Float(line_height),
+                JValue::Int(text_color as i32),
+                JValue::Int(background_color as i32),
+                JValue::Int(border_color as i32),
+                JValue::Int(focus_border_color as i32),
+                JValue::Float(border_width),
+                JValue::Object(&jplaceholder),
+                JValue::Int(placeholder_color as i32),
+                JValue::Object(&jline_ranges),
+                JValue::Float(corner_radius),
+                JValue::Float(clip_x),
+                JValue::Float(clip_y),
+                JValue::Float(clip_width),
+                JValue::Float(clip_height),
+                JValue::Bool(clip_bounds.is_some()),
+                JValue::Bool(multiline),
+                JValue::Bool(initial),
+                JValue::Bool(force_text_sync),
+            ],
+        )
+        .e()?;
+        Ok(())
+    });
+    if let Err(error) = result {
+        log::warn!("gpuiShowNativeEditor failed: {error}");
+    }
+}
+
+/// Apply the editor operation parked during paint. Called right after each
+/// frame's draw so the editor window never runs ahead of the submitted frame.
+pub fn flush_pending_editor_op() {
+    let pending = PENDING_EDITOR_OP.lock().take();
+    match pending {
+        Some(PendingEditorOp::Show(params)) => show_native_editor_direct(params),
+        Some(PendingEditorOp::Hide) => hide_native_editor_direct(),
+        None => {}
+    }
+}
+
+/// Hide the native editor and restore the IME shadow view focus.
+pub fn hide_native_editor_android() {
+    // Parked during paint; applied after this frame's draw submits.
+    *PENDING_EDITOR_OP.lock() = Some(PendingEditorOp::Hide);
+}
+
+/// Remove the editor window before the frame that removes its owning dialog.
+/// Closing a dialog starts during input dispatch; waiting for the post-draw
+/// flush leaves the editor floating above the settings page for one frame.
+pub fn hide_native_editor_now() {
+    PENDING_EDITOR_OP.lock().take();
+    hide_native_editor_direct();
+}
+
+/// Translate the attached editor window by a logical y delta.
+///
+/// Dialog movement is detected while building the new GPUI frame. Applying
+/// the translation immediately lets the platform window land on that frame;
+/// parking it until after `draw` made the native editor trail the moving
+/// dialog by one frame. The Cookie dialog additionally moves from Android's
+/// IME inset callback via [`set_native_editor_ime_follow_android`].
+pub fn translate_native_editor_android(delta_y: f32) {
+    if delta_y != 0.0 {
+        translate_native_editor_direct(delta_y);
+    }
+}
+
+/// Move the Cookie editor from Android's IME inset callback instead of from
+/// GPUI's render pass. The inset callback runs earlier in the same vsync, so
+/// the separate editor window keeps up with the dialog's reflow.
+pub fn set_native_editor_ime_follow_android(follow: bool) {
+    let result = with_env(|env| {
+        let activity = activity(env)?;
+        env.call_method(
+            &activity,
+            jni::jni_str!("gpuiSetNativeEditorImeFollow"),
+            jni::jni_sig!("(Z)V"),
+            &[JValue::Bool(follow)],
+        )
+        .e()?;
+        Ok(())
+    });
+    if let Err(error) = result {
+        log::warn!("gpuiSetNativeEditorImeFollow failed: {error}");
+    }
+}
+
+/// Enable the Android-only Cookie handoff where GPUI owns the visual field
+/// during IME animations and Java reveals the real editor after the final
+/// submitted frame.
+pub fn set_native_editor_ime_preview_android(preview: bool) {
+    let result = with_env(|env| {
+        let activity = activity(env)?;
+        env.call_method(
+            &activity,
+            jni::jni_str!("gpuiSetNativeEditorImePreview"),
+            jni::jni_sig!("(Z)V"),
+            &[JValue::Bool(preview)],
+        )
+        .e()?;
+        Ok(())
+    });
+    if let Err(error) = result {
+        log::warn!("gpuiSetNativeEditorImePreview failed: {error}");
+    }
+}
+
+pub fn take_native_editor_ime_animation_end() -> bool {
+    IME_ANIMATION_END_PENDING.swap(false, Ordering::AcqRel)
+}
+
+pub fn native_editor_ime_preview_visible() -> bool {
+    NATIVE_EDITOR_IME_PREVIEW_VISIBLE.load(Ordering::Acquire)
+}
+
+pub fn set_native_editor_ime_preview_visible(visible: bool) {
+    NATIVE_EDITOR_IME_PREVIEW_VISIBLE.store(visible, Ordering::Release);
+    wake_ime_frame();
+}
+
+pub fn show_native_editor_after_ime_animation() {
+    let result = with_env(|env| {
+        let activity = activity(env)?;
+        env.call_method(
+            &activity,
+            jni::jni_str!("gpuiShowNativeEditorAfterImeAnimation"),
+            jni::jni_sig!("()V"),
+            &[],
+        )
+        .e()?;
+        Ok(())
+    });
+    if let Err(error) = result {
+        log::warn!("gpuiShowNativeEditorAfterImeAnimation failed: {error}");
+    }
+}
+
+/// Keep the editor window attached but transparent while a dialog warms up
+/// its GPUI surface. The next call exposes the already-laid-out window.
+pub fn set_native_editor_warmup_android(warmup: bool) {
+    let result = with_env(|env| {
+        let activity = activity(env)?;
+        env.call_method(
+            &activity,
+            jni::jni_str!("gpuiSetNativeEditorWarmup"),
+            jni::jni_sig!("(Z)V"),
+            &[JValue::Bool(warmup)],
+        )
+        .e()?;
+        Ok(())
+    });
+    if let Err(error) = result {
+        log::warn!("gpuiSetNativeEditorWarmup failed: {error}");
+    }
+}
+
+fn translate_native_editor_direct(delta_y: f32) {
+    let result = with_env(|env| {
+        let activity = activity(env)?;
+        env.call_method(
+            &activity,
+            jni::jni_str!("gpuiTranslateNativeEditor"),
+            jni::jni_sig!("(F)V"),
+            &[JValue::Float(delta_y)],
+        )
+        .e()?;
+        Ok(())
+    });
+    if let Err(error) = result {
+        log::warn!("gpuiTranslateNativeEditor failed: {error}");
+    }
+}
+
+/// Dismiss the Java resume cover after the first post-resume frame submits.
+pub fn hide_resume_cover_android() {
+    let result = with_env(|env| {
+        let activity = activity(env)?;
+        env.call_method(
+            &activity,
+            jni::jni_str!("gpuiHideResumeCover"),
+            jni::jni_sig!("()V"),
+            &[],
+        )
+        .e()?;
+        Ok(())
+    });
+    if let Err(error) = result {
+        log::warn!("gpuiHideResumeCover failed: {error}");
+    }
+}
+
+/// Apply an editor hide immediately. Called from the post-draw flush.
+fn hide_native_editor_direct() {
+    let result = with_env(|env| {
+        let activity = activity(env)?;
+        env.call_method(
+            &activity,
+            jni::jni_str!("gpuiHideNativeEditor"),
+            jni::jni_sig!("()V"),
+            &[],
+        )
+        .e()?;
+        Ok(())
+    });
+    if let Err(error) = result {
+        log::warn!("gpuiHideNativeEditor failed: {error}");
+    }
+}
+
+/// Read the live native editor text for a synchronous focus/commit path.
+pub fn native_editor_text_android() -> Option<String> {
+    with_env(|env| {
+        if env.exception_check() {
+            env.exception_clear();
+        }
+        let activity = activity(env)?;
+        let _ = env.call_method(
+            &activity,
+            jni::jni_str!("gpuiFlushNativeEditorText"),
+            jni::jni_sig!("()V"),
+            &[],
+        );
+        if env.exception_check() {
+            env.exception_clear();
+        }
+        let value = env
+            .call_method(
+                &activity,
+                jni::jni_str!("gpuiGetNativeEditorText"),
+                jni::jni_sig!("()Ljava/lang/String;"),
+                &[],
+            )
+            .and_then(|value| value.l())
+            .map_err(|error| {
+                env.exception_clear();
+                error.to_string()
+            })?;
+        if value.is_null() {
+            Ok(None)
+        } else {
+            Ok(Some(get_string(env, &value)))
+        }
+    })
+    .ok()
+    .flatten()
+    .map(|value| {
+        crate::discard_pending_mirror_events();
+        value
+    })
+}
+
+/// Current display rotation as `Surface.ROTATION_*` (0/1/2/3).
+pub fn display_rotation_android() -> Option<i32> {
+    with_env(|env| {
+        if env.exception_check() {
+            env.exception_clear();
+        }
+        let activity = activity(env)?;
+        env.call_method(
+            &activity,
+            jni::jni_str!("gpuiDisplayRotation"),
+            jni::jni_sig!("()I"),
+            &[],
+        )
+        .and_then(|value| value.i())
+        .map_err(|error| {
+            env.exception_clear();
+            error.to_string()
+        })
+    })
+    .ok()
+}
+
+/// Deliver a key event to the system `EditText` that currently owns input.
+pub fn dispatch_native_editor_key_android(action: i32, key_code: i32, meta_state: i32) {
+    let result = with_env(|env| {
+        let activity = activity(env)?;
+        env.call_method(
+            &activity,
+            jni::jni_str!("gpuiDispatchNativeEditorKey"),
+            jni::jni_sig!("(III)V"),
+            &[
+                JValue::Int(action),
+                JValue::Int(key_code),
+                JValue::Int(meta_state),
+            ],
+        )
+        .e()?;
+        Ok(())
+    });
+    if let Err(error) = result {
+        log::warn!("gpuiDispatchNativeEditorKey failed: {error}");
+    }
+}
+
+/// The mirror editor's text changed: sync into the focused GPUI input.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Java_dev_gpui_mobile_GpuiActivity_nativeMirrorTextChanged(
+    _env: *mut std::ffi::c_void,
+    _class: *mut std::ffi::c_void,
+    text: *mut std::ffi::c_void,
+    sel_start: i32,
+    sel_end: i32,
+    session: i64,
+) {
+    let current = crate::native_editor_session();
+    if (session as u64) < current {
+        return;
+    }
+    if (session as u64) > current {
+        crate::set_native_editor_session(session as u64);
+    }
+    let sel_start = sel_start.max(0) as usize;
+    let sel_end = sel_end.max(0) as usize;
+    enqueue_string_ime_event(text, move |text| crate::ImeEvent::MirrorText {
+        text,
+        sel_start_utf16: sel_start,
+        sel_end_utf16: sel_end,
+    });
+}
+
+/// The mirror editor's selection changed (handle drag): sync selection.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Java_dev_gpui_mobile_GpuiActivity_nativeMirrorSelectionChanged(
+    _env: *mut std::ffi::c_void,
+    _class: *mut std::ffi::c_void,
+    sel_start: i32,
+    sel_end: i32,
+) {
+    crate::enqueue_ime_event(crate::ImeEvent::MirrorSelection {
+        start_utf16: sel_start.max(0) as usize,
+        end_utf16: sel_end.max(0) as usize,
+    });
+    wake_ime_frame();
+}
+
+/// The mirror editor scrolled: drive the GPUI input viewport with the same
+/// offset so visible text and the system caret/selection stay together.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Java_dev_gpui_mobile_GpuiActivity_nativeMirrorScrollChanged(
+    _env: *mut std::ffi::c_void,
+    _class: *mut std::ffi::c_void,
+    scroll_top: f32,
+) {
+    crate::enqueue_ime_event(crate::ImeEvent::MirrorScroll {
+        scroll_top: scroll_top.max(0.0),
+    });
+    wake_ime_frame();
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Java_dev_gpui_mobile_GpuiActivity_nativeOnNativeEditorHidden(
+    _env: *mut std::ffi::c_void,
+    _class: *mut std::ffi::c_void,
+) {
+    crate::NATIVE_EDITOR_ACTIVE.store(false, Ordering::Release);
+    record_native_editor_bounds(None);
+    EDITOR_TOUCH_CLAIMED.store(false, Ordering::Release);
+    crate::set_native_editor_line_ranges(None);
+    crate::enqueue_ime_event(crate::ImeEvent::NativeEditorHidden);
+    wake_ime_frame();
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Java_dev_gpui_mobile_GpuiActivity_nativeOnNativeEditorFocusChanged(
+    _env: *mut std::ffi::c_void,
+    _class: *mut std::ffi::c_void,
+    focused: jni::sys::jboolean,
+) {
+    if !focused {
+        // The synchronous snapshot read on outside MouseDown handles the
+        // latest editor contents. Drop any frame-batched echoes before the
+        // focus-loss event can leave them queued for the next focused input.
+        crate::discard_pending_mirror_events();
+    }
+    crate::enqueue_ime_event(crate::ImeEvent::NativeEditorFocusChanged(focused));
+    wake_ime_frame();
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Java_dev_gpui_mobile_GpuiActivity_nativeOnNativeEditorImeAnimationEnd(
+    _env: *mut std::ffi::c_void,
+    _class: *mut std::ffi::c_void,
+) {
+    IME_ANIMATION_END_PENDING.store(true, Ordering::Release);
+    wake_ime_frame();
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Java_dev_gpui_mobile_GpuiActivity_nativeOnNativeEditorImePreviewVisible(
+    _env: *mut std::ffi::c_void,
+    _class: *mut std::ffi::c_void,
+    visible: jni::sys::jboolean,
+) {
+    set_native_editor_ime_preview_visible(visible);
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Java_dev_gpui_mobile_GpuiActivity_nativeOnNativeEditorWindowFocusChanged(
+    _env: *mut std::ffi::c_void,
+    _class: *mut std::ffi::c_void,
+    owns_focus: jni::sys::jboolean,
+) {
+    crate::set_native_editor_owns_window_focus(owns_focus);
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Java_dev_gpui_mobile_GpuiActivity_nativeMirrorLineRangesChanged(
+    _env: *mut std::ffi::c_void,
+    _class: *mut std::ffi::c_void,
+    text: *mut std::ffi::c_void,
+    ranges: *mut std::ffi::c_void,
+) {
+    let text_raw = text as jni::sys::jobject;
+    let ranges_raw = ranges as jni::sys::jobject;
+    let _ = with_env(|env| {
+        let text = unsafe { JObject::from_raw(env, text_raw) };
+        let ranges = unsafe { JObject::from_raw(env, ranges_raw) };
+        let text = get_string(env, &text);
+        let ranges = get_string(env, &ranges);
+        let ranges_utf16 = ranges
+            .split(',')
+            .filter_map(|range| {
+                let (start, end) = range.split_once(':')?;
+                Some((start.parse().ok()?, end.parse().ok()?))
+            })
+            .collect();
+        crate::set_native_editor_line_ranges(Some(crate::NativeEditorLineRanges {
+            text,
+            ranges_utf16,
+        }));
+        wake_ime_frame();
+        Ok(())
+    });
+}
+
+/// Queue a copy-selection action from the system text menu. Drained on the
+/// next frame together with the IME events.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Java_dev_gpui_mobile_GpuiActivity_nativeCopySelection(
+    _env: *mut std::ffi::c_void,
+    _class: *mut std::ffi::c_void,
+) {
+    crate::enqueue_ime_event(crate::ImeEvent::CopySelection);
+}
+
+/// Queue a cut-selection action from the system text menu. Drained on the
+/// next frame together with the IME events.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Java_dev_gpui_mobile_GpuiActivity_nativeCutSelection(
+    _env: *mut std::ffi::c_void,
+    _class: *mut std::ffi::c_void,
+) {
+    crate::enqueue_ime_event(crate::ImeEvent::CutSelection);
+}
+
+/// Store `text` in the Android system clipboard (text menu copy action).
+pub fn set_clipboard_text_android(text: &str) {
+    let result = with_env(|env| {
+        let activity = activity(env)?;
+        let jtext = env.new_string(text).map_err(|error| error.to_string())?;
+        env.call_method(
+            &activity,
+            jni::jni_str!("gpuiSetClipboardText"),
+            jni::jni_sig!("(Ljava/lang/String;)V"),
+            &[JValue::Object(&jtext)],
+        )
+        .e()?;
+        Ok(())
+    });
+    if let Err(error) = result {
+        log::warn!("gpuiSetClipboardText failed: {error}");
+    }
+}
+
 pub fn notify_accessibility_changed() {
     let result = with_env(|env| {
         let activity = activity(env)?;
@@ -1599,6 +2692,107 @@ pub unsafe extern "C" fn Java_dev_gpui_mobile_GpuiActivity_nativeIsInitialized(
     }
 }
 
+/// Called from `GpuiActivity` to query whether the first GPUI frame has been
+/// submitted to the NativeActivity surface.
+///
+/// # Safety
+/// Must only be called from the JVM on a valid JNI thread.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Java_dev_gpui_mobile_GpuiActivity_nativeIsFirstFramePresented(
+    _env: *mut std::ffi::c_void,
+    _class: *mut std::ffi::c_void,
+) -> u8 {
+    if NATIVE_FIRST_FRAME_PRESENTED.load(Ordering::Acquire) {
+        1 // JNI_TRUE
+    } else {
+        0 // JNI_FALSE
+    }
+}
+
+/// Reset the first-frame latch when a new Activity instance installs its
+/// launch cover.
+///
+/// # Safety
+/// Must only be called from the JVM on a valid JNI thread.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Java_dev_gpui_mobile_GpuiActivity_nativeResetFirstFramePresented(
+    _env: *mut std::ffi::c_void,
+    _class: *mut std::ffi::c_void,
+) {
+    NATIVE_FIRST_FRAME_PRESENTED.store(false, Ordering::Release);
+}
+
+/// Called from `GpuiActivity` when the system back key / gesture fires.
+///
+/// The Java input overlay owns focus, so back keys do not reliably reach the
+/// native input queue. Forwarding them here keeps the in-app page-back
+/// animation working on every navigation mode.
+///
+/// # Safety
+/// Must only be called from the JVM on a valid JNI thread.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Java_dev_gpui_mobile_GpuiActivity_nativeOnBackPressed(
+    _env: *mut std::ffi::c_void,
+    _class: *mut std::ffi::c_void,
+) {
+    let Some(platform) = PLATFORM.get() else {
+        return;
+    };
+    platform
+        .foreground_executor()
+        .dispatch_on_main_thread(move || {
+            crate::dispatch_back_handler();
+        });
+}
+
+/// Called from `GpuiActivity` when the resume cover starts fading out (after
+/// the render-complete hold). Flushes the editor op parked during the covered
+/// frames so the native input appears together with the revealed UI.
+///
+/// # Safety
+/// Must only be called from the JVM on a valid JNI thread.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Java_dev_gpui_mobile_GpuiActivity_nativeOnResumeCoverFadeStart(
+    _env: *mut std::ffi::c_void,
+    _class: *mut std::ffi::c_void,
+) {
+    RESUME_COVER_ACTIVE.store(false, Ordering::Release);
+    flush_pending_editor_op();
+}
+
+/// Called from `GpuiActivity` when Android reports updated `WindowInsets`.
+///
+/// # Safety
+/// Must only be called from the JVM on a valid JNI thread.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Java_dev_gpui_mobile_GpuiActivity_nativeOnInsetsChanged(
+    _env: *mut std::ffi::c_void,
+    _class: *mut std::ffi::c_void,
+    left: i32,
+    top: i32,
+    right: i32,
+    bottom: i32,
+    ime_left: i32,
+    ime_top: i32,
+    ime_right: i32,
+    ime_bottom: i32,
+) {
+    let Some(platform) = PLATFORM.get() else {
+        return;
+    };
+    platform
+        .foreground_executor()
+        .dispatch_on_main_thread(move || {
+            let Some(window) = platform.primary_window() else {
+                return;
+            };
+            window.update_safe_area_insets(left, top, right, bottom);
+            window.update_ime_insets(ime_left, ime_top, ime_right, ime_bottom);
+            window.notify_insets_changed();
+            window.request_frame();
+        });
+}
+
 /// JNI bridge: receive a deeplink URL from `GpuiActivity.onNewIntent()`.
 ///
 /// When the app is already running and a deeplink is opened (e.g. via
@@ -1644,12 +2838,23 @@ fn enqueue_string_ime_event(
         Ok(())
     })
     .is_ok();
-    if queued && let Some(platform) = PLATFORM.get() {
-        // IME callbacks can arrive while the native loop is idle. Wake its
-        // registered looper pipe so the next frame drains the queued event.
+    if queued {
+        wake_ime_frame();
+    }
+}
+
+/// IME callbacks arrive from the Android UI thread, often while GPUI is idle.
+/// Waking the dispatcher is not sufficient by itself: the queued IME event is
+/// drained from the window frame callback, so request an actual frame.
+pub(crate) fn wake_ime_frame() {
+    if let Some(platform) = PLATFORM.get() {
         platform
             .foreground_executor()
-            .dispatch_on_main_thread(|| {});
+            .dispatch_on_main_thread(move || {
+                if let Some(window) = platform.primary_window() {
+                    window.request_frame();
+                }
+            });
     }
 }
 

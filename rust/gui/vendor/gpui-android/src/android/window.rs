@@ -37,13 +37,13 @@ use futures::channel::oneshot;
 use gpui::{
     self, AtlasKey, AtlasTile, Capslock, DispatchEventResult, GpuSpecs, Modifiers, PlatformAtlas,
     PlatformDisplay, PlatformInputHandler, PlatformWindow, PromptButton, PromptLevel,
-    RequestFrameOptions, WindowBackgroundAppearance, WindowBounds, WindowControlArea,
+    RequestFrameOptions, WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowInsets,
     WindowVisibility,
 };
 use gpui_foreign_parent::sync::SyncResizeDebounce;
-use gpui_wgpu::{GpuContext, WgpuRenderer, WgpuSurfaceConfig, wgpu};
+use gpui_wgpu::{GpuContext, WgpuContext, WgpuRenderer, WgpuSurfaceConfig, wgpu};
 use jni::objects::{Global, JObject};
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use raw_window_handle::{
     AndroidDisplayHandle, AndroidNdkWindowHandle, HasDisplayHandle, HasWindowHandle,
     RawDisplayHandle, RawWindowHandle,
@@ -55,8 +55,73 @@ use std::ptr::NonNull;
 use std::rc::Rc;
 use std::sync::{
     Arc, OnceLock,
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
+use std::time::{Duration, Instant};
+
+/// A stable atlas handle for GPUI windows whose GPU surface is recreated.
+///
+/// GPUI caches the atlas returned by `PlatformWindow::sprite_atlas` for the
+/// lifetime of a logical window. On Android, `init_window` recreates the
+/// renderer (and therefore its atlas) whenever the system destroys and returns
+/// the native surface. Routing atlas access through this proxy keeps the
+/// GPUI-visible handle stable while its backing implementation follows the
+/// active renderer.
+struct SharedAtlas {
+    atlas: RwLock<Option<Arc<dyn PlatformAtlas>>>,
+    backing_atlas: RwLock<Option<Arc<gpui_wgpu::WgpuAtlas>>>,
+}
+
+impl SharedAtlas {
+    fn new(atlas: Arc<dyn PlatformAtlas>, backing_atlas: Arc<gpui_wgpu::WgpuAtlas>) -> Arc<Self> {
+        Arc::new(Self {
+            atlas: RwLock::new(Some(atlas)),
+            backing_atlas: RwLock::new(Some(backing_atlas)),
+        })
+    }
+
+    fn empty() -> Arc<Self> {
+        Arc::new(Self {
+            atlas: RwLock::new(None),
+            backing_atlas: RwLock::new(None),
+        })
+    }
+
+    fn set_atlas(&self, atlas: Arc<dyn PlatformAtlas>) {
+        *self.atlas.write() = Some(atlas);
+    }
+
+    fn backing_atlas(&self) -> Option<Arc<gpui_wgpu::WgpuAtlas>> {
+        self.backing_atlas.read().clone()
+    }
+
+    fn set_backing_atlas(&self, atlas: Arc<gpui_wgpu::WgpuAtlas>) {
+        *self.backing_atlas.write() = Some(atlas);
+    }
+}
+
+impl PlatformAtlas for SharedAtlas {
+    fn get_or_insert_with<'a>(
+        &self,
+        key: AtlasKey,
+        build: &mut dyn FnMut() -> anyhow::Result<
+            Option<(gpui::Size<gpui::DevicePixels>, std::borrow::Cow<'a, [u8]>)>,
+        >,
+    ) -> anyhow::Result<Option<AtlasTile>> {
+        let atlas = self.atlas.read().clone();
+        match atlas {
+            Some(atlas) => atlas.get_or_insert_with(key, build),
+            None => Ok(None),
+        }
+    }
+
+    fn remove(&self, key: &AtlasKey) {
+        let atlas = self.atlas.read().clone();
+        if let Some(atlas) = atlas {
+            atlas.remove(key);
+        }
+    }
+}
 
 use super::{AndroidKeyEvent, Bounds, DevicePixels, Pixels, Point, Size, TouchPoint};
 use crate::lifecycle::{active_state_changed, restore_taken_value};
@@ -196,11 +261,10 @@ fn load_set_frame_rate_with_change_strategy() -> Option<SetFrameRateWithChangeSt
 /// The NDK entry points are resolved with `dlsym` so this library still loads
 /// on pre-API-30/31 devices where the symbols do not exist.
 fn request_high_frame_rate(window: &NativeWindow) {
-    let api_level = unsafe { ndk_sys::android_get_device_api_level() };
     let native_window = window.ptr().as_ptr();
 
-    let status = if api_level >= 31 {
-        load_set_frame_rate_with_change_strategy().map(|set_frame_rate| unsafe {
+    let status = load_set_frame_rate_with_change_strategy()
+        .map(|set_frame_rate| unsafe {
             set_frame_rate(
                 native_window,
                 HIGH_FRAME_RATE,
@@ -208,22 +272,20 @@ fn request_high_frame_rate(window: &NativeWindow) {
                 ONLY_IF_SEAMLESS,
             )
         })
-    } else if api_level >= 30 {
-        load_set_frame_rate().map(|set_frame_rate| unsafe {
-            set_frame_rate(
-                native_window,
-                HIGH_FRAME_RATE,
-                DEFAULT_FRAME_RATE_COMPATIBILITY,
-            )
-        })
-    } else {
-        None
-    };
+        .or_else(|| {
+            load_set_frame_rate().map(|set_frame_rate| unsafe {
+                set_frame_rate(
+                    native_window,
+                    HIGH_FRAME_RATE,
+                    DEFAULT_FRAME_RATE_COMPATIBILITY,
+                )
+            })
+        });
 
     match status {
         Some(0) => log::info!("Requested 120 Hz frame rate"),
         Some(status) => log::warn!("ANativeWindow_setFrameRate* failed with status {status}"),
-        None => log::debug!("Skipping high frame rate request on API {api_level}"),
+        None => log::debug!("High frame rate APIs are unavailable on this device"),
     }
 }
 
@@ -269,6 +331,8 @@ impl Default for AndroidTouchGesture {
 struct AndroidTouchState {
     active: [Option<AndroidActiveTouch>; ANDROID_MAX_TOUCHES],
     gesture: AndroidTouchGesture,
+    /// Contact whose `TouchEvent::Started` was forwarded to GPUI.
+    touch_id: Option<i32>,
 }
 
 impl AndroidTouchState {
@@ -358,6 +422,10 @@ impl AndroidTouchState {
 
 /// Called when the window's active status changes (foreground/background).
 pub type ActiveStatusCallback = Box<dyn FnMut(bool) + Send + 'static>;
+struct MainThreadInsetsCallback(Box<dyn FnMut(WindowInsets)>);
+// SAFETY: Android invokes insets callbacks only on the GPUI main thread. The
+// callback is stored behind WindowState's mutex, matching MainThreadInputHandler.
+unsafe impl Send for MainThreadInsetsCallback {}
 
 /// Called when a key event arrives.
 pub type KeyCallback = Box<dyn FnMut(AndroidKeyEvent) + Send + 'static>;
@@ -438,6 +506,12 @@ struct WindowState {
     /// `WindowResized`.  The top inset accounts for the status bar / notch,
     /// and the bottom inset accounts for the navigation bar / gesture area.
     safe_area_insets: SafeAreaInsets,
+    /// Keyboard insets in physical (device) pixels.
+    ime_insets: SafeAreaInsets,
+    /// Once Android has delivered real `WindowInsets`, ignore the legacy
+    /// content-rect estimate. On edge-to-edge devices the content rect can be
+    /// the full display even while the status bar still occupies real space.
+    window_insets_authoritative: bool,
 
     /// Last IME anchor sent to Java. Avoid repeated JNI work for unchanged carets.
     last_ime_bounds: Option<(f32, f32, f32)>,
@@ -451,6 +525,9 @@ struct WindowState {
     /// Whether the window background should be transparent.
     transparent: bool,
 
+    /// Time of the last frame actually presented to the surface.
+    last_draw: Option<Instant>,
+
     // ── callbacks ─────────────────────────────────────────────────────────
     request_frame_callback: Option<RequestFrameCallback>,
     touch_callback: Option<TouchCallback>,
@@ -459,6 +536,7 @@ struct WindowState {
     close_callback: Option<CloseCallback>,
     appearance_callback: Option<AppearanceCallback>,
     active_status_callback: Option<ActiveStatusCallback>,
+    insets_callback: Option<MainThreadInsetsCallback>,
 }
 
 /// Returns a renderer removed for an unlocked draw to its window state even
@@ -466,6 +544,7 @@ struct WindowState {
 struct RendererRestore<'a> {
     state: &'a Arc<Mutex<WindowState>>,
     renderer: Option<WgpuRenderer>,
+    drawn_at: Option<Instant>,
 }
 
 impl Drop for RendererRestore<'_> {
@@ -477,6 +556,7 @@ impl Drop for RendererRestore<'_> {
         if state.renderer.is_none() {
             restore_taken_value(&mut state.renderer, renderer);
         }
+        state.last_draw = self.drawn_at;
     }
 }
 
@@ -495,6 +575,7 @@ unsafe impl Send for WindowState {}
 /// but foldable / multi-display devices may have two.
 pub struct AndroidWindow {
     state: Arc<Mutex<WindowState>>,
+    sprite_atlas: Arc<SharedAtlas>,
     /// Stable monotonic ID for the lifetime of this logical window.
     id: u64,
     /// Whether the window is currently active (foregrounded).
@@ -555,11 +636,14 @@ impl AndroidWindow {
             width,
             height,
             transparent,
+            None,
         )
         .context("failed to create gpui_wgpu renderer")?;
 
         let id = next_android_window_id();
 
+        let renderer_atlas = renderer.sprite_atlas().clone();
+        let sprite_atlas = SharedAtlas::new(renderer_atlas.clone() as _, renderer_atlas);
         let state = Arc::new(Mutex::new(WindowState {
             native_window: Some(native_window),
             gpu_context,
@@ -568,10 +652,13 @@ impl AndroidWindow {
             height,
             scale_factor,
             safe_area_insets: SafeAreaInsets::default(),
+            ime_insets: SafeAreaInsets::default(),
+            window_insets_authoritative: false,
             last_ime_bounds: None,
             appearance: WindowAppearance::Light,
             is_active: true,
             transparent,
+            last_draw: None,
             request_frame_callback: None,
             touch_callback: None,
             key_callback: None,
@@ -579,10 +666,12 @@ impl AndroidWindow {
             close_callback: None,
             appearance_callback: None,
             active_status_callback: None,
+            insets_callback: None,
         }));
 
         Ok(Arc::new(Self {
             state,
+            sprite_atlas,
             id,
             active: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             direct_contact_claims: Arc::new(Mutex::new(HashSet::new())),
@@ -602,10 +691,13 @@ impl AndroidWindow {
             height,
             scale_factor,
             safe_area_insets: SafeAreaInsets::default(),
+            ime_insets: SafeAreaInsets::default(),
+            window_insets_authoritative: false,
             last_ime_bounds: None,
             appearance: WindowAppearance::Light,
             is_active: false,
             transparent: false,
+            last_draw: None,
             request_frame_callback: None,
             touch_callback: None,
             key_callback: None,
@@ -613,10 +705,12 @@ impl AndroidWindow {
             close_callback: None,
             appearance_callback: None,
             active_status_callback: None,
+            insets_callback: None,
         }));
 
         Arc::new(Self {
             state,
+            sprite_atlas: SharedAtlas::empty(),
             id: next_android_window_id(),
             active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             direct_contact_claims: Arc::new(Mutex::new(HashSet::new())),
@@ -640,6 +734,7 @@ impl AndroidWindow {
         // The local gpui_wgpu renderer does not expose a detachable surface API,
         // so Android recreates the renderer whenever NativeActivity gives us a
         // fresh ANativeWindow.
+        let previous_atlas = self.sprite_atlas.backing_atlas();
         if let Some(mut renderer) = state.renderer.take() {
             renderer.destroy();
         }
@@ -651,8 +746,20 @@ impl AndroidWindow {
             state.gpu_context = Rc::clone(&gpu_context);
             gpu_context
         };
-        let renderer = Self::create_renderer(&native_window, ctx, width, height, transparent)?;
+        let renderer = Self::create_renderer(
+            &native_window,
+            ctx,
+            width,
+            height,
+            transparent,
+            previous_atlas,
+        )?;
+        self.sprite_atlas
+            .set_atlas(renderer.sprite_atlas().clone() as _);
+        self.sprite_atlas
+            .set_backing_atlas(renderer.sprite_atlas().clone());
         state.renderer = Some(renderer);
+        state.last_draw = None;
         log::info!(
             "AndroidWindow::init_window — created renderer {}×{}",
             width,
@@ -762,6 +869,34 @@ impl AndroidWindow {
                 scale,
             );
             // Put callback back.
+            let mut state = self.state.lock();
+            if state.resize_callback.is_none() {
+                state.resize_callback = Some(cb);
+            }
+        }
+    }
+
+    pub fn update_scale_factor(&self, scale_factor: f32) {
+        if !scale_factor.is_finite() || scale_factor <= 0.0 {
+            return;
+        }
+        let (width, height, callback) = {
+            let mut state = self.state.lock();
+            if (state.scale_factor - scale_factor).abs() <= f32::EPSILON {
+                return;
+            }
+            state.scale_factor = scale_factor;
+            state.last_ime_bounds = None;
+            (state.width, state.height, state.resize_callback.take())
+        };
+        if let Some(mut cb) = callback {
+            cb(
+                Size {
+                    width: DevicePixels(width),
+                    height: DevicePixels(height),
+                },
+                scale_factor,
+            );
             let mut state = self.state.lock();
             if state.resize_callback.is_none() {
                 state.resize_callback = Some(cb);
@@ -880,7 +1015,6 @@ impl AndroidWindow {
             log::trace!("AndroidWindow::draw — skipping empty scene");
             return;
         }
-
         // Take the renderer out of state so we can draw WITHOUT holding
         // the state lock.  renderer.draw() calls get_current_texture()
         // which can block on the GPU / Vulkan driver.  Holding the lock
@@ -898,9 +1032,35 @@ impl AndroidWindow {
         let mut restore = RendererRestore {
             state: &self.state,
             renderer: Some(renderer),
+            drawn_at: None,
         };
         if let Some(renderer) = restore.renderer.as_mut() {
+            let draw_started = std::time::Instant::now();
             renderer.draw(scene);
+            restore.drawn_at = Some(Instant::now());
+            crate::android::jni::NATIVE_FIRST_FRAME_PRESENTED.store(true, Ordering::Release);
+            let cover_active = crate::android::jni::RESUME_COVER_ACTIVE.load(Ordering::Acquire);
+            if cover_active {
+                // While the resume cover is up, the editor panel window would
+                // render above the opaque cover and appear before the rest of
+                // the UI. Keep the editor op parked; Java flushes it when the
+                // cover fade starts so the input appears together with the UI.
+                if crate::android::jni::RESUME_COVER_PENDING.swap(false, Ordering::AcqRel) {
+                    crate::android::jni::hide_resume_cover_android();
+                }
+            } else {
+                crate::android::jni::flush_pending_editor_op();
+                if crate::android::jni::take_native_editor_ime_animation_end() {
+                    crate::android::jni::show_native_editor_after_ime_animation();
+                }
+            }
+            let elapsed = draw_started.elapsed();
+            if elapsed >= std::time::Duration::from_millis(30) {
+                log::warn!(
+                    "AndroidWindow::draw — slow frame: {:.1} ms",
+                    elapsed.as_secs_f64() * 1000.0
+                );
+            }
         }
     }
 
@@ -918,6 +1078,11 @@ impl AndroidWindow {
     pub fn needs_frame_pump(&self) -> bool {
         let momentum = self.momentum.lock();
         momentum.has_pending_scroll || momentum.scroller.is_active()
+    }
+
+    /// Elapsed time since the last frame was presented, if any.
+    pub fn time_since_last_draw(&self) -> Option<Duration> {
+        self.state.lock().last_draw.map(|at| at.elapsed())
     }
 
     pub fn request_frame(&self) {
@@ -1029,6 +1194,22 @@ impl AndroidWindow {
         self.state.lock().appearance
     }
 
+    /// Re-deliver the current appearance to GPUI.
+    pub fn refresh_appearance(&self) {
+        let appearance = self.state.lock().appearance;
+        let cb = {
+            let mut state = self.state.lock();
+            state.appearance_callback.take()
+        };
+        if let Some(mut cb) = cb {
+            cb(appearance);
+            let mut state = self.state.lock();
+            if state.appearance_callback.is_none() {
+                state.appearance_callback = Some(cb);
+            }
+        }
+    }
+
     /// Update the active (foreground/background) status of the window.
     ///
     /// Called by `on_window_focus_changed` in `jni.rs`.
@@ -1118,6 +1299,57 @@ impl AndroidWindow {
         state.safe_area_insets.to_logical(state.scale_factor)
     }
 
+    /// Returns the current keyboard insets in logical pixels.
+    pub fn ime_insets_logical(&self) -> SafeAreaInsets {
+        let state = self.state.lock();
+        state.ime_insets.to_logical(state.scale_factor)
+    }
+
+    fn window_insets_from_state(state: &WindowState) -> WindowInsets {
+        let safe = state.safe_area_insets.to_logical(state.scale_factor);
+        let ime = state.ime_insets.to_logical(state.scale_factor);
+        WindowInsets {
+            safe_area: gpui::Edges {
+                top: gpui::px(safe.top),
+                right: gpui::px(safe.right),
+                bottom: gpui::px(safe.bottom),
+                left: gpui::px(safe.left),
+            },
+            ime: gpui::Edges {
+                top: gpui::px(ime.top),
+                right: gpui::px(ime.right),
+                bottom: gpui::px(ime.bottom),
+                left: gpui::px(ime.left),
+            },
+        }
+    }
+
+    /// Attach the platform insets changed callback.
+    pub fn on_insets_changed<F>(&self, cb: F)
+    where
+        F: FnMut(WindowInsets) + 'static,
+    {
+        self.state.lock().insets_callback = Some(MainThreadInsetsCallback(Box::new(cb)));
+    }
+
+    /// Re-deliver the latest insets to GPUI.
+    pub fn notify_insets_changed(&self) {
+        let (cb, insets) = {
+            let mut state = self.state.lock();
+            (
+                state.insets_callback.take(),
+                Self::window_insets_from_state(&state),
+            )
+        };
+        if let Some(mut cb) = cb {
+            (cb.0)(insets);
+            let mut state = self.state.lock();
+            if state.insets_callback.is_none() {
+                state.insets_callback = Some(cb);
+            }
+        }
+    }
+
     /// Update the safe area insets from the content rect provided by the system.
     ///
     /// `content_rect` is `(left, top, right, bottom)` in physical pixels — the
@@ -1131,6 +1363,9 @@ impl AndroidWindow {
         content_bottom: i32,
     ) {
         let mut state = self.state.lock();
+        if state.window_insets_authoritative {
+            return;
+        }
         let insets = SafeAreaInsets {
             top: content_top as f32,
             bottom: (state.height - content_bottom).max(0) as f32,
@@ -1147,6 +1382,63 @@ impl AndroidWindow {
         state.safe_area_insets = insets;
     }
 
+    /// Update the safe area using Android's current system-bar insets.
+    ///
+    /// Unlike `content_rect`, `WindowInsets` remains correct when Android is
+    /// drawing edge-to-edge and the native surface still covers the full
+    /// display.
+    pub fn update_safe_area_insets(&self, left: i32, top: i32, right: i32, bottom: i32) {
+        let mut state = self.state.lock();
+        let insets = SafeAreaInsets {
+            top: top.max(0) as f32,
+            bottom: bottom.max(0) as f32,
+            left: left.max(0) as f32,
+            right: right.max(0) as f32,
+        };
+        if state.safe_area_insets.top == insets.top
+            && state.safe_area_insets.bottom == insets.bottom
+            && state.safe_area_insets.left == insets.left
+            && state.safe_area_insets.right == insets.right
+        {
+            return;
+        }
+        log::info!(
+            "safe_area_insets (WindowInsets): top={:.0} bottom={:.0} left={:.0} right={:.0} (physical px)",
+            insets.top,
+            insets.bottom,
+            insets.left,
+            insets.right,
+        );
+        state.safe_area_insets = insets;
+        state.window_insets_authoritative = true;
+    }
+
+    /// Update the Android IME insets reported by `WindowInsets.Type.ime()`.
+    pub fn update_ime_insets(&self, left: i32, top: i32, right: i32, bottom: i32) {
+        let mut state = self.state.lock();
+        let insets = SafeAreaInsets {
+            top: top.max(0) as f32,
+            bottom: bottom.max(0) as f32,
+            left: left.max(0) as f32,
+            right: right.max(0) as f32,
+        };
+        if state.ime_insets.top == insets.top
+            && state.ime_insets.bottom == insets.bottom
+            && state.ime_insets.left == insets.left
+            && state.ime_insets.right == insets.right
+        {
+            return;
+        }
+        log::info!(
+            "ime_insets (WindowInsets): top={:.0} bottom={:.0} left={:.0} right={:.0} (physical px)",
+            insets.top,
+            insets.bottom,
+            insets.left,
+            insets.right,
+        );
+        state.ime_insets = insets;
+    }
+
     // ── state queries ─────────────────────────────────────────────────────────
 
     /// Whether the window currently has an active wgpu surface.
@@ -1161,6 +1453,11 @@ impl AndroidWindow {
             .renderer
             .as_ref()
             .map(|r| r.sprite_atlas().clone() as Arc<dyn PlatformAtlas>)
+    }
+
+    /// Returns the stable atlas proxy consumed by GPUI.
+    pub fn shared_sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
+        self.sprite_atlas.clone()
     }
 
     /// Returns GPU specs from the renderer, if available.
@@ -1276,16 +1573,90 @@ impl AndroidWindow {
         width: i32,
         height: i32,
         transparent: bool,
+        atlas: Option<Arc<gpui_wgpu::WgpuAtlas>>,
     ) -> Result<WgpuRenderer> {
         let raw = Self::raw_window(native_window);
+
+        match Self::create_gles_renderer(
+            Rc::clone(&gpu_context),
+            &raw,
+            width,
+            height,
+            transparent,
+            atlas,
+        ) {
+            Ok(renderer) => Ok(renderer),
+            Err(error) => {
+                log::warn!(
+                    "OpenGL ES renderer initialization failed: {error:#}; \
+                     falling back to the default wgpu backend"
+                );
+                *gpu_context.borrow_mut() = None;
+                let config = WgpuSurfaceConfig {
+                    size: gpui::size(gpui::DevicePixels(width), gpui::DevicePixels(height)),
+                    transparent,
+                    preferred_present_mode: Some(wgpu::PresentMode::Mailbox),
+                };
+                WgpuRenderer::new(gpu_context, &raw, config, None)
+            }
+        }
+    }
+
+    /// Android has a small dedicated GL path. Adreno's Vulkan driver on at
+    /// least the Xiaomi 23077RABDC fails to render texture-backed primitives
+    /// (text sprites and SVG paths), while GL renders them correctly.
+    fn create_gles_renderer(
+        gpu_context: GpuContext,
+        raw: &RawAndroidWindow,
+        width: i32,
+        height: i32,
+        transparent: bool,
+        atlas: Option<Arc<gpui_wgpu::WgpuAtlas>>,
+    ) -> Result<WgpuRenderer> {
+        let instance = {
+            let context = gpu_context.borrow();
+            match context.as_ref() {
+                Some(context) => context.instance.clone(),
+                None => wgpu::Instance::new(wgpu::InstanceDescriptor {
+                    backends: wgpu::Backends::GL,
+                    flags: wgpu::InstanceFlags::default(),
+                    backend_options: wgpu::BackendOptions::default(),
+                    memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
+                    display: Some(Box::new(*raw)),
+                }),
+            }
+        };
+
+        let target = wgpu::SurfaceTargetUnsafe::RawHandle {
+            raw_display_handle: None,
+            raw_window_handle: raw.window_handle()?.as_raw(),
+        };
+        let surface = unsafe {
+            instance
+                .create_surface_unsafe(target)
+                .map_err(|error| anyhow::anyhow!("failed to create GL surface: {error}"))?
+        };
+
+        let needs_context = gpu_context.borrow().is_none();
+        if needs_context {
+            let context = WgpuContext::new(instance, &surface, None)
+                .context("failed to create GL wgpu context")?;
+            *gpu_context.borrow_mut() = Some(context);
+        }
 
         let config = WgpuSurfaceConfig {
             size: gpui::size(gpui::DevicePixels(width), gpui::DevicePixels(height)),
             transparent,
             preferred_present_mode: Some(wgpu::PresentMode::Mailbox),
         };
-
-        WgpuRenderer::new(gpu_context, &raw, config, None)
+        WgpuRenderer::new_from_existing_surface_with_atlas(
+            gpu_context,
+            surface,
+            config,
+            None,
+            atlas,
+        )
+        .context("failed to create GL renderer")
     }
 }
 
@@ -1339,6 +1710,132 @@ struct MainThreadInputHandler(Option<PlatformInputHandler>);
 // access this handler. This wrapper exists solely because AndroidWindow's
 // callback registry uses a Send bound for all callbacks.
 unsafe impl Send for MainThreadInputHandler {}
+
+/// Reduce a frame-coalesced native editor snapshot to the smallest UTF-16
+/// replacement against GPUI's current text.
+fn mirror_text_replacement(
+    current: &str,
+    updated: &str,
+) -> Option<(std::ops::Range<usize>, String)> {
+    if current == updated {
+        return None;
+    }
+
+    let current_chars: Vec<char> = current.chars().collect();
+    let updated_chars: Vec<char> = updated.chars().collect();
+    let shared_len = current_chars.len().min(updated_chars.len());
+
+    let mut prefix = 0;
+    while prefix < shared_len && current_chars[prefix] == updated_chars[prefix] {
+        prefix += 1;
+    }
+
+    let max_suffix = shared_len - prefix;
+    let mut suffix = 0;
+    while suffix < max_suffix
+        && current_chars[current_chars.len() - 1 - suffix]
+            == updated_chars[updated_chars.len() - 1 - suffix]
+    {
+        suffix += 1;
+    }
+
+    let old_end = current_chars.len() - suffix;
+    let new_end = updated_chars.len() - suffix;
+    let start_utf16 = current_chars[..prefix]
+        .iter()
+        .map(|ch| ch.len_utf16())
+        .sum();
+    let end_utf16 = current_chars[..old_end]
+        .iter()
+        .map(|ch| ch.len_utf16())
+        .sum();
+    let replacement_start_byte = updated_chars[..prefix].iter().map(|ch| ch.len_utf8()).sum();
+    let replacement_end_byte = updated_chars[..new_end]
+        .iter()
+        .map(|ch| ch.len_utf8())
+        .sum();
+    Some((
+        start_utf16..end_utf16,
+        updated[replacement_start_byte..replacement_end_byte].to_string(),
+    ))
+}
+
+fn apply_text_ime_event(handler: &mut PlatformInputHandler, event: crate::ImeEvent) {
+    match event {
+        crate::ImeEvent::Commit(text) => {
+            handler.replace_text_in_range(None, &text);
+            handler.unmark_text();
+        }
+        crate::ImeEvent::SetComposing(text) => {
+            let selected = text.encode_utf16().count();
+            handler.replace_and_mark_text_in_range(None, &text, Some(selected..selected));
+        }
+        crate::ImeEvent::FinishComposing => handler.unmark_text(),
+        crate::ImeEvent::DeleteSurrounding { before, after } => {
+            if let Some(selection) = handler.selected_text_range(true) {
+                let start = selection.range.start.saturating_sub(before);
+                let end = selection.range.end.saturating_add(after);
+                handler.replace_text_in_range(Some(start..end), "");
+            }
+        }
+        crate::ImeEvent::CopySelection => {
+            if let Some(selection) = handler.selected_text_range(true) {
+                let mut adjusted = None;
+                if let Some(text) = handler.text_for_range(selection.range.clone(), &mut adjusted)
+                    && !text.is_empty()
+                {
+                    crate::android::jni::set_clipboard_text_android(&text);
+                }
+            }
+        }
+        crate::ImeEvent::CutSelection => {
+            if let Some(selection) = handler.selected_text_range(true) {
+                let mut adjusted = None;
+                if let Some(text) = handler.text_for_range(selection.range.clone(), &mut adjusted)
+                    && !text.is_empty()
+                {
+                    crate::android::jni::set_clipboard_text_android(&text);
+                }
+                handler.replace_text_in_range(Some(selection.range), "");
+            }
+        }
+        crate::ImeEvent::MirrorText {
+            text,
+            sel_start_utf16,
+            sel_end_utf16,
+        } => {
+            let mut adjusted = None;
+            let current = handler
+                .text_for_range(0..usize::MAX, &mut adjusted)
+                .unwrap_or_default();
+            if let Some((range, replacement)) = mirror_text_replacement(&current, &text) {
+                handler.replace_text_in_range(Some(range), &replacement);
+            }
+            let selection = sel_start_utf16..sel_end_utf16;
+            let current_selection = handler
+                .selected_text_range(true)
+                .map(|selection| selection.range);
+            if current_selection.as_ref() != Some(&selection) {
+                handler.set_selected_text_range(selection);
+            }
+        }
+        crate::ImeEvent::MirrorSelection {
+            start_utf16,
+            end_utf16,
+        } => {
+            handler.set_selected_text_range(start_utf16..end_utf16);
+        }
+        crate::ImeEvent::MirrorScroll { scroll_top } => {
+            crate::dispatch_native_editor_scroll(scroll_top);
+        }
+        crate::ImeEvent::NativeEditorHidden => {
+            crate::dispatch_native_editor_hidden();
+        }
+        crate::ImeEvent::NativeEditorFocusChanged(focused) => {
+            crate::dispatch_native_editor_focus(focused);
+        }
+    }
+}
 
 impl AndroidPlatformWindow {
     /// Create a new `AndroidPlatformWindow` wrapping an existing `AndroidWindow`.
@@ -1434,6 +1931,15 @@ impl PlatformWindow for AndroidPlatformWindow {
 
     fn scale_factor(&self) -> f32 {
         self.window.scale_factor()
+    }
+
+    fn insets(&self) -> gpui::WindowInsets {
+        let state = self.window.state.lock();
+        AndroidWindow::window_insets_from_state(&state)
+    }
+
+    fn on_insets_changed(&self, callback: Box<dyn FnMut(gpui::WindowInsets)>) {
+        self.window.state.lock().insets_callback = Some(MainThreadInsetsCallback(callback));
     }
 
     fn appearance(&self) -> gpui::WindowAppearance {
@@ -1553,35 +2059,35 @@ impl PlatformWindow for AndroidPlatformWindow {
         let input_handler = Arc::clone(&self.input_handler);
 
         self.window.on_request_frame(move || {
-            {
-                let events = crate::drain_ime_events();
-                if !events.is_empty()
-                    && let Some(handler) = input_handler.lock().0.as_mut()
-                {
-                    for event in events {
-                        match event {
-                            crate::ImeEvent::Commit(text) => {
-                                handler.replace_text_in_range(None, &text);
-                                handler.unmark_text();
-                            }
-                            crate::ImeEvent::SetComposing(text) => {
-                                let selected = text.encode_utf16().count();
-                                handler.replace_and_mark_text_in_range(
-                                    None,
-                                    &text,
-                                    Some(selected..selected),
-                                );
-                            }
-                            crate::ImeEvent::FinishComposing => handler.unmark_text(),
-                            crate::ImeEvent::DeleteSurrounding { before, after } => {
-                                if let Some(selection) = handler.selected_text_range(true) {
-                                    let start = selection.range.start.saturating_sub(before);
-                                    let end = selection.range.end.saturating_add(after);
-                                    handler.replace_text_in_range(Some(start..end), "");
-                                }
-                            }
-                        }
+            let mut pending_text_events = Vec::new();
+            for event in crate::drain_ime_events() {
+                match event {
+                    crate::ImeEvent::MirrorScroll { scroll_top } => {
+                        crate::dispatch_native_editor_scroll(scroll_top);
                     }
+                    crate::ImeEvent::NativeEditorHidden => {
+                        crate::dispatch_native_editor_hidden();
+                    }
+                    crate::ImeEvent::NativeEditorFocusChanged(focused) => {
+                        if !focused {
+                            // A final mirror snapshot may already have been
+                            // drained into this frame before the focus event
+                            // arrived. The live text was synchronously read
+                            // on outside MouseDown, so replaying that snapshot
+                            // can overwrite a Clear action on the same tap.
+                            pending_text_events.retain(|event| {
+                                !matches!(
+                                    event,
+                                    crate::ImeEvent::MirrorText { .. }
+                                        | crate::ImeEvent::MirrorSelection { .. }
+                                        | crate::ImeEvent::MirrorScroll { .. }
+                                )
+                            });
+                            crate::discard_pending_mirror_events();
+                        }
+                        crate::dispatch_native_editor_focus(focused);
+                    }
+                    text_event => pending_text_events.push(text_event),
                 }
             }
 
@@ -1687,10 +2193,33 @@ impl PlatformWindow for AndroidPlatformWindow {
                 }
             }
 
-            // Check if text input arrived since last frame — if so, force a
-            // render so drain_pending_text() runs and the UI updates.
-            let text_dirty =
-                crate::TEXT_INPUT_DIRTY.swap(false, std::sync::atomic::Ordering::AcqRel);
+            // Apply text snapshots before requesting the frame. The input
+            // handler updates the app model synchronously; rendering first
+            // would paint stale button state and need another frame to catch
+            // up after the handler refreshes the window.
+            let had_text_events = !pending_text_events.is_empty();
+            if !pending_text_events.is_empty() {
+                let mut handler = input_handler.lock();
+                if let Some(handler) = handler.0.as_mut() {
+                    for event in pending_text_events.drain(..) {
+                        apply_text_ime_event(handler, event);
+                    }
+                } else {
+                    drop(handler);
+                    log::info!(
+                        "deferring {} IME text event(s): no focused input handler",
+                        pending_text_events.len()
+                    );
+                    crate::prepend_ime_events(pending_text_events);
+                }
+            }
+
+            // Text changes may set the dirty bit while they update the app
+            // model. Consume it only after applying them so this render sees
+            // the latest input and button state.
+            let text_dirty = crate::TEXT_INPUT_DIRTY
+                .swap(false, std::sync::atomic::Ordering::AcqRel)
+                || had_text_events;
 
             let mut cb = send_callback.lock();
             cb(RequestFrameOptions {
@@ -1698,6 +2227,7 @@ impl PlatformWindow for AndroidPlatformWindow {
                 force_render: text_dirty,
                 ..Default::default()
             });
+            drop(cb);
         });
     }
 
@@ -1735,12 +2265,54 @@ impl PlatformWindow for AndroidPlatformWindow {
         // The threshold is in logical pixels (~8 px ≈ ~3 mm at 160 dpi).
         {
             let cb = Arc::clone(&input_cb);
-            let scale_factor = self.window.scale_factor();
+            let window = Arc::clone(&self.window);
             let momentum = Arc::clone(&self.momentum);
             let touch_state = Mutex::new(AndroidTouchState::default());
-            let claimed_contacts = Arc::clone(&self.window.direct_contact_claims);
+            let claimed_contacts = Arc::clone(&window.direct_contact_claims);
+
+            // Touch has no "mouse left the element" event, so a tap would
+            // otherwise leave GPUI's hover state stuck on the last touched
+            // element (or never light it up at all).  Emit a synthetic mouse
+            // move at the touch-down position to show the hover style, then
+            // park the cursor off-window a moment after the gesture ends.
+            let schedule_hover_clear = {
+                let cb = Arc::clone(&cb);
+                let pending = Arc::new(AtomicBool::new(false));
+                move || {
+                    if pending.swap(true, Ordering::SeqCst) {
+                        return;
+                    }
+                    let clear = {
+                        let cb = Arc::clone(&cb);
+                        let pending = Arc::clone(&pending);
+                        move || {
+                            pending.store(false, Ordering::SeqCst);
+                            let _ =
+                                cb.lock()(gpui::PlatformInput::MouseMove(gpui::MouseMoveEvent {
+                                    position: gpui::point(gpui::px(-10000.0), gpui::px(-10000.0)),
+                                    modifiers: gpui::Modifiers::default(),
+                                    pressed_button: None,
+                                }));
+                        }
+                    };
+                    if let Some(platform) = crate::android::jni::platform() {
+                        let dispatcher = platform.dispatcher();
+                        let main_dispatcher = Arc::clone(&dispatcher);
+                        dispatcher.dispatch_after(Duration::from_millis(150), move || {
+                            main_dispatcher.dispatch_on_main_thread(clear);
+                        });
+                    } else {
+                        pending.store(false, Ordering::SeqCst);
+                    }
+                }
+            };
 
             self.window.on_touch(move |touch| {
+                // Density can change while the app is running (Developer
+                // Options, foldables, external displays). Read it per event
+                // instead of capturing the density that happened to be active
+                // when the callback was installed.
+                let scale_factor = window.scale_factor();
                 let logical_x = touch.x / scale_factor;
                 let logical_y = touch.y / scale_factor;
                 let modifiers = gpui::Modifiers::default();
@@ -1808,6 +2380,14 @@ impl PlatformWindow for AndroidPlatformWindow {
                         if matches!(phase, gpui::PointerPhase::Up | gpui::PointerPhase::Cancel) {
                             claimed_contacts.lock().remove(&touch.id);
                             touch_state.lock().remove(touch.id);
+                            let mut guard = cb.lock();
+                            let _ = guard(gpui::PlatformInput::Touch(gpui::TouchEvent {
+                                id: gpui::TouchId(touch.id.max(0) as u64),
+                                phase: gpui::TouchPhase::Cancelled,
+                                position,
+                                predicted_position: None,
+                                force: None,
+                            }));
                         }
                         return;
                     }
@@ -1818,6 +2398,7 @@ impl PlatformWindow for AndroidPlatformWindow {
                 match touch.action {
                     // ACTION_DOWN / ACTION_POINTER_DOWN
                     0 => {
+                        crate::TEXT_SELECT_ACTIVE.store(false, Ordering::Release);
                         {
                             let mut ms = momentum.lock();
                             ms.scroller.cancel();
@@ -1833,6 +2414,48 @@ impl PlatformWindow for AndroidPlatformWindow {
                                 start_x: logical_x,
                                 start_y: logical_y,
                             };
+                            state.touch_id = Some(touch.id);
+                            // Dispatch the hover-move asynchronously: sending
+                            // it synchronously inside the touch callback made
+                            // GPUI's hover→draw re-enter the renderer while
+                            // the OS was still dispatching MotionEvent DOWN,
+                            // deadlocking the main thread into an ANR.
+                            let hover_cb = Arc::clone(&cb);
+                            if let Some(platform) = crate::android::jni::platform() {
+                                let dispatcher = platform.dispatcher();
+                                let main_dispatcher = Arc::clone(&dispatcher);
+                                dispatcher.dispatch_after(Duration::from_millis(1), move || {
+                                    main_dispatcher.dispatch_on_main_thread(move || {
+                                        let mut guard = hover_cb.lock();
+                                        let _ = guard(gpui::PlatformInput::MouseMove(
+                                            gpui::MouseMoveEvent {
+                                                position,
+                                                modifiers,
+                                                pressed_button: None,
+                                            },
+                                        ));
+                                    });
+                                });
+                            }
+                            let mut guard = cb.lock();
+                            let _ = guard(gpui::PlatformInput::Touch(gpui::TouchEvent {
+                                id: gpui::TouchId(touch.id.max(0) as u64),
+                                phase: gpui::TouchPhase::Started,
+                                position,
+                                predicted_position: None,
+                                force: None,
+                            }));
+                        } else if let Some(touch_id) = state.touch_id.take() {
+                            // A second contact turns the gesture into a pinch;
+                            // cancel the pending single-touch tap recognizer.
+                            let mut guard = cb.lock();
+                            let _ = guard(gpui::PlatformInput::Touch(gpui::TouchEvent {
+                                id: gpui::TouchId(touch_id.max(0) as u64),
+                                phase: gpui::TouchPhase::Cancelled,
+                                position,
+                                predicted_position: None,
+                                force: None,
+                            }));
                         }
 
                         if let Some((x, y, delta, phase)) = state.pinch_update() {
@@ -1886,7 +2509,13 @@ impl PlatformWindow for AndroidPlatformWindow {
                                 let dy = logical_y - start_y;
                                 let distance = (dx * dx + dy * dy).sqrt();
 
-                                if distance > ANDROID_SCROLL_SLOP {
+                                // A claimed long press is extending a text
+                                // selection: keep the gesture pending so the
+                                // input keeps receiving moves instead of the
+                                // page starting to scroll.
+                                let text_selecting =
+                                    crate::TEXT_SELECT_ACTIVE.load(Ordering::Acquire);
+                                if !text_selecting && distance > ANDROID_SCROLL_SLOP {
                                     state.gesture = AndroidTouchGesture::Scrolling {
                                         prev_x: logical_x,
                                         prev_y: logical_y,
@@ -1922,6 +2551,16 @@ impl PlatformWindow for AndroidPlatformWindow {
                         drop(ms);
 
                         if matches!(state.gesture, AndroidTouchGesture::Scrolling { .. }) {
+                            if let Some(touch_id) = state.touch_id.take() {
+                                let mut guard = cb.lock();
+                                let _ = guard(gpui::PlatformInput::Touch(gpui::TouchEvent {
+                                    id: gpui::TouchId(touch_id.max(0) as u64),
+                                    phase: gpui::TouchPhase::Cancelled,
+                                    position,
+                                    predicted_position: None,
+                                    force: None,
+                                }));
+                            }
                             return;
                         }
 
@@ -1931,13 +2570,24 @@ impl PlatformWindow for AndroidPlatformWindow {
                             modifiers,
                             pressed_button: Some(gpui::MouseButton::Left),
                         }));
+                        if state.touch_id.is_some() {
+                            let _ = guard(gpui::PlatformInput::Touch(gpui::TouchEvent {
+                                id: gpui::TouchId(touch.id.max(0) as u64),
+                                phase: gpui::TouchPhase::Moved,
+                                position,
+                                predicted_position: None,
+                                force: None,
+                            }));
+                        }
                     }
 
                     // ACTION_UP / ACTION_CANCEL / ACTION_POINTER_UP
                     1 | 3 => {
                         let cancelled = touch.action == crate::event_stages::TOUCH_ACTION_CANCEL;
+                        crate::TEXT_SELECT_ACTIVE.store(false, Ordering::Release);
                         if state.end_pinch() {
                             state.remove(touch.id);
+                            let touch_id = state.touch_id.take();
                             let mut ms = momentum.lock();
                             ms.scroller.cancel();
                             ms.velocity_tracker.reset();
@@ -1953,6 +2603,15 @@ impl PlatformWindow for AndroidPlatformWindow {
                                 modifiers,
                                 phase: gpui::TouchPhase::Ended,
                             }));
+                            if let Some(touch_id) = touch_id {
+                                let _ = guard(gpui::PlatformInput::Touch(gpui::TouchEvent {
+                                    id: gpui::TouchId(touch_id.max(0) as u64),
+                                    phase: gpui::TouchPhase::Cancelled,
+                                    position,
+                                    predicted_position: None,
+                                    force: None,
+                                }));
+                            }
                             return;
                         }
 
@@ -1968,23 +2627,26 @@ impl PlatformWindow for AndroidPlatformWindow {
 
                                 if !cancelled {
                                     let tap_pos = gpui::point(gpui::px(start_x), gpui::px(start_y));
+                                    let touch_id = state.touch_id.take().unwrap_or(touch.id);
                                     let mut guard = cb.lock();
-                                    let _ = guard(gpui::PlatformInput::MouseDown(
-                                        gpui::MouseDownEvent {
-                                            button: gpui::MouseButton::Left,
-                                            position: tap_pos,
-                                            modifiers,
-                                            click_count: 1,
-                                            first_mouse: false,
-                                        },
-                                    ));
-                                    let _ =
-                                        guard(gpui::PlatformInput::MouseUp(gpui::MouseUpEvent {
-                                            button: gpui::MouseButton::Left,
-                                            position: tap_pos,
-                                            modifiers,
-                                            click_count: 1,
-                                        }));
+                                    let _ = guard(gpui::PlatformInput::Touch(gpui::TouchEvent {
+                                        id: gpui::TouchId(touch_id.max(0) as u64),
+                                        phase: gpui::TouchPhase::Ended,
+                                        position: tap_pos,
+                                        predicted_position: None,
+                                        force: None,
+                                    }));
+                                    schedule_hover_clear();
+                                } else if let Some(touch_id) = state.touch_id.take() {
+                                    let mut guard = cb.lock();
+                                    let _ = guard(gpui::PlatformInput::Touch(gpui::TouchEvent {
+                                        id: gpui::TouchId(touch_id.max(0) as u64),
+                                        phase: gpui::TouchPhase::Cancelled,
+                                        position,
+                                        predicted_position: None,
+                                        force: None,
+                                    }));
+                                    schedule_hover_clear();
                                 }
                             }
                             AndroidTouchGesture::Scrolling { prev_x, prev_y } => {
@@ -2026,11 +2688,22 @@ impl PlatformWindow for AndroidPlatformWindow {
                                     modifiers,
                                     click_count: 1,
                                 }));
+                                if let Some(touch_id) = state.touch_id.take() {
+                                    let _ = guard(gpui::PlatformInput::Touch(gpui::TouchEvent {
+                                        id: gpui::TouchId(touch_id.max(0) as u64),
+                                        phase: gpui::TouchPhase::Cancelled,
+                                        position,
+                                        predicted_position: None,
+                                        force: None,
+                                    }));
+                                }
+                                schedule_hover_clear();
                             }
                             AndroidTouchGesture::Idle | AndroidTouchGesture::Pinching { .. } => {}
                         }
 
                         state.gesture = AndroidTouchGesture::Idle;
+                        state.touch_id = None;
                     }
 
                     _ => {}
@@ -2178,13 +2851,14 @@ impl PlatformWindow for AndroidPlatformWindow {
     }
 
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
-        self.window
-            .sprite_atlas()
-            .unwrap_or_else(|| Arc::new(FallbackAtlas::new()))
+        self.window.shared_sprite_atlas()
     }
 
     fn is_subpixel_rendering_supported(&self) -> bool {
-        self.window.supports_subpixel_aa()
+        // Some Android GPU drivers advertise dual-source blending but produce
+        // fully transparent subpixel glyphs (observed on Adreno 613 via GL).
+        // Use grayscale antialiasing on Android so text remains visible.
+        false
     }
 
     fn gpu_specs(&self) -> Option<GpuSpecs> {

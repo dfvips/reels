@@ -1,16 +1,17 @@
 [package]
-name = "douyin-parser-ios"
+name = "reels-ios"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [lib]
-name = "douyin_parser_ios"
+name = "reels_ios"
 crate-type = ["staticlib"]
 
 [dependencies]
 gpui.workspace = true
 gpui-ios.workspace = true
 douyin-ui = { path = "../../crates/ui" }
+douyin-core = { path = "../../../crates/core" }
 log = "0.4"
 oslog = "0.2"

@@ -1,4 +1,6 @@
-//! iOS 静态库入口：由 Swift AppDelegate 调用 `douyin_parser_ios_start`。
+//! iOS 静态库入口：由 Swift AppDelegate 调用 `reels_ios_start`。
+
+mod appearance;
 
 use std::path::PathBuf;
 
@@ -9,13 +11,14 @@ fn install_paths() {
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir);
     douyin_ui::paths::set_override(douyin_ui::paths::AppPaths::with_roots(
-        home.join(".config").join("douyin_parser"),
-        home.join("Library").join("Caches").join("douyin_parser"),
+        home.join(".config").join("reels"),
+        home.join("Library").join("Caches").join("reels"),
         home.join("Documents"),
     ));
 }
 
 fn launch(cx: &mut App) {
+    appearance::register_app(cx);
     douyin_ui::init(cx);
     if let Err(error) = douyin_ui::open_main_window(cx) {
         log::error!("窗口创建失败: {error}");
@@ -25,8 +28,8 @@ fn launch(cx: &mut App) {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn douyin_parser_ios_start() {
-    let _ = oslog::OsLogger::new("com.dreamfly.douyinParser")
+pub extern "C" fn reels_ios_start() {
+    let _ = oslog::OsLogger::new("com.dreamfly.reels")
         .level_filter(log::LevelFilter::Info)
         .init();
     install_paths();

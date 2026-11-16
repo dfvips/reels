@@ -1,10 +1,10 @@
 //! 视频下载（后台线程 + 进度事件）。
 
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use douyin_core::files::{safe_file_name, unique_file_name};
@@ -32,6 +32,8 @@ pub enum DownloadEvent {
 }
 
 const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+const PARALLEL_THRESHOLD_BYTES: u64 = 50 * 1024 * 1024;
+const PARALLEL_SEGMENT_COUNT: u64 = 6;
 
 pub fn start_downloads(
     urls: Vec<String>,
@@ -44,7 +46,8 @@ pub fn start_downloads(
 ) {
     std::thread::spawn(move || {
         let client = match reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(60))
+            .connect_timeout(Duration::from_secs(30))
+            .timeout(Duration::from_secs(12 * 60 * 60))
             .build()
         {
             Ok(client) => client,
@@ -98,11 +101,18 @@ pub fn start_downloads(
             let destination = directory.join(&file_name);
             let temp_path = cache_dir.join(format!("{file_name}.part"));
 
-            match download_one(&client, url, &temp_path, index, &cancel, &tx) {
+            match download_one(&client, url, &temp_path, &extension, index, &cancel, &tx) {
                 Ok(()) => {
                     let _ = std::fs::create_dir_all(&directory);
                     match std::fs::rename(&temp_path, &destination) {
                         Ok(()) => {
+                            let saved_to_gallery = crate::gallery::save_media(&destination);
+                            if crate::gallery::caller_deletes_source_after_save()
+                                && saved_to_gallery
+                            {
+                                // 相册已保存副本，删除沙盒内文件避免重复占用存储。
+                                let _ = std::fs::remove_file(&destination);
+                            }
                             let _ = tx.send(DownloadEvent::Completed {
                                 index,
                                 path: destination,
@@ -111,6 +121,12 @@ pub fn start_downloads(
                         Err(rename_error) => match std::fs::copy(&temp_path, &destination) {
                             Ok(_) => {
                                 let _ = std::fs::remove_file(&temp_path);
+                                let saved_to_gallery = crate::gallery::save_media(&destination);
+                                if crate::gallery::caller_deletes_source_after_save()
+                                    && saved_to_gallery
+                                {
+                                    let _ = std::fs::remove_file(&destination);
+                                }
                                 let _ = tx.send(DownloadEvent::Completed {
                                     index,
                                     path: destination,
@@ -129,7 +145,6 @@ pub fn start_downloads(
                     }
                 }
                 Err(error) => {
-                    let _ = std::fs::remove_file(&temp_path);
                     let _ = tx.send(DownloadEvent::Failed { index, error });
                 }
             }
@@ -151,10 +166,19 @@ fn download_one(
     client: &reqwest::blocking::Client,
     url: &str,
     temp_path: &Path,
+    extension: &str,
     index: usize,
     cancel: &Arc<AtomicBool>,
     tx: &Sender<DownloadEvent>,
 ) -> Result<(), String> {
+    if is_video_extension(extension) {
+        if let Some(total) = probe_range_total(client, url) {
+            if total > PARALLEL_THRESHOLD_BYTES {
+                return download_parallel(client, url, temp_path, total, index, cancel, tx);
+            }
+        }
+    }
+
     let mut response = client
         .get(url)
         .header(reqwest::header::USER_AGENT, USER_AGENT)
@@ -205,6 +229,183 @@ fn download_one(
     Ok(())
 }
 
+fn is_video_extension(extension: &str) -> bool {
+    matches!(
+        extension.to_ascii_lowercase().as_str(),
+        "mp4" | "mov" | "m4v" | "webm"
+    )
+}
+
+fn probe_range_total(client: &reqwest::blocking::Client, url: &str) -> Option<u64> {
+    let response = client
+        .get(url)
+        .header(reqwest::header::USER_AGENT, USER_AGENT)
+        .header(reqwest::header::REFERER, referer_for(url))
+        .header(reqwest::header::RANGE, "bytes=0-0")
+        .send()
+        .ok()?;
+    if response.status().as_u16() != 206 {
+        return None;
+    }
+    let content_range = response.headers().get(reqwest::header::CONTENT_RANGE)?;
+    let content_range = content_range.to_str().ok()?;
+    content_range.rsplit('/').next()?.trim().parse().ok()
+}
+
+fn download_parallel(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    temp_path: &Path,
+    total: u64,
+    index: usize,
+    cancel: &Arc<AtomicBool>,
+    tx: &Sender<DownloadEvent>,
+) -> Result<(), String> {
+    let segment_count = PARALLEL_SEGMENT_COUNT.min(total);
+    let segment_size = total / segment_count;
+    let progress = Arc::new(Mutex::new(vec![0u64; segment_count as usize]));
+    let abort = Arc::new(AtomicBool::new(false));
+    let _ = tx.send(DownloadEvent::Started { index, total });
+
+    // 先预分配完整体积的临时文件，各分段按偏移直接写入，避免二次合并。
+    std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(temp_path)
+        .and_then(|file| file.set_len(total))
+        .map_err(|error| format!("创建临时文件失败: {error}"))?;
+
+    let mut results = Vec::new();
+    std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for segment in 0..segment_count {
+            let start = segment * segment_size;
+            let end = if segment + 1 == segment_count {
+                total - 1
+            } else {
+                start + segment_size - 1
+            };
+            let progress = Arc::clone(&progress);
+            let abort = Arc::clone(&abort);
+            let cancel = Arc::clone(cancel);
+            let tx = tx.clone();
+            let temp_path = temp_path.to_path_buf();
+            handles.push(scope.spawn(move || {
+                download_segment(
+                    client, url, &temp_path, segment, start, end, index, total, &progress, &cancel,
+                    &abort, &tx,
+                )
+                .inspect_err(|_| abort.store(true, Ordering::Relaxed))
+            }));
+        }
+        for handle in handles {
+            results.push(match handle.join() {
+                Ok(result) => result,
+                Err(_) => Err("下载线程异常退出".to_string()),
+            });
+        }
+    });
+
+    if let Some(error) = results.into_iter().find_map(|result| result.err()) {
+        return Err(error);
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn download_segment(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    temp_path: &Path,
+    segment: u64,
+    start: u64,
+    end: u64,
+    index: usize,
+    total: u64,
+    progress: &Arc<Mutex<Vec<u64>>>,
+    cancel: &Arc<AtomicBool>,
+    abort: &Arc<AtomicBool>,
+    tx: &Sender<DownloadEvent>,
+) -> Result<u64, String> {
+    let expected = end - start + 1;
+    let mut response = client
+        .get(url)
+        .header(reqwest::header::USER_AGENT, USER_AGENT)
+        .header(reqwest::header::REFERER, referer_for(url))
+        .header(reqwest::header::RANGE, format!("bytes={start}-{end}"))
+        .send()
+        .map_err(|error| format!("下载请求失败: {error}"))?
+        .error_for_status()
+        .map_err(|error| format!("服务器返回错误: {error}"))?;
+    if response.status().as_u16() != 206 {
+        return Err("服务器不支持分段下载".to_string());
+    }
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(temp_path)
+        .map_err(|error| format!("打开临时文件失败: {error}"))?;
+    file.seek(SeekFrom::Start(start))
+        .map_err(|error| format!("定位写入位置失败: {error}"))?;
+    let mut buffer = vec![0u8; 64 * 1024];
+    let mut downloaded = 0u64;
+    let mut last_reported = 0u64;
+
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return Err("下载已取消".to_string());
+        }
+        if abort.load(Ordering::Relaxed) {
+            return Err("下载已中断".to_string());
+        }
+        let read = response
+            .read(&mut buffer)
+            .map_err(|error| format!("读取数据失败: {error}"))?;
+        if read == 0 {
+            break;
+        }
+        file.write_all(&buffer[..read])
+            .map_err(|error| format!("写入分片失败: {error}"))?;
+        downloaded += read as u64;
+        if downloaded - last_reported >= 128 * 1024 {
+            last_reported = downloaded;
+            report_segment_progress(progress, segment, downloaded, index, total, tx);
+        }
+    }
+
+    if downloaded != expected {
+        return Err(format!(
+            "分片长度错误: 期望 {expected} 字节，实际 {downloaded} 字节"
+        ));
+    }
+    report_segment_progress(progress, segment, downloaded, index, total, tx);
+    Ok(downloaded)
+}
+
+fn report_segment_progress(
+    progress: &Arc<Mutex<Vec<u64>>>,
+    segment: u64,
+    downloaded: u64,
+    index: usize,
+    total: u64,
+    tx: &Sender<DownloadEvent>,
+) {
+    let Ok(mut progress) = progress.lock() else {
+        return;
+    };
+    let Some(slot) = progress.get_mut(segment as usize) else {
+        return;
+    };
+    *slot = downloaded;
+    let total_downloaded = progress.iter().sum();
+    let _ = tx.send(DownloadEvent::Progress {
+        index,
+        downloaded: total_downloaded,
+        total,
+    });
+}
+
 fn referer_for(url: &str) -> &'static str {
     if url.contains("xhscdn.com") || url.contains("xiaohongshu.com") {
         "https://www.xiaohongshu.com/"
@@ -214,16 +415,30 @@ fn referer_for(url: &str) -> &'static str {
 }
 
 pub fn clear_cache(cache_dir: &Path) -> Result<(), String> {
+    if !cache_dir.exists() {
+        return Ok(());
+    }
+    if !cache_dir.is_dir() {
+        return std::fs::remove_file(cache_dir).map_err(|error| error.to_string());
+    }
     let entries = std::fs::read_dir(cache_dir).map_err(|error| error.to_string())?;
+    let mut errors = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.is_dir() {
-            std::fs::remove_dir_all(&path).map_err(|error| error.to_string())?;
+        let result = if path.is_dir() {
+            std::fs::remove_dir_all(&path)
         } else {
-            std::fs::remove_file(&path).map_err(|error| error.to_string())?;
+            std::fs::remove_file(&path)
+        };
+        if let Err(error) = result {
+            errors.push(format!("{}: {error}", path.display()));
         }
     }
-    Ok(())
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("\n"))
+    }
 }
 
 #[cfg(test)]
@@ -232,10 +447,85 @@ mod tests {
 
     #[test]
     fn downloaded_file_name_keeps_mp4_suffix() {
-        let directory = std::env::temp_dir().join("douyin_parser_no_such_download_dir");
+        let directory = std::env::temp_dir().join("reels_no_such_download_dir");
         assert_eq!(
             download_file_name(&directory, "测试标题", "mp4"),
             "测试标题.mp4"
         );
+    }
+
+    #[test]
+    fn parallel_download_writes_segments_in_place() {
+        use std::net::TcpListener;
+
+        let total: u64 = 1024;
+        let body: Vec<u8> = (0..total as usize).map(|index| index as u8).collect();
+        let server_body = body.clone();
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let url = format!("http://{}/range.bin", listener.local_addr().expect("addr"));
+        let server = std::thread::spawn(move || {
+            let mut served = 0;
+            while served < PARALLEL_SEGMENT_COUNT as usize {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    break;
+                };
+                let mut request = Vec::new();
+                let mut buffer = [0u8; 1024];
+                loop {
+                    let read = stream.read(&mut buffer).expect("read request");
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..read]);
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let request = String::from_utf8_lossy(&request).to_string();
+                let range = request
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("range")
+                            .then(|| value.trim().strip_prefix("bytes=").map(str::to_string))
+                            .flatten()
+                    })
+                    .expect("range header");
+                let (start, end) = {
+                    let (start, end) = range.split_once('-').expect("range values");
+                    (
+                        start.parse::<u64>().expect("range start"),
+                        end.parse::<u64>().expect("range end"),
+                    )
+                };
+                let slice = &server_body[start as usize..=(end as usize)];
+                let head = format!(
+                    "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {start}-{end}/{total}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    slice.len()
+                );
+                stream.write_all(head.as_bytes()).expect("write head");
+                stream.write_all(slice).expect("write body");
+                served += 1;
+            }
+        });
+
+        let client = reqwest::blocking::Client::new();
+        let directory = std::env::temp_dir().join("reels_parallel_test");
+        std::fs::create_dir_all(&directory).expect("create dir");
+        let temp_path = directory.join("out.bin");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        download_parallel(&client, &url, &temp_path, total, 0, &cancel, &tx)
+            .expect("parallel download");
+
+        let downloaded = std::fs::read(&temp_path).expect("read result");
+        assert_eq!(downloaded, body);
+        assert!(matches!(rx.recv(), Ok(DownloadEvent::Started { .. })));
+        assert!(matches!(rx.recv(), Ok(DownloadEvent::Progress { .. })));
+        server.join().expect("server thread");
+        let _ = std::fs::remove_file(&temp_path);
+        let _ = std::fs::remove_dir(&directory);
     }
 }

@@ -2,3 +2,47 @@
 .idea/
 .vscode/
 *.iml
+
+# 本地笔记与 QA 截图/录屏
+MEMORY.md
+qa/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 构建与打包产物
+target/
+build/
+dmg-stage/
+Payload/
+*.app
+*.dmg
+*.ipa
+*.apk
+*.aab
+*.xcresult
+*.dSYM
+/*.zip
+
+# 本地签名材料
+.secrets/
+*.mobileprovision
+*.provisionprofile
+*.p12
+*.cer
+*.p8
+*.key
+*.pem
+*.keystore
+*.jks
+keystore.properties
+ExportOptions.plist
+
+# 本地日志与环境变量
+*.log
+.env
+.env.*
+!.env.example

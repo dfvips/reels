@@ -4,21 +4,37 @@ use gpui::{
     div, px, AnyElement, Context, FontWeight, InteractiveElement, IntoElement, ParentElement,
     StatefulInteractiveElement, Styled, Window,
 };
+
+fn home_logo() -> AnyElement {
+    div()
+        .w(px(20.0))
+        .h(px(20.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(crate::widgets::GradientIcon::new(icons::HOME_LOGO, 20.0))
+        .into_any_element()
+}
 use gpui_ui_kit::{TooltipPlacement, WithTooltip};
 
 use crate::paths::is_desktop;
 use crate::theme::Palette;
-use crate::widgets::{self, TitleIconButton};
+use crate::widgets::TitleIconButton;
 use crate::{
-    icons, is_double_click, AppView, Route, APP_NAME, MOBILE_APPBAR_HEIGHT, SYSTEM_BAR_HEIGHT,
+    icons, is_double_click, AppView, Route, MOBILE_APPBAR_HEIGHT, SYSTEM_BAR_HEIGHT,
     TITLE_ROW_HEIGHT,
 };
 
 impl AppView {
-    pub fn render_titlebar(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    pub fn render_titlebar(
+        &mut self,
+        route: Route,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let palette = self.palette();
         if !is_desktop() {
-            return self.render_mobile_appbar(palette, cx);
+            return self.render_mobile_appbar(route, palette, cx);
         }
 
         let mut system_bar = div()
@@ -64,7 +80,7 @@ impl AppView {
             );
         }
 
-        let title_row = match self.route {
+        let title_row = match route {
             Route::Settings => self.render_settings_title_row(palette, cx),
             Route::Results => self.render_results_title_row(palette, cx),
             Route::Home => self.render_home_title_row(palette, cx),
@@ -86,15 +102,7 @@ impl AppView {
         let theme_icon = self.theme_icon();
         let theme_label = self.theme_label().to_string();
 
-        let logo = div()
-            .w(px(26.0))
-            .h(px(26.0))
-            .rounded_full()
-            .bg(palette.primary)
-            .flex()
-            .items_center()
-            .justify_center()
-            .child(widgets::icon(icons::PLAY, 20.0, palette.bg));
+        let logo = home_logo();
 
         let mut drag = div()
             .id("home-title-drag")
@@ -104,15 +112,11 @@ impl AppView {
             .items_center()
             .gap(px(4.0))
             .child(logo)
-            .child(
-                div()
-                    .min_w(px(0.0))
-                    .text_size(px(crate::theme::title_font_size()))
-                    .font_weight(FontWeight::BOLD)
-                    .text_color(palette.primary)
-                    .truncate()
-                    .child(APP_NAME),
-            );
+            .child(div().flex_shrink_0().child(crate::widgets::gradient_text(
+                crate::widgets::GRADIENT_TITLE,
+                crate::widgets::GRADIENT_TITLE_WIDTH,
+                crate::widgets::GRADIENT_TITLE_HEIGHT,
+            )));
 
         #[cfg(target_os = "macos")]
         {
@@ -140,8 +144,10 @@ impl AppView {
         div()
             .h(px(TITLE_ROW_HEIGHT))
             .w_full()
-            .pl(px(16.0))
-            .pr(px(12.0))
+            .pl(px(32.0))
+            // 右侧对齐的是图标本体（24px），按钮 32px 的 hover 盒子不算，
+            // 因此少留 4px，让图标右缘与输入框右缘齐平。
+            .pr(px(28.0))
             .flex()
             .items_center()
             .child(drag)
@@ -169,7 +175,7 @@ impl AppView {
                         WithTooltip::new(
                             TitleIconButton::new(
                                 "settings-button",
-                                icons::SETTINGS,
+                                icons::SETTINGS.as_bytes(),
                                 palette.primary,
                                 palette.window_btn_hover,
                             )
@@ -231,7 +237,7 @@ impl AppView {
             .child(
                 TitleIconButton::new(
                     "back-button",
-                    icons::BACK,
+                    icons::BACK.as_bytes(),
                     palette.primary,
                     palette.window_btn_hover,
                 )
@@ -244,11 +250,7 @@ impl AppView {
             .into_any_element()
     }
 
-    fn render_results_title_row(
-        &mut self,
-        palette: Palette,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
+    fn render_results_title_row(&mut self, palette: Palette, cx: &mut Context<Self>) -> AnyElement {
         let entity = cx.entity();
         let mut drag = div()
             .id("results-title-drag")
@@ -291,7 +293,7 @@ impl AppView {
             .child(
                 TitleIconButton::new(
                     "results-back-button",
-                    icons::BACK,
+                    icons::BACK.as_bytes(),
                     palette.primary,
                     palette.window_btn_hover,
                 )
@@ -304,15 +306,20 @@ impl AppView {
             .into_any_element()
     }
 
-    fn render_mobile_appbar(&mut self, palette: Palette, cx: &mut Context<Self>) -> AnyElement {
+    fn render_mobile_appbar(
+        &mut self,
+        route: Route,
+        palette: Palette,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let entity = cx.entity();
         let theme_entity = entity.clone();
         let settings_entity = entity.clone();
         let theme_icon = self.theme_icon();
 
-        let title = match self.route {
+        let title = match route {
             Route::Settings | Route::Results => {
-                let text = if self.route == Route::Settings {
+                let text = if route == Route::Settings {
                     "设置"
                 } else {
                     "解析结果"
@@ -336,33 +343,19 @@ impl AppView {
                 .flex()
                 .items_center()
                 .gap(px(4.0))
-                .child(
-                    div()
-                        .w(px(26.0))
-                        .h(px(26.0))
-                        .rounded_full()
-                        .bg(palette.primary)
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .child(widgets::icon(icons::PLAY, 20.0, palette.bg)),
-                )
-                .child(
-                    div()
-                        .min_w(px(0.0))
-                        .text_size(px(crate::theme::title_font_size()))
-                        .font_weight(FontWeight::BOLD)
-                        .text_color(palette.primary)
-                        .truncate()
-                        .child(APP_NAME),
-                )
+                .child(home_logo())
+                .child(div().min_w(px(0.0)).child(crate::widgets::gradient_text(
+                    crate::widgets::GRADIENT_TITLE,
+                    crate::widgets::GRADIENT_TITLE_WIDTH,
+                    crate::widgets::GRADIENT_TITLE_HEIGHT,
+                )))
                 .into_any_element(),
         };
 
-        let leading = match self.route {
+        let leading = match route {
             Route::Settings => TitleIconButton::new(
                 "back-button",
-                icons::BACK,
+                icons::BACK.as_bytes(),
                 palette.primary,
                 palette.window_btn_hover,
             )
@@ -372,7 +365,7 @@ impl AppView {
             .into_any_element(),
             Route::Results => TitleIconButton::new(
                 "results-back-button",
-                icons::BACK,
+                icons::BACK.as_bytes(),
                 palette.primary,
                 palette.window_btn_hover,
             )
@@ -383,48 +376,53 @@ impl AppView {
             Route::Home => div().w(px(0.0)).into_any_element(),
         };
 
-        let horizontal_padding = match self.route {
-            Route::Settings | Route::Results => 8.0,
-            Route::Home => 12.0,
+        let (left_padding, right_padding) = match route {
+            Route::Settings | Route::Results => (8.0, 8.0),
+            Route::Home => (32.0, 28.0),
+        };
+
+        let trailing = if route == Route::Home {
+            div()
+                .flex()
+                .items_center()
+                .gap(px(4.0))
+                .child(
+                    TitleIconButton::new(
+                        "theme-button",
+                        theme_icon,
+                        palette.primary,
+                        palette.window_btn_hover,
+                    )
+                    .on_click(move |_, _, cx| {
+                        theme_entity.update(cx, |this, cx| this.cycle_theme(cx));
+                    }),
+                )
+                .child(
+                    TitleIconButton::new(
+                        "settings-button",
+                        icons::SETTINGS.as_bytes(),
+                        palette.primary,
+                        palette.window_btn_hover,
+                    )
+                    .on_click(move |_, _, cx| {
+                        settings_entity.update(cx, |this, cx| this.open_settings(cx));
+                    }),
+                )
+                .into_any_element()
+        } else {
+            div().w(px(32.0)).h(px(32.0)).into_any_element()
         };
 
         div()
             .h(px(MOBILE_APPBAR_HEIGHT))
             .w_full()
-            .pl(px(horizontal_padding))
-            .pr(px(8.0))
+            .pl(px(left_padding))
+            .pr(px(right_padding))
             .flex()
             .items_center()
             .child(leading)
             .child(title)
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(4.0))
-                    .child(
-                        TitleIconButton::new(
-                            "theme-button",
-                            theme_icon,
-                            palette.primary,
-                            palette.window_btn_hover,
-                        )
-                        .on_click(move |_, _, cx| {
-                            theme_entity.update(cx, |this, cx| this.cycle_theme(cx));
-                        }),
-                    )
-                    .child(
-                        TitleIconButton::new(
-                            "settings-button",
-                            icons::SETTINGS,
-                            palette.primary,
-                            palette.window_btn_hover,
-                        )
-                        .on_click(move |_, _, cx| {
-                            settings_entity.update(cx, |this, cx| this.open_settings(cx));
-                        }),
-                    ),
-            )
+            .child(trailing)
             .into_any_element()
     }
 }

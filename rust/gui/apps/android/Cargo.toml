@@ -1,11 +1,11 @@
 [package]
-name = "douyin-parser-android"
+name = "reels-android"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [lib]
-name = "douyin_parser_android"
+name = "reels_android"
 crate-type = ["cdylib"]
 
 [dependencies]

@@ -1,11 +1,11 @@
 [package]
-name = "douyin-parser"
+name = "reels"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "抖音视频解析"
+name = "短视频解析"
 path = "src/main.rs"
 
 [dependencies]
@@ -14,5 +14,13 @@ gpui.workspace = true
 gpui-miniapp.workspace = true
 douyin-ui = { path = "../../crates/ui" }
 
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
+
 [target.'cfg(target_os = "macos")'.dependencies]
 gpui-macos = { workspace = true, features = ["runtime_shaders"] }
+objc = "0.2.7"
+block = "0.1.6"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Globalization", "Win32_Media_Audio", "Win32_System_Com", "Win32_System_Ole", "Win32_System_Variant"] }

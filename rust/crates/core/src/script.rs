@@ -63,12 +63,7 @@ pub fn build_scripts(entries: &[ScriptEntry], is_windows: bool) -> Vec<Generated
         used_names.push(download_name.clone());
         let download_name = format!("{download_name}.{download_ext}");
         for (tool_index, tool) in TOOLS.iter().enumerate() {
-            commands[tool_index].push(build_command(
-                tool,
-                &entry.url,
-                &download_name,
-                is_windows,
-            ));
+            commands[tool_index].push(build_command(tool, &entry.url, &download_name, is_windows));
         }
     }
     TOOLS
@@ -211,7 +206,9 @@ mod tests {
         assert!(names.contains(&"把手机借给我，不是把... - 把手机借给我，不是把..._aria2c.sh"));
         let aria = &scripts[0];
         assert!(aria.contents.contains("'把手机借给我，不是把手机给我.mp4'"));
-        assert!(aria.contents.contains("'把手机借给我，不是把手机给我_2.mp4'"));
+        assert!(aria
+            .contents
+            .contains("'把手机借给我，不是把手机给我_2.mp4'"));
     }
 
     #[test]
@@ -247,10 +244,7 @@ mod tests {
     #[test]
     fn every_tool_script_contains_all_entries() {
         let scripts = build_scripts(
-            &[
-                entry("a", "https://x/1"),
-                entry("b", "https://x/2"),
-            ],
+            &[entry("a", "https://x/1"), entry("b", "https://x/2")],
             false,
         );
         for script in &scripts {
@@ -295,6 +289,8 @@ mod tests {
             false,
         );
         assert!(scripts[0].contents.contains("'livephoto 图.heic'"));
-        assert!(scripts[0].contents.contains("'https://sns-img-hw.xhscdn.com/abc'"));
+        assert!(scripts[0]
+            .contents
+            .contains("'https://sns-img-hw.xhscdn.com/abc'"));
     }
 }

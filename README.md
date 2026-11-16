@@ -1,4 +1,4 @@
-# 抖音视频解析（Rust / GPUI）
+# 短视频解析（Rust / GPUI）
 
 `rust` 分支只包含 Rust + GPUI 实现及其平台工程。
 
@@ -17,34 +17,34 @@
 
 ```bash
 cd rust/gui
-cargo run --locked -p douyin-parser
+cargo run --locked -p reels
 ```
 
 Release 模式运行：
 
 ```bash
 cd rust/gui
-cargo run --release --locked -p douyin-parser
+cargo run --release --locked -p reels
 ```
 
 指定界面显示的版本号：
 
 ```bash
 cd rust/gui
-APP_VERSION=1.0.3 cargo run --release --locked -p douyin-parser
+APP_VERSION=1.0.3 cargo run --release --locked -p reels
 ```
 
 只构建可执行文件：
 
 ```bash
 cd rust/gui
-cargo build --release --locked -p douyin-parser
+cargo build --release --locked -p reels
 ```
 
 产物位置：
 
-- macOS / Linux：`rust/gui/target/release/抖音视频解析`
-- Windows：`rust/gui/target/release/抖音视频解析.exe`
+- macOS / Linux：`rust/gui/target/release/短视频解析`
+- Windows：`rust/gui/target/release/短视频解析.exe`
 
 ## 检查
 
@@ -54,8 +54,27 @@ cargo test --locked
 cargo fmt --all -- --check
 
 cd gui
-cargo check --locked -p douyin-parser
+cargo check --locked -p reels
 cargo fmt --all -- --check
 ```
 
 首次编译会下载较大的 GPUI Git 依赖，耗时取决于网络。
+
+## Android Release 签名
+
+CI 发布 `assembleRelease` 时从以下 GitHub Actions Secrets 读取签名材料：
+
+- `ANDROID_KEYSTORE_BASE64`：PKCS#12 keystore 的 Base64 内容。
+- `ANDROID_KEYSTORE_PASSWORD`：keystore 密码。
+- `ANDROID_KEY_ALIAS`：key alias。
+- `ANDROID_KEY_PASSWORD`：key 密码。
+
+本地签名使用 `rust/gui/apps/android/android/keystore.properties`，该文件和
+`.secrets/` 下的密钥材料均已被 Git 忽略。Base64 可用以下命令生成：
+
+```bash
+base64 < reels-release.jks | tr -d '\n'
+```
+
+PR 构建没有 Secrets 时会回退到 debug 签名；push、tag 和手动触发缺少 Secrets
+会直接失败，避免误发布 debug 签名的 APK。

@@ -126,13 +126,24 @@ fn merge_cookies(session: String, user: Option<&str>) -> String {
         .filter(|pair| pair.contains('='))
         .collect();
     let mut merged: Vec<String> = Vec::new();
-    let user_name = |pair: &str| pair.split('=').next().unwrap_or("").trim().to_ascii_lowercase();
+    let user_name = |pair: &str| {
+        pair.split('=')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase()
+    };
     for existing in session.split(';') {
         let existing = existing.trim();
         if existing.is_empty() || !existing.contains('=') {
             continue;
         }
-        let name = existing.split('=').next().unwrap_or("").trim().to_ascii_lowercase();
+        let name = existing
+            .split('=')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
         if user_pairs.iter().any(|pair| user_name(pair) == name) {
             continue;
         }
@@ -422,14 +433,9 @@ fn extract_images(image_list: Option<&Value>, client: &HttpClient) -> Vec<XhsIma
         let segments: Vec<&str> = before_suffix.split('/').filter(|s| !s.is_empty()).collect();
         // 与 xhs_app 一致：note 相关目录（如 notes_pre_post）保留目录
         // 并使用 ci.xiaohongshu.com，其余取最后一段使用 sns-img-hw。
-        let note_start = segments
-            .iter()
-            .position(|segment| segment.contains("note"));
+        let note_start = segments.iter().position(|segment| segment.contains("note"));
         let (base, key) = match note_start {
-            Some(index) => (
-                IMAGE_NOTE_CDN,
-                segments[index..].join("/"),
-            ),
+            Some(index) => (IMAGE_NOTE_CDN, segments[index..].join("/")),
             None => match segments.last() {
                 Some(key) => (IMAGE_CDN, (*key).to_string()),
                 None => continue,
@@ -549,7 +555,10 @@ mod tests {
         let client = HttpClient::new().unwrap();
         let videos = extract_videos(&note, &client);
         assert_eq!(videos.len(), 1);
-        assert_eq!(videos[0].url, "https://sns-video-bd.xhscdn.com/spectrum/key2");
+        assert_eq!(
+            videos[0].url,
+            "https://sns-video-bd.xhscdn.com/spectrum/key2"
+        );
         assert_eq!(videos[0].duration, Some(25));
     }
 
@@ -577,7 +586,9 @@ mod tests {
             Some("https://www.xiaohongshu.com/explore/def".to_string())
         );
         assert_eq!(
-            normalize_profile_url("https://www.xiaohongshu.com/explore/6773508e0000000009015fa0?xsec_token=1"),
+            normalize_profile_url(
+                "https://www.xiaohongshu.com/explore/6773508e0000000009015fa0?xsec_token=1"
+            ),
             None
         );
     }

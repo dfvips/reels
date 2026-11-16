@@ -432,16 +432,21 @@ unsafe extern "C" fn looper_callback(fd: RawFd, _events: i32, data: *mut std::ff
     }
 
     // Run all queued tasks.
+    let mut drained = 0usize;
     loop {
         let task = {
             let mut q = queue_arc.lock();
             q.tasks.pop_front()
         };
         match task {
-            Some(f) => f(),
+            Some(f) => {
+                drained += 1;
+                f()
+            }
             None => break,
         }
     }
+    log::debug!("looper_callback fired: drained={} tasks", drained);
 
     // Leak the Arc again so it isn't freed — the data pointer lifetime is
     // managed by `AndroidDispatcher`.

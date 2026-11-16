@@ -25,7 +25,7 @@ pub struct MediaEntry {
     pub extension: Option<String>,
     pub duration_secs: Option<u64>,
     pub size_bytes: Option<u64>,
-    /// 清晰度标签（xhs: RAW/HD；抖音: 1080P 等）。
+    /// 清晰度标签（xhs: 原画/HD；抖音: 原画/2160P 等）。
     pub quality: Option<String>,
     pub width: Option<u64>,
     pub height: Option<u64>,
@@ -135,7 +135,7 @@ impl VideoExtractor {
                             extension: Some("mp4".to_string()),
                             duration_secs: video.duration,
                             size_bytes: video.size,
-                            quality: video.quality_type,
+                            quality: xhs_quality(video.quality_type.as_deref()),
                             width: video.width,
                             height: video.height,
                         })
@@ -161,10 +161,7 @@ impl VideoExtractor {
                     .flat_map(|image| {
                         let mut entries = vec![MediaEntry {
                             url: image.raw_url.clone(),
-                            extension: image
-                                .extension
-                                .clone()
-                                .or_else(|| Some("jpg".to_string())),
+                            extension: image.extension.clone().or_else(|| Some("jpg".to_string())),
                             size_bytes: self.http.head_content_length(&image.raw_url),
                             width: image.width,
                             height: image.height,
@@ -192,11 +189,9 @@ impl VideoExtractor {
                     entries,
                 )
             }
-            Err(error) => ExtractionResult::failure(
-                url,
-                MediaPlatform::Xhs,
-                format!("解析失败: {error}"),
-            ),
+            Err(error) => {
+                ExtractionResult::failure(url, MediaPlatform::Xhs, format!("解析失败: {error}"))
+            }
         }
     }
 
@@ -231,36 +226,119 @@ impl VideoExtractor {
 
         // 首选：签名接口（不依赖页面结构）
         if let Some(detail) = self.api.fetch_aweme_detail(&aweme_id) {
-            let Some(video_url) = detail.play_urls.first().cloned() else {
-                return ExtractionResult::failure(
-                    url,
-                    MediaPlatform::Douyin,
-                    "无法获取视频播放链接",
-                );
+            // 原画优先：play_addr.uri 通过 aweme/v1/play 会重定向到
+            // tos-cn-v-0015c002 原画（通常为 4K/H.265，远大于 web 播放地址）。
+            // 接口失败时回退到 web play_addr。
+            let original_url = detail
+                .play_uri
+                .as_deref()
+                .and_then(|video_id| self.http.get_final_video_url(video_id))
+                .filter(|video_url| !video_url.contains("aweme.snssdk.com"));
+            let (video_url, is_original) = match original_url {
+                Some(video_url) => (video_url, true),
+                None => {
+                    let Some(video_url) = detail.play_urls.first().cloned() else {
+                        return ExtractionResult::failure(
+                            url,
+                            MediaPlatform::Douyin,
+                            "无法获取视频播放链接",
+                        );
+                    };
+                    (video_url, false)
+                }
             };
-            let size_bytes = detail.size_bytes.or_else(|| self.http.head_content_length(&video_url));
-            let entry = MediaEntry {
-                url: video_url,
-                extension: None,
-                duration_secs: detail.duration_ms.map(|ms| ms / 1000),
-                size_bytes,
-                quality: gear_quality(detail.quality.as_deref()),
-                width: detail.width,
-                height: detail.height,
-            };
+            let duration_secs = detail.duration_ms.map(|ms| ms / 1000);
+            let mut entries = Vec::new();
+            if is_original {
+                entries.push(MediaEntry {
+                    url: video_url.clone(),
+                    extension: None,
+                    duration_secs,
+                    size_bytes: self.http.head_content_length(&video_url),
+                    quality: Some("原画".to_string()),
+                    width: detail.width,
+                    height: detail.height,
+                });
+            } else {
+                let matched = detail
+                    .bit_rates
+                    .iter()
+                    .find(|bit_rate| bit_rate.url.as_deref() == Some(video_url.as_str()));
+                entries.push(MediaEntry {
+                    url: video_url.clone(),
+                    extension: None,
+                    duration_secs,
+                    size_bytes: matched
+                        .and_then(|bit_rate| bit_rate.size_bytes)
+                        .or_else(|| self.http.head_content_length(&video_url)),
+                    quality: matched
+                        .and_then(|bit_rate| {
+                            bit_rate_quality(bit_rate.quality.as_deref(), bit_rate.height)
+                        })
+                        .or_else(|| gear_quality(detail.quality.as_deref())),
+                    width: matched.and_then(|bit_rate| bit_rate.width),
+                    height: matched.and_then(|bit_rate| bit_rate.height),
+                });
+            }
+
+            let mut seen_resolutions: Vec<(u64, u64)> = Vec::new();
+            for bit_rate in &detail.bit_rates {
+                let Some(bit_rate_url) = bit_rate.url.clone() else {
+                    continue;
+                };
+                let (Some(width), Some(height)) = (bit_rate.width, bit_rate.height) else {
+                    continue;
+                };
+                if seen_resolutions.contains(&(width, height)) {
+                    continue;
+                }
+                if entries.iter().any(|entry| entry.url == bit_rate_url) {
+                    continue;
+                }
+                seen_resolutions.push((width, height));
+                entries.push(MediaEntry {
+                    url: bit_rate_url.clone(),
+                    extension: None,
+                    duration_secs,
+                    size_bytes: bit_rate
+                        .size_bytes
+                        .or_else(|| self.http.head_content_length(&bit_rate_url)),
+                    quality: bit_rate_quality(bit_rate.quality.as_deref(), Some(height)),
+                    width: Some(width),
+                    height: Some(height),
+                });
+            }
+
+            if entries.len() > 1 {
+                let first = entries.remove(0);
+                entries.sort_by_key(|entry| {
+                    (
+                        std::cmp::Reverse(entry.height.unwrap_or(0)),
+                        std::cmp::Reverse(entry.width.unwrap_or(0)),
+                    )
+                });
+                entries.insert(0, first);
+            }
+
             return ExtractionResult::success(
                 url,
                 MediaPlatform::Douyin,
                 MediaKind::Video,
                 detail.desc,
-                vec![entry],
+                entries,
             );
         }
 
         // 回退：分享页 HTML 流程
         let html = match self.http.fetch_html(&page_url) {
             Ok(html) => html,
-            Err(err) => return ExtractionResult::failure(url, MediaPlatform::Douyin, format!("解析失败: {err}")),
+            Err(err) => {
+                return ExtractionResult::failure(
+                    url,
+                    MediaPlatform::Douyin,
+                    format!("解析失败: {err}"),
+                )
+            }
         };
         let Some(video_id) = url_parser::extract_video_id(&html) else {
             return ExtractionResult::failure(url, MediaPlatform::Douyin, "无法获取视频播放链接");
@@ -301,6 +379,20 @@ fn gear_quality(gear: Option<&str>) -> Option<String> {
         return None;
     }
     Some(format!("{best}P"))
+}
+
+fn bit_rate_quality(gear: Option<&str>, height: Option<u64>) -> Option<String> {
+    gear_quality(gear).or_else(|| height.map(|height| format!("{height}P")))
+}
+
+fn xhs_quality(quality: Option<&str>) -> Option<String> {
+    quality.map(|quality| {
+        if quality == "RAW" {
+            "原画".to_string()
+        } else {
+            quality.to_string()
+        }
+    })
 }
 
 fn non_empty_title(title: &str) -> Option<String> {

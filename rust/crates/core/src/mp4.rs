@@ -158,22 +158,16 @@ mod tests {
     fn sample_moov(video_dims: (u32, u32), audio_dims: (u32, u32)) -> Vec<u8> {
         let mut payload = Vec::new();
         payload.extend_from_slice(&box_bytes(b"mvhd", &[0u8; 100]));
-        payload.extend_from_slice(&box_bytes(
-            b"trak",
-            &{
-                let mut trak = tkhd_bytes(video_dims.0, video_dims.1);
-                trak.extend_from_slice(&box_bytes(b"mdia", &[0u8; 16]));
-                trak
-            },
-        ));
-        payload.extend_from_slice(&box_bytes(
-            b"trak",
-            &{
-                let mut trak = tkhd_bytes(audio_dims.0, audio_dims.1);
-                trak.extend_from_slice(&box_bytes(b"mdia", &[0u8; 16]));
-                trak
-            },
-        ));
+        payload.extend_from_slice(&box_bytes(b"trak", &{
+            let mut trak = tkhd_bytes(video_dims.0, video_dims.1);
+            trak.extend_from_slice(&box_bytes(b"mdia", &[0u8; 16]));
+            trak
+        }));
+        payload.extend_from_slice(&box_bytes(b"trak", &{
+            let mut trak = tkhd_bytes(audio_dims.0, audio_dims.1);
+            trak.extend_from_slice(&box_bytes(b"mdia", &[0u8; 16]));
+            trak
+        }));
         box_bytes(b"moov", &payload)
     }
 

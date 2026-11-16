@@ -186,6 +186,12 @@ impl AndroidDisplay {
         self.scale_factor
     }
 
+    pub fn set_scale_factor(&mut self, scale_factor: f32) {
+        if scale_factor.is_finite() && scale_factor > 0.0 {
+            self.scale_factor = scale_factor;
+        }
+    }
+
     /// Approximate screen density in dots-per-inch.
     pub fn dpi(&self) -> i32 {
         (self.scale_factor * DENSITY_DEFAULT as f32).round() as i32
@@ -293,6 +299,10 @@ impl DisplayList {
     /// Returns the primary (first) display.
     pub fn primary(&self) -> Option<&AndroidDisplay> {
         self.displays.first()
+    }
+
+    pub fn primary_mut(&mut self) -> Option<&mut AndroidDisplay> {
+        self.displays.first_mut()
     }
 
     /// Returns all displays.

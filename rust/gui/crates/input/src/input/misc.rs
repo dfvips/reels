@@ -1,6 +1,4 @@
-use super::EDIT_STATES;
-use super::FOCUS_HANDLES;
-use super::TEXT_ORIGINS;
+use super::{EDIT_STATES, FOCUS_HANDLES, FOCUS_SUBS, INPUT_ENTITIES, TEXT_ORIGINS};
 use gpui::Keystroke;
 
 const MAX_THREAD_LOCAL_INPUT_STATES: usize = 1000;
@@ -82,10 +80,19 @@ pub fn input_state_count() -> (usize, usize, usize) {
 /// This removes all thread-local state for all Input components.
 /// Use with caution - this will reset all input editing state.
 pub fn clear_all_input_states() {
+    FOCUS_SUBS.with(|subs| {
+        subs.borrow_mut().clear();
+    });
     FOCUS_HANDLES.with(|handles| {
         handles.borrow_mut().clear();
     });
     EDIT_STATES.with(|states| {
         states.borrow_mut().clear();
+    });
+    TEXT_ORIGINS.with(|origins| {
+        origins.borrow_mut().clear();
+    });
+    INPUT_ENTITIES.with(|entities| {
+        entities.borrow_mut().clear();
     });
 }

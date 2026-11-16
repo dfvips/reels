@@ -143,6 +143,16 @@ impl EditState {
         }
     }
 
+    /// Seed a non-editing buffer from a controlled value. Reopening a dialog
+    /// uses this so no draft, selection, undo history or focus survives.
+    pub(super) fn new_fresh(value: &str) -> Self {
+        Self {
+            editing: false,
+            text: value.to_string(),
+            ..Self::default()
+        }
+    }
+
     /// Convert a character index to the byte index of the start of that character.
     /// Returns `self.text.len()` if `char_idx` is past the end of the text.
     fn char_index_to_byte(&self, char_idx: usize) -> usize {

@@ -12,14 +12,12 @@ use crate::{icons, AppView, Dialog, Route, ToastKind, APP_VERSION};
 
 impl AppView {
     pub fn open_settings(&mut self, cx: &mut Context<Self>) {
-        self.route = Route::Settings;
         self.refresh_cache_info();
-        cx.notify();
+        self.navigate_to(Route::Settings, cx);
     }
 
     pub fn close_settings(&mut self, cx: &mut Context<Self>) {
-        self.route = Route::Home;
-        cx.notify();
+        self.navigate_back(cx);
     }
 
     pub fn theme_name(&self) -> &'static str {
@@ -38,11 +36,11 @@ impl AppView {
         }
     }
 
-    pub fn theme_icon(&self) -> &'static str {
+    pub fn theme_icon(&self) -> &'static [u8] {
         match self.settings.theme_mode.as_str() {
-            "light" => icons::SUN,
-            "dark" => icons::MOON,
-            _ => icons::CONTRAST,
+            "light" => icons::SUN.as_bytes(),
+            "dark" => icons::MOON.as_bytes(),
+            _ => icons::CONTRAST.as_bytes(),
         }
     }
 
@@ -62,22 +60,44 @@ impl AppView {
     }
 
     pub fn clear_cache(&mut self, cx: &mut Context<Self>) {
-        let result = crate::download::clear_cache(&self.paths.cache_dir);
+        let mut cache_dirs = vec![self.paths.cache_dir.clone()];
+        cache_dirs.extend(self.paths.legacy_cache_dirs());
+        cache_dirs.extend(crate::paths::leftover_download_files());
+        cache_dirs.sort();
+        cache_dirs.dedup();
+        let mut errors = Vec::new();
+        for path in cache_dirs {
+            if !path.exists() {
+                continue;
+            }
+            let result = if path.is_dir() {
+                crate::download::clear_cache(&path)
+            } else {
+                std::fs::remove_file(&path).map_err(|error| error.to_string())
+            };
+            if let Err(error) = result {
+                errors.push(format!("{}: {error}", path.display()));
+            }
+        }
         self.refresh_cache_info();
-        let (success, message, details) = match result {
-            Ok(()) => (
+        let (success, message, details) = if errors.is_empty() && self.cache_size == 0 {
+            (
                 true,
-                "缓存清理完成".to_string(),
+                "缓存已清理".to_string(),
+                vec![format!("当前剩余缓存: {}", format_size(self.cache_size))],
+            )
+        } else if !errors.is_empty() {
+            errors.push(format!("当前剩余缓存: {}", format_size(self.cache_size)));
+            (false, "清除缓存失败:".to_string(), errors)
+        } else {
+            (
+                false,
+                "仍有缓存未能清理:".to_string(),
                 self.cache_paths
                     .iter()
-                    .map(|path| format!("🗑️ {path}"))
+                    .map(|path| format!("• {path}"))
                     .collect(),
-            ),
-            Err(error) => (
-                false,
-                format!("清除缓存失败: {error}"),
-                vec![format!("❌ {error}")],
-            ),
+            )
         };
         self.dialog = Some(Dialog::ClearCacheResult {
             success,
@@ -103,10 +123,11 @@ impl AppView {
                 self.render_item(
                     palette,
                     "settings-storage",
-                    icons::FOLDER,
+                    icons::FOLDER.as_bytes(),
                     "存储设置",
                     "设置视频保存的默认位置",
-                    move |cx| {
+                    move |window, cx| {
+                        window.blur(cx);
                         entity.update(cx, |this, cx| {
                             this.open_save_location_dialog(cx);
                         });
@@ -119,7 +140,7 @@ impl AppView {
 
         let entity = cx.entity();
         let cookie_status = if self.settings.xhs_cookie.trim().is_empty() {
-            "未设置（默认留白）"
+            "未设置"
         } else {
             "已设置（用于小红书解析）"
         };
@@ -127,10 +148,11 @@ impl AppView {
             self.render_item(
                 palette,
                 "settings-cookie",
-                icons::LOCK,
+                icons::LOCK.as_bytes(),
                 "Cookie 设置",
                 &format!("仅用于小红书 · {cookie_status}"),
-                move |cx| {
+                move |window, cx| {
+                    window.blur(cx);
                     entity.update(cx, |this, cx| {
                         this.open_xhs_cookie_dialog(cx);
                     });
@@ -145,10 +167,11 @@ impl AppView {
             self.render_item(
                 palette,
                 "settings-help",
-                icons::HELP,
+                icons::HELP.as_bytes(),
                 "使用说明",
                 "查看支持的链接格式与使用方式",
-                move |cx| {
+                move |window, cx| {
+                    window.blur(cx);
                     entity.update(cx, |this, cx| {
                         this.dialog = Some(Dialog::Help);
                         cx.notify();
@@ -164,10 +187,11 @@ impl AppView {
             self.render_item(
                 palette,
                 "settings-about",
-                icons::INFO,
+                icons::INFO.as_bytes(),
                 "关于",
                 &format!("应用版本: {APP_VERSION}"),
-                move |cx| {
+                move |window, cx| {
+                    window.blur(cx);
                     entity.update(cx, |this, cx| {
                         this.dialog = Some(Dialog::About);
                         cx.notify();
@@ -188,10 +212,11 @@ impl AppView {
             self.render_item(
                 palette,
                 "settings-cache",
-                icons::TRASH,
+                icons::TRASH.as_bytes(),
                 "清除缓存",
                 &cache_subtitle,
-                move |cx| {
+                move |window, cx| {
+                    window.blur(cx);
                     entity.update(cx, |this, cx| {
                         this.dialog = Some(Dialog::ClearCache);
                         cx.notify();
@@ -214,10 +239,10 @@ impl AppView {
         &self,
         palette: Palette,
         id: &'static str,
-        icon: &'static str,
+        icon: &'static [u8],
         title: &str,
         subtitle: &str,
-        on_click: impl Fn(&mut gpui::App) + 'static,
+        on_click: impl Fn(&mut Window, &mut gpui::App) + 'static,
     ) -> impl IntoElement {
         let handler = std::rc::Rc::new(on_click);
         div()
@@ -229,13 +254,13 @@ impl AppView {
             .items_center()
             .cursor_pointer()
             .hover(move |style| style.bg(palette.window_btn_hover))
-            .on_click(move |_, _, cx| {
-                handler(cx);
+            .on_click(move |_, window, cx| {
+                handler(window, cx);
             })
             .child(
                 div()
                     .mr(px(16.0))
-                    .child(widgets::icon(icon, 24.0, palette.primary)),
+                    .child(widgets::GradientIcon::new(icon, 24.0)),
             )
             .child(
                 div()

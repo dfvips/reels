@@ -1,39 +1,42 @@
-name: DouyinParser
+name: Reels
 options:
   bundleIdPrefix: com.dreamfly
   deploymentTarget:
-    iOS: "15.0"
+    iOS: "18.0"
   createIntermediateGroups: true
 
 settings:
   base:
     SWIFT_VERSION: "5.0"
-    IPHONEOS_DEPLOYMENT_TARGET: "15.0"
-    SWIFT_OBJC_BRIDGING_HEADER: DouyinParser/BridgingHeader.h
+    IPHONEOS_DEPLOYMENT_TARGET: "18.0"
+    SWIFT_OBJC_BRIDGING_HEADER: Reels/BridgingHeader.h
     EXCLUDED_ARCHS[sdk=iphonesimulator*]: x86_64
     ENABLE_BITCODE: NO
 
 targets:
-  DouyinParser:
+  Reels:
     type: application
     platform: iOS
     sources:
-      - path: DouyinParser
+      - path: Reels
         excludes:
           - Info.plist
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.dreamfly.douyinParser
-        PRODUCT_NAME: 抖音视频解析
-        INFOPLIST_FILE: DouyinParser/Info.plist
-        GENERATE_INFOPLIST_FILE: NO
+        PRODUCT_BUNDLE_IDENTIFIER: com.dreamfly.reels
+        PRODUCT_NAME: Reels
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ASSETCATALOG_COMPILER_INCLUDE_ALL_APPICON_ASSETS: YES
+        MARKETING_VERSION: "1.0.25"
+        CURRENT_PROJECT_VERSION: "25"
+        INFOPLIST_FILE: Reels/Info.plist
+        GENERATE_INFOPLIST_FILE: NO
         LIBRARY_SEARCH_PATHS:
           - "$(PROJECT_DIR)/lib"
         DEAD_CODE_STRIPPING: NO
         OTHER_LDFLAGS:
           - "-force_load"
-          - "$(PROJECT_DIR)/lib/libdouyin_parser_ios.a"
+          - "$(PROJECT_DIR)/lib/libreels_ios.a"
           - "-framework"
           - "Metal"
           - "-framework"
@@ -48,6 +51,8 @@ targets:
           - "CoreFoundation"
           - "-framework"
           - "UIKit"
+          - "-framework"
+          - "Photos"
           - "-framework"
           - "Foundation"
           - "-framework"

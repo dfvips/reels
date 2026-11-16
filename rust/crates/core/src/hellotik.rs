@@ -40,7 +40,8 @@ const PARSE_VERSION: u32 = 1;
 const RESPONSE_SALT: &str = "93838338562359368888868323563256";
 
 const USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36";
-const SEC_CH_UA: &str = "\"Chromium\";v=\"146\", \"Not-A.Brand\";v=\"24\", \"Google Chrome\";v=\"146\"";
+const SEC_CH_UA: &str =
+    "\"Chromium\";v=\"146\", \"Not-A.Brand\";v=\"24\", \"Google Chrome\";v=\"146\"";
 
 static CLIENT: LazyLock<Client> = LazyLock::new(|| {
     Client::builder()
@@ -69,15 +70,15 @@ fn request_headers() -> HeaderMap {
     headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-cache"));
     headers.insert(ORIGIN, HeaderValue::from_static("https://www.hellotik.app"));
     headers.insert(PRAGMA, HeaderValue::from_static("no-cache"));
-    headers.insert(REFERER, HeaderValue::from_static("https://www.hellotik.app/zh/rednote"));
+    headers.insert(
+        REFERER,
+        HeaderValue::from_static("https://www.hellotik.app/zh/rednote"),
+    );
     headers.insert("User-Agent", HeaderValue::from_static(USER_AGENT));
     headers.insert("sec-ch-ua", HeaderValue::from_static(SEC_CH_UA));
     headers.insert("sec-ch-ua-mobile", HeaderValue::from_static("?0"));
     headers.insert("sec-ch-ua-platform", HeaderValue::from_static("\"macOS\""));
-    headers.insert(
-        "sec-fetch-dest",
-        HeaderValue::from_static("empty"),
-    );
+    headers.insert("sec-fetch-dest", HeaderValue::from_static("empty"));
     headers.insert("sec-fetch-mode", HeaderValue::from_static("cors"));
     headers.insert("sec-fetch-site", HeaderValue::from_static("same-origin"));
     headers
@@ -109,8 +110,14 @@ pub fn parse_video(url: &str) -> Result<HellotikMedia, String> {
         return Err(format_parse_error(&json));
     }
     let payload = if json.get("encrypt").and_then(Value::as_bool) == Some(true) {
-        let data = json.get("data").and_then(Value::as_str).ok_or("hellotik 响应缺少 data")?;
-        let key = json.get("key").and_then(Value::as_str).ok_or("hellotik 响应缺少 key")?;
+        let data = json
+            .get("data")
+            .and_then(Value::as_str)
+            .ok_or("hellotik 响应缺少 data")?;
+        let key = json
+            .get("key")
+            .and_then(Value::as_str)
+            .ok_or("hellotik 响应缺少 key")?;
         decrypt_response(data, key)?
     } else {
         json.get("data").cloned().ok_or("hellotik 响应缺少 data")?
@@ -274,10 +281,12 @@ fn decode_transform(raw: &[u8]) -> Result<Vec<u8>, String> {
     let reversed = block_reverse(&xored);
     let remapped: Vec<u8> = reversed
         .iter()
-        .map(|byte| match CUSTOM_ALPHABET.iter().position(|c| c == byte) {
-            Some(index) => STANDARD_ALPHABET[index],
-            None => *byte,
-        })
+        .map(
+            |byte| match CUSTOM_ALPHABET.iter().position(|c| c == byte) {
+                Some(index) => STANDARD_ALPHABET[index],
+                None => *byte,
+            },
+        )
         .collect();
     BASE64
         .decode(&remapped)
@@ -310,7 +319,8 @@ fn aes_cbc_decrypt(key: &[u8], iv: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>, 
     if key.len() != 32 || iv.len() != 16 || ciphertext.is_empty() || ciphertext.len() % 16 != 0 {
         return Err("hellotik AES-CBC 参数无效".to_string());
     }
-    let cipher = Aes256::new_from_slice(key).map_err(|_| "hellotik AES-CBC 初始化失败".to_string())?;
+    let cipher =
+        Aes256::new_from_slice(key).map_err(|_| "hellotik AES-CBC 初始化失败".to_string())?;
     let mut plaintext = Vec::with_capacity(ciphertext.len());
     let mut previous = iv.to_vec();
     for block in ciphertext.chunks(16) {
@@ -396,10 +406,12 @@ mod tests {
         let b64 = BASE64.encode(raw);
         let remapped: Vec<u8> = b64
             .bytes()
-            .map(|byte| match STANDARD_ALPHABET.iter().position(|c| *c == byte) {
-                Some(index) => CUSTOM_ALPHABET[index],
-                None => byte,
-            })
+            .map(
+                |byte| match STANDARD_ALPHABET.iter().position(|c| *c == byte) {
+                    Some(index) => CUSTOM_ALPHABET[index],
+                    None => byte,
+                },
+            )
             .collect();
         let reversed = block_reverse(&remapped);
         let xored: Vec<u8> = reversed.iter().map(|byte| byte ^ 90).collect();
@@ -490,9 +502,15 @@ mod tests {
 
     #[test]
     fn envelope_gcm_roundtrip() {
-        let envelope =
-            build_envelope("https://www.xiaohongshu.com/x", "uwx_123456abcdXY", "Other", "", "TK", "SD")
-                .unwrap();
+        let envelope = build_envelope(
+            "https://www.xiaohongshu.com/x",
+            "uwx_123456abcdXY",
+            "Other",
+            "",
+            "TK",
+            "SD",
+        )
+        .unwrap();
         let value: Value = serde_json::from_str(&envelope).unwrap();
         assert_eq!(value["tk_e5eea8"], "TK");
         assert_eq!(value["vr_e5eea8"], 1);
@@ -536,4 +554,3 @@ mod tests {
         assert_eq!(media.url, "https://v/big.mp4");
     }
 }
-

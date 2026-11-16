@@ -1,7 +1,38 @@
 import java.io.File
+import java.io.FileInputStream
+import java.util.Properties
 
 plugins {
     id("com.android.application")
+}
+
+val keystoreProperties = Properties().apply {
+    val file = rootProject.file("keystore.properties")
+    if (file.isFile) {
+        FileInputStream(file).use { load(it) }
+    }
+}
+
+fun signingValue(envName: String, propertyName: String): String? =
+    System.getenv(envName)?.takeIf { it.isNotBlank() }
+        ?: keystoreProperties.getProperty(propertyName)?.takeIf { it.isNotBlank() }
+
+val releaseStoreFile = signingValue("ANDROID_KEYSTORE_PATH", "storeFile")
+val releaseStorePassword = signingValue("ANDROID_KEYSTORE_PASSWORD", "storePassword")
+val releaseKeyAlias = signingValue("ANDROID_KEY_ALIAS", "keyAlias")
+val releaseKeyPassword = signingValue("ANDROID_KEY_PASSWORD", "keyPassword")
+val hasReleaseSigning = !releaseStoreFile.isNullOrBlank()
+
+if (hasReleaseSigning) {
+    check(!releaseStorePassword.isNullOrBlank()) {
+        "缺少 ANDROID_KEYSTORE_PASSWORD 或 keystore.properties 中的 storePassword"
+    }
+    check(!releaseKeyAlias.isNullOrBlank()) {
+        "缺少 ANDROID_KEY_ALIAS 或 keystore.properties 中的 keyAlias"
+    }
+    check(!releaseKeyPassword.isNullOrBlank()) {
+        "缺少 ANDROID_KEY_PASSWORD 或 keystore.properties 中的 keyPassword"
+    }
 }
 
 fun findGpuiAndroidJava(): File {
@@ -20,11 +51,11 @@ fun findGpuiAndroidJava(): File {
 }
 
 android {
-    namespace = "com.dreamfly.douyinParser"
+    namespace = "com.dreamfly.reels"
     compileSdk = 35
 
     defaultConfig {
-        applicationId = "com.dreamfly.douyinParser"
+        applicationId = "com.dreamfly.reels"
         minSdk = 26
         targetSdk = 35
         versionCode = (project.findProperty("douyinVersionCode") as String? ?: "1").toInt()
@@ -39,7 +70,18 @@ android {
             abiFilters += requestedAbis
         }
 
-        manifestPlaceholders["nativeLibraryName"] = "douyin_parser_android"
+        manifestPlaceholders["nativeLibraryName"] = "reels_android"
+    }
+
+    signingConfigs {
+        create("release") {
+            if (hasReleaseSigning) {
+                storeFile = rootProject.file(releaseStoreFile!!)
+                storePassword = releaseStorePassword
+                keyAlias = releaseKeyAlias
+                keyPassword = releaseKeyPassword
+            }
+        }
     }
 
     buildTypes {
@@ -49,7 +91,11 @@ android {
         }
         release {
             isMinifyEnabled = false
-            signingConfig = signingConfigs.getByName("debug")
+            signingConfig = if (hasReleaseSigning) {
+                signingConfigs.getByName("release")
+            } else {
+                signingConfigs.getByName("debug")
+            }
         }
     }
 
@@ -63,13 +109,14 @@ android {
     packaging {
         jniLibs {
             keepDebugSymbols += listOf(
-                "*/armeabi-v7a/libdouyin_parser_android.so",
-                "*/arm64-v8a/libdouyin_parser_android.so",
+                "*/armeabi-v7a/libreels_android.so",
+                "*/arm64-v8a/libreels_android.so",
             )
         }
     }
 }
 
 dependencies {
+    implementation("androidx.core:core-splashscreen:1.0.1")
     testImplementation("junit:junit:4.13.2")
 }

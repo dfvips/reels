@@ -25,7 +25,7 @@ mod imp {
         android_logger::init_once(
             android_logger::Config::default()
                 .with_max_level(log::LevelFilter::Info)
-                .with_tag("douyin-parser"),
+                .with_tag("reels"),
         );
         std::panic::set_hook(Box::new(|info| {
             log::error!("GPUI Android panic: {info}");

@@ -1,12 +1,12 @@
 //! HTML、重定向与播放地址请求。
 
 use std::io::Read;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use reqwest::blocking::Client;
 use reqwest::header::{
-    HeaderMap, HeaderValue, ACCEPT, ACCEPT_LANGUAGE, CONTENT_LENGTH, CONTENT_TYPE, COOKIE, LOCATION,
-    RANGE, SET_COOKIE, USER_AGENT,
+    HeaderMap, HeaderValue, ACCEPT, ACCEPT_LANGUAGE, CONTENT_LENGTH, CONTENT_TYPE, COOKIE,
+    LOCATION, RANGE, SET_COOKIE, USER_AGENT,
 };
 use url::Url;
 
@@ -46,10 +46,7 @@ impl HttpClient {
     ) -> Result<(String, String), String> {
         let mut current = url.to_string();
         for _ in 0..5 {
-            let mut request = self
-                .client
-                .get(&current)
-                .headers(headers.clone());
+            let mut request = self.client.get(&current).headers(headers.clone());
             if let Some(cookie) = cookie {
                 request = request.header(COOKIE, cookie);
             }
@@ -151,7 +148,7 @@ impl HttpClient {
     pub fn get_final_video_url(&self, video_id: &str) -> Option<String> {
         let url = crate::url_parser::generate_video_url(video_id);
         if let Some(location) = self.get_redirect_url(&url) {
-            return Some(location);
+            return Some(ensure_dy_q(location));
         }
         let response = self.client.get(&url).headers(ios_headers()).send().ok()?;
         if matches!(response.status().as_u16(), 301 | 302) {
@@ -159,10 +156,30 @@ impl HttpClient {
                 .headers()
                 .get(LOCATION)
                 .and_then(|value| value.to_str().ok())
-                .map(str::to_string);
+                .map(|value| ensure_dy_q(value.to_string()));
         }
         Some(url)
     }
+}
+
+/// CDN 地址有时缺少 `dy_q` 参数，补上当前时间戳可避免部分网络下
+/// 直接访问或下载失败。
+fn ensure_dy_q(url: String) -> String {
+    let Ok(mut parsed) = Url::parse(&url) else {
+        return url;
+    };
+    if parsed.query_pairs().any(|(key, _)| key == "dy_q") {
+        return url;
+    }
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    parsed
+        .query_pairs_mut()
+        .append_pair("dy_q", &timestamp.to_string())
+        .append_pair("dy_va_biz_cert", "");
+    parsed.to_string()
 }
 
 fn collect_set_cookies(response: &reqwest::blocking::Response) -> String {
@@ -210,4 +227,22 @@ fn resolve_url(base: &str, location: &str) -> Result<String, String> {
         .and_then(|url| url.join(location))
         .map(|url| url.to_string())
         .map_err(|err| format!("重定向地址解析失败: {err}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ensure_dy_q;
+
+    #[test]
+    fn appends_dy_q_when_missing() {
+        let url = ensure_dy_q("https://example.com/video/".to_string());
+        assert!(url.contains("dy_q="));
+        assert!(url.ends_with("dy_va_biz_cert="));
+    }
+
+    #[test]
+    fn keeps_existing_dy_q() {
+        let url = "https://example.com/video/?dy_q=1&dy_va_biz_cert=".to_string();
+        assert_eq!(ensure_dy_q(url.clone()), url);
+    }
 }

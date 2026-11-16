@@ -1,8 +1,16 @@
 target/
 **/build/
+**/build-*/
+**/DerivedData/
+**/*.xcodeproj/
+**/*.xcworkspace/
+**/*.xcresult/
 **/lib/*.a
-**/DouyinParser.xcodeproj/
+**/lib/*.dylib
+**/lib/*.so
 **/jniLibs/
 **/.gradle/
+**/.cxx/
 **/local.properties
 **/*.iml
+**/Payload/

@@ -52,4 +52,5 @@ ndk = { version = "0.9", features = ["nativewindow"] }
 ndk-context = "0.1"
 ndk-sys = "0.6"
 rustc-hash = "2"
+ttf-parser = "0.25"
 uuid = { version = "1", features = ["v5"] }

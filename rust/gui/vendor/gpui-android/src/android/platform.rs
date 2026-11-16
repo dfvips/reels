@@ -46,6 +46,7 @@ use std::{
     cell::RefCell,
     collections::HashMap,
     ffi::OsString,
+    fs,
     io::Read,
     path::{Path, PathBuf},
     rc::Rc,
@@ -86,6 +87,122 @@ const THERMAL_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 fn thermal_check_is_due(last_check: Option<Instant>, now: Instant) -> bool {
     last_check.is_none_or(|last_check| now.duration_since(last_check) >= THERMAL_POLL_INTERVAL)
+}
+
+fn system_font_file_from_xml(xml: &str) -> Option<PathBuf> {
+    let xml = xml
+        .split("<!--")
+        .enumerate()
+        .filter_map(|(index, chunk)| {
+            (index == 0)
+                .then_some(chunk)
+                .or_else(|| chunk.split_once("-->").map(|(_, remainder)| remainder))
+        })
+        .collect::<String>();
+
+    let mut first_default_family = None;
+    let mut requested_family = None;
+    let mut offset = 0;
+    while let Some(start) = find_xml_family_tag(&xml, offset) {
+        let Some(open_end) = xml[start..].find('>').map(|index| start + index) else {
+            break;
+        };
+        let Some(close_start) = xml[open_end..]
+            .find("</family>")
+            .map(|index| open_end + index)
+        else {
+            break;
+        };
+
+        let attributes = &xml[start..=open_end];
+        let family = &xml[open_end + 1..close_start];
+        if first_default_family.is_none() && !attributes.contains("name=") {
+            first_default_family = Some(family);
+        }
+        if attributes.contains("name=\"sans-serif\"") {
+            requested_family = Some(family);
+            break;
+        }
+        offset = close_start + "</family>".len();
+    }
+
+    let family = requested_family.or(first_default_family)?;
+    let font_start = family.find("<font")?;
+    let font_open_end = family[font_start..].find('>')? + font_start;
+    let font_contents = family[font_open_end + 1..].trim_start();
+    let file_name = font_contents
+        .split_once('<')
+        .map(|(file_name, _)| file_name)
+        .unwrap_or(font_contents)
+        .trim();
+    if file_name.is_empty() {
+        return None;
+    }
+
+    let file = Path::new(file_name);
+    if file.is_absolute() {
+        Some(file.to_path_buf())
+    } else {
+        Some(Path::new("/system/fonts").join(file))
+    }
+}
+
+fn find_xml_family_tag(xml: &str, offset: usize) -> Option<usize> {
+    let mut search_from = offset;
+    while let Some(relative_start) = xml[search_from..].find("<family") {
+        let start = search_from + relative_start;
+        let tag_end = start + "<family".len();
+        match xml[tag_end..].chars().next() {
+            Some(character) if character.is_ascii_whitespace() || character == '>' => {
+                return Some(start);
+            }
+            Some(_) => search_from = tag_end,
+            None => return None,
+        }
+    }
+    None
+}
+
+fn font_family_name(path: &Path) -> Option<String> {
+    let data = fs::read(path).ok()?;
+    let face = ttf_parser::Face::parse(&data, 0).ok()?;
+    let mut typographic_family = None;
+    let mut family = None;
+    for name in face.names() {
+        if !name.is_unicode() {
+            continue;
+        }
+        if name.name_id == ttf_parser::name_id::TYPOGRAPHIC_FAMILY && typographic_family.is_none() {
+            typographic_family = name.to_string();
+        } else if name.name_id == ttf_parser::name_id::FAMILY && family.is_none() {
+            family = name.to_string();
+        }
+    }
+    typographic_family.or(family)
+}
+
+fn android_system_ui_font() -> Option<(PathBuf, String)> {
+    let font_paths = [
+        "/system/etc/fonts.xml",
+        "/data/system/fonts/theme_webview/fonts.xml",
+    ];
+    for config_path in font_paths {
+        let Ok(xml) = fs::read_to_string(config_path) else {
+            continue;
+        };
+        let Some(font_path) = system_font_file_from_xml(&xml) else {
+            continue;
+        };
+        if !font_path.is_file() {
+            continue;
+        }
+        let Some(family) = font_family_name(&font_path) else {
+            continue;
+        };
+        log::info!("Android system UI font: {family} ({})", font_path.display());
+        return Some((font_path, family));
+    }
+    None
 }
 
 thread_local! {
@@ -566,12 +683,17 @@ impl AndroidPlatform {
             AndroidDispatcher::new()
         };
 
-        let text_system = Arc::new(CosmicTextSystem::new("Roboto"));
+        let system_ui_font = android_system_ui_font();
+        let system_font_family = system_ui_font
+            .as_ref()
+            .map(|(_, family)| family.as_str())
+            .unwrap_or("Roboto");
+        let text_system = Arc::new(CosmicTextSystem::new(system_font_family));
 
         // Load Android system fonts so GPUI's fallback chain can resolve.
         // GPUI tries ".SystemUIFont" → ".ZedMono" → … → "Noto Sans" → "DejaVu Sans" → "Arial".
-        // Android ships Roboto and DroidSans in /system/fonts/.  We load them
-        // explicitly because cosmic-text's fontdb may not scan Android paths.
+        // Android does not expose its fonts through fontconfig, so load both
+        // the configured system UI font and common fallback files explicitly.
         {
             let font_paths: &[&str] = &[
                 // Core UI fonts
@@ -593,6 +715,13 @@ impl AndroidPlatform {
                 "/system/fonts/NotoSans-Bold.ttf",
                 "/system/fonts/NotoSans-Italic.ttf",
                 "/system/fonts/NotoSans-BoldItalic.ttf",
+                // Vendor locale fallbacks. Android's EditText uses these after
+                // the primary sans-serif face, so GPUI must load the same
+                // files to keep mixed CJK/Latin glyph advances and caret hit
+                // testing aligned with the native editor.
+                "/system/fonts/MiSansVF.ttf",
+                "/system/fonts/MiSansTCVF.ttf",
+                "/system/fonts/MiSansLatinVF.ttf",
                 "/system/fonts/NotoSansCJK-Regular.ttc",
                 "/system/fonts/NotoSansDevanagari-Regular.otf",
                 "/system/fonts/NotoSansArabic-Regular.ttf",
@@ -608,11 +737,16 @@ impl AndroidPlatform {
                 "/system/fonts/NotoSerif-Regular.ttf",
                 "/system/fonts/NotoSerif-Bold.ttf",
             ];
-            let available_font_paths = font_paths
+            let mut available_font_paths = font_paths
                 .iter()
                 .map(std::path::Path::new)
                 .filter(|path| path.is_file())
                 .collect::<Vec<_>>();
+            if let Some((path, _)) = system_ui_font.as_ref()
+                && !available_font_paths.contains(&path.as_path())
+            {
+                available_font_paths.insert(0, path.as_path());
+            }
             if let Err(error) = text_system.add_font_paths(available_font_paths.iter().copied()) {
                 log::warn!("failed to add system font paths: {error:#}");
             }
@@ -1016,6 +1150,13 @@ impl AndroidPlatform {
         state.displays = DisplayList::single(display);
     }
 
+    pub fn update_primary_display_scale(&self, scale_factor: f32) {
+        let mut state = self.state.lock();
+        if let Some(display) = state.displays.primary_mut() {
+            display.set_scale_factor(scale_factor);
+        }
+    }
+
     // ── clipboard ─────────────────────────────────────────────────────────────
 
     /// Write `text` to the clipboard.
@@ -1370,7 +1511,12 @@ impl AndroidPlatform {
     ///
     /// Useful in headless tests where there is no real ALooper.
     pub fn flush_main_thread_tasks(&self) {
-        self.state.lock().dispatcher.flush_main_thread_tasks();
+        // A queued task may itself query the platform (for example, the
+        // WindowInsets callback asks for the primary window). Holding the
+        // platform-state lock while running tasks makes that re-entry
+        // deadlock on parking_lot::Mutex and blocks the native event loop.
+        let dispatcher = self.state.lock().dispatcher.clone();
+        dispatcher.flush_main_thread_tasks();
     }
 }
 
@@ -2295,6 +2441,20 @@ mod tests {
     fn flush_main_thread_tasks_no_panic() {
         // There are no tasks queued, so this should be a no-op.
         headless().flush_main_thread_tasks();
+    }
+
+    #[test]
+    fn flush_main_thread_tasks_allows_platform_reentry() {
+        let platform = Arc::new(headless());
+        let task_platform = Arc::clone(&platform);
+        platform
+            .foreground_executor()
+            .dispatch_on_main_thread(move || {
+                // The real WindowInsets task calls primary_window(). This
+                // must not deadlock while the queued task is being drained.
+                assert_eq!(task_platform.window_count(), 0);
+            });
+        platform.flush_main_thread_tasks();
     }
 
     // ── tick ─────────────────────────────────────────────────────────────────

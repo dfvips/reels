@@ -17,8 +17,10 @@ static XHS_SHORT_LINK: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)https?://xhslink\.(?:com|cn)/[/\w]+").unwrap());
 
 static XHS_PAGE_LINK: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)https?://[\w.-]*xiaohongshu\.com/(?:explore|discovery/item|user/profile)/[^\s'<>]+")
-        .unwrap()
+    Regex::new(
+        r"(?i)https?://[\w.-]*xiaohongshu\.com/(?:explore|discovery/item|user/profile)/[^\s'<>]+",
+    )
+    .unwrap()
 });
 
 static TRAILING_PUNCTUATION: &[char] = &[

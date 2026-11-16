@@ -17,15 +17,40 @@ concurrency:
   cancel-in-progress: true
 
 permissions:
-  contents: write
+  contents: read
 
 env:
-  PROJECT_SLUG: douyin_parser
-  PRODUCT_NAME: 抖音视频解析
+  PROJECT_SLUG: reels
+  PRODUCT_NAME: 短视频解析
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
 jobs:
+  # ================================================================== 检查
+  check:
+    name: format & core tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust -> target
+
+      - name: Check formatting
+        working-directory: rust
+        run: |
+          cargo fmt --all -- --check
+          cargo fmt --all --manifest-path gui/Cargo.toml -- --check
+
+      - name: Run core tests
+        working-directory: rust
+        run: cargo test --locked
+
   # ================================================================== 版本
   version:
     name: resolve version
@@ -152,7 +177,7 @@ jobs:
           RUSTFLAGS: "-C target-feature=+crt-static"
         run: |
           cargo build --release --manifest-path rust/gui/Cargo.toml `
-            --locked -p douyin-parser --target ${{ matrix.target }}
+            --locked -p reels --target ${{ matrix.target }}
           if ($LASTEXITCODE -ne 0) { throw "cargo build 失败" }
 
           $exe = "rust/gui/target/${{ matrix.target }}/release/${{ env.PRODUCT_NAME }}.exe"
@@ -250,7 +275,7 @@ jobs:
           APP_VERSION: ${{ needs.version.outputs.base }}
         run: |
           cargo build --release --manifest-path rust/gui/Cargo.toml \
-            --locked -p douyin-parser --target ${{ matrix.target }}
+            --locked -p reels --target ${{ matrix.target }}
 
       - name: Assemble & sign macOS app bundle
         env:
@@ -264,8 +289,10 @@ jobs:
           mkdir -p "${APP}/Contents/MacOS" "${APP}/Contents/Resources"
           cp "rust/gui/target/${{ matrix.target }}/release/${PRODUCT_NAME}" \
             "${APP}/Contents/MacOS/${PRODUCT_NAME}"
-          cp rust/assets/macos.icns \
+          cp rust/assets/logo/logo.icns \
             "${APP}/Contents/Resources/AppIcon.icns"
+          cp rust/assets/logo/logo-dark.icns \
+            "${APP}/Contents/Resources/AppIconDark.icns"
 
           cat > "${APP}/Contents/Info.plist" <<PLIST
           <?xml version="1.0" encoding="UTF-8"?>
@@ -276,7 +303,7 @@ jobs:
             <key>CFBundleDisplayName</key><string>${PRODUCT_NAME}</string>
             <key>CFBundleExecutable</key><string>${PRODUCT_NAME}</string>
             <key>CFBundleIconFile</key><string>AppIcon</string>
-            <key>CFBundleIdentifier</key><string>com.dreamfly.douyinParser</string>
+            <key>CFBundleIdentifier</key><string>com.dreamfly.reels</string>
             <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
             <key>CFBundleName</key><string>${PRODUCT_NAME}</string>
             <key>CFBundlePackageType</key><string>APPL</string>
@@ -380,6 +407,11 @@ jobs:
     needs: version
     name: ${{ matrix.label }}
     runs-on: ubuntu-latest
+    env:
+      ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+      ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+      ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+      ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
     strategy:
       fail-fast: false
       matrix:
@@ -415,21 +447,49 @@ jobs:
         with:
           workspaces: rust/gui -> target
 
+      - name: Configure Android release signing
+        run: |
+          set -euo pipefail
+          if [[ -z "${ANDROID_KEYSTORE_BASE64:-}" ]]; then
+            if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+              echo "::warning::PR 未配置 Android release secrets，使用 debug 签名"
+              exit 0
+            fi
+            echo "::error::缺少 Android release 签名 secrets"
+            exit 1
+          fi
+          for name in ANDROID_KEYSTORE_PASSWORD ANDROID_KEY_ALIAS ANDROID_KEY_PASSWORD; do
+            if [[ -z "${!name:-}" ]]; then
+              echo "::error::缺少 ${name}"
+              exit 1
+            fi
+          done
+          KEYSTORE="${RUNNER_TEMP}/reels-release.keystore"
+          printf '%s' "${ANDROID_KEYSTORE_BASE64}" | base64 --decode > "${KEYSTORE}"
+          if [[ ! -s "${KEYSTORE}" ]]; then
+            echo "::error::ANDROID_KEYSTORE_BASE64 解码后为空"
+            exit 1
+          fi
+          keytool -list -keystore "${KEYSTORE}" \
+            -storepass "${ANDROID_KEYSTORE_PASSWORD}" \
+            -alias "${ANDROID_KEY_ALIAS}" >/dev/null
+          echo "ANDROID_KEYSTORE_PATH=${KEYSTORE}" >> "$GITHUB_ENV"
+
       - name: Build native libraries
         env:
           APP_VERSION: ${{ needs.version.outputs.base }}
         run: |
           set -euo pipefail
-          ABI_ARGS=""
+          ABI_ARGS=()
           ABI_LIST="${{ matrix.abis }}"
           ABI_LIST="${ABI_LIST//,/ }"
           for abi in ${ABI_LIST}; do
-            ABI_ARGS="${ABI_ARGS} -t ${abi}"
+            ABI_ARGS+=(-t "${abi}")
           done
           cd rust/gui
-          cargo ndk ${ABI_ARGS} -P 26 \
+          cargo ndk "${ABI_ARGS[@]}" -P 26 \
             -o apps/android/android/app/src/main/jniLibs \
-            build --release --locked -p douyin-parser-android
+            build --release --locked -p reels-android
 
       - name: Build APK
         run: |
@@ -454,13 +514,31 @@ jobs:
             echo "::error::未生成 APK"
             exit 1
           fi
-          cp "${APK}" "${GITHUB_WORKSPACE}/${PROJECT_SLUG}-${{ matrix.label }}.apk"
-          ls -lh "${GITHUB_WORKSPACE}/${PROJECT_SLUG}-${{ matrix.label }}.apk"
+          cp "${APK}" "${GITHUB_WORKSPACE}/${PRODUCT_NAME}.apk"
+          ls -lh "${GITHUB_WORKSPACE}/${PRODUCT_NAME}.apk"
+
+      - name: Verify APK signature
+        run: |
+          set -euo pipefail
+          APK="${GITHUB_WORKSPACE}/${PRODUCT_NAME}.apk"
+          APKSIGNER="$(find "${ANDROID_HOME}/build-tools" -type f -name apksigner \
+            | sort -V | tail -n 1)"
+          if [[ -z "${APKSIGNER}" || ! -x "${APKSIGNER}" ]]; then
+            echo "::error::未找到 apksigner"
+            exit 1
+          fi
+          CERT_INFO="$("${APKSIGNER}" verify --print-certs "${APK}")"
+          if [[ "${{ github.event_name }}" != "pull_request" ]] \
+            && grep -Fq "CN=Android Debug" <<< "${CERT_INFO}"; then
+            echo "::error::release APK 仍使用 debug 签名"
+            exit 1
+          fi
+          grep -F "Signer #1 certificate DN" <<< "${CERT_INFO}" || true
 
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ env.PROJECT_SLUG }}-${{ matrix.label }}
-          path: ${{ env.PROJECT_SLUG }}-${{ matrix.label }}.apk
+          path: ${{ env.PRODUCT_NAME }}.apk
           if-no-files-found: error
           retention-days: 30
 
@@ -485,9 +563,9 @@ jobs:
           APP_VERSION: ${{ needs.version.outputs.base }}
         run: |
           cargo build --release --manifest-path rust/gui/Cargo.toml \
-            --locked -p douyin-parser-ios --target aarch64-apple-ios
+            --locked -p reels-ios --target aarch64-apple-ios
           mkdir -p rust/gui/apps/ios/ios/lib
-          cp rust/gui/target/aarch64-apple-ios/release/libdouyin_parser_ios.a \
+          cp rust/gui/target/aarch64-apple-ios/release/libreels_ios.a \
             rust/gui/apps/ios/ios/lib/
 
       - name: Build unsigned IPA
@@ -500,8 +578,8 @@ jobs:
           cd rust/gui/apps/ios/ios
           xcodegen generate
           xcodebuild \
-            -project DouyinParser.xcodeproj \
-            -scheme DouyinParser \
+            -project Reels.xcodeproj \
+            -scheme Reels \
             -configuration Release \
             -sdk iphoneos \
             -destination 'generic/platform=iOS' \
@@ -518,10 +596,90 @@ jobs:
             echo "::error::未找到 .app 产物"
             exit 1
           fi
+          if [[ ! -f "${APP}/Assets.car" ]]; then
+            echo "::error::iOS AppIcon 资源未编译进 .app"
+            exit 1
+          fi
+          ICON_NAME="$(/usr/libexec/PlistBuddy \
+            -c 'Print :CFBundleIcons:CFBundlePrimaryIcon:CFBundleIconName' \
+            "${APP}/Info.plist")"
+          if [[ "${ICON_NAME}" != "AppIcon" ]]; then
+            echo "::error::Info.plist 未声明 AppIcon，实际值：${ICON_NAME}"
+            exit 1
+          fi
+          for ICON in AppIconDark AppIconLight; do
+            ICON_FILE="$(/usr/libexec/PlistBuddy \
+              -c "Print :CFBundleIcons:CFBundleAlternateIcons:${ICON}:CFBundleIconFiles:0" \
+              "${APP}/Info.plist")"
+            if [[ "${ICON_FILE}" != "${ICON}" ]]; then
+              echo "::error::iOS Info.plist 未声明 ${ICON} 替代图标，实际值：${ICON_FILE}"
+              exit 1
+            fi
+          done
+          python3 - "${APP}/Assets.car" <<'PY'
+          import json
+          import subprocess
+          import sys
+
+          info = json.loads(
+              subprocess.check_output(
+                  ["xcrun", "assetutil", "--info", sys.argv[1]],
+                  text=True,
+              )
+          )
+          icons = {
+              (entry.get("Name"), entry.get("Appearance"))
+              for entry in info
+              if entry.get("AssetType") == "Icon Image"
+          }
+          required = {
+              ("AppIcon", None),
+              ("AppIcon", "UIAppearanceDark"),
+              ("AppIcon", "ISAppearanceTintable"),
+              ("AppIconDark", None),
+              ("AppIconDark", "UIAppearanceDark"),
+              ("AppIconDark", "ISAppearanceTintable"),
+              ("AppIconLight", None),
+              ("AppIconLight", "UIAppearanceDark"),
+              ("AppIconLight", "ISAppearanceTintable"),
+          }
+          missing = sorted(str(item) for item in required - icons)
+          if missing:
+              raise SystemExit(
+                  "::error::iOS 图标变体缺失：" + ", ".join(missing)
+              )
+          expected_sources = {
+              ("AppIcon", None): "Icon-App-1024x1024@1x.png",
+              ("AppIcon", "UIAppearanceDark"): "dark-Icon-App-1024x1024@1x.png",
+              ("AppIcon", "ISAppearanceTintable"): "tinted-Icon-App-1024x1024@1x.png",
+              ("AppIconLight", None): "Icon-App-1024x1024@1x.png",
+              ("AppIconLight", "UIAppearanceDark"): "dark-Icon-App-1024x1024@1x.png",
+              ("AppIconLight", "ISAppearanceTintable"): "tinted-Icon-App-1024x1024@1x.png",
+              ("AppIconDark", None): "Icon-App-1024x1024@1x.png",
+              ("AppIconDark", "UIAppearanceDark"): "dark-Icon-App-1024x1024@1x.png",
+              ("AppIconDark", "ISAppearanceTintable"): "tinted-Icon-App-1024x1024@1x.png",
+          }
+          renditions = {}
+          for entry in info:
+              if entry.get("AssetType") != "Icon Image":
+                  continue
+              renditions.setdefault(
+                  (entry.get("Name"), entry.get("Appearance")), set()
+              ).add(entry.get("RenditionName"))
+          wrong = {
+              key: sorted(renditions.get(key, {"missing"}))
+              for key, expected in expected_sources.items()
+              if renditions.get(key) != {expected}
+          }
+          if wrong:
+              raise SystemExit(
+                  f"::error::iOS 图标变体来源不符合预期：{wrong}"
+              )
+          PY
           rm -rf Payload
           mkdir Payload
           cp -R "${APP}" Payload/
-          IPA="${GITHUB_WORKSPACE}/${PROJECT_SLUG}-ios-unsigned.ipa"
+          IPA="${GITHUB_WORKSPACE}/${PRODUCT_NAME}.ipa"
           python3 - "${IPA}" <<'PY'
           import os
           import sys
@@ -542,16 +700,18 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ env.PROJECT_SLUG }}-ios-unsigned
-          path: ${{ env.PROJECT_SLUG }}-ios-unsigned.ipa
+          path: ${{ env.PRODUCT_NAME }}.ipa
           if-no-files-found: error
           retention-days: 30
 
   # ================================================================== Release
   release:
     name: publish release
-    needs: [version, windows, macos, android, ios]
+    needs: [check, version, windows, macos, android, ios]
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -562,14 +722,14 @@ jobs:
           set -euo pipefail
           mkdir -p release
 
-          # Windows：zip 内只有一个「抖音视频解析.exe」
-          cp artifacts/douyin_parser-win-x64/douyin_parser-win-x64.zip release/
-          cp artifacts/douyin_parser-win-x86/douyin_parser-win-x86.zip release/
-          cp artifacts/douyin_parser-win-arm64/douyin_parser-win-arm64.zip release/
+          # Windows：zip 内只有一个「短视频解析.exe」
+          cp artifacts/reels-win-x64/reels-win-x64.zip release/
+          cp artifacts/reels-win-x86/reels-win-x86.zip release/
+          cp artifacts/reels-win-arm64/reels-win-arm64.zip release/
 
-          # macOS：zip 内只有一个「抖音视频解析.dmg」
-          cp artifacts/douyin_parser-mac-x64/douyin_parser-mac-x64.zip release/
-          cp artifacts/douyin_parser-mac-arm64/douyin_parser-mac-arm64.zip release/
+          # macOS：zip 内只有一个「短视频解析.dmg」
+          cp artifacts/reels-mac-x64/reels-mac-x64.zip release/
+          cp artifacts/reels-mac-arm64/reels-mac-arm64.zip release/
 
           # Android / iOS：内部文件统一为中文名，zip 名保持英文+架构。
           python3 - <<'PY'
@@ -582,13 +742,13 @@ jobs:
           release = pathlib.Path("release")
 
           for abi in ("armv7", "armv8", "universal"):
-              source = root / f"douyin_parser-android-{abi}" / f"douyin_parser-android-{abi}.apk"
-              target = release / f"douyin_parser-android-{abi}.zip"
+              source = root / f"reels-android-{abi}" / f"{product}.apk"
+              target = release / f"reels-android-{abi}.zip"
               with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as zf:
                   zf.write(source, arcname=f"{product}.apk")
 
-          source = root / "douyin_parser-ios-unsigned" / "douyin_parser-ios-unsigned.ipa"
-          with zipfile.ZipFile(release / "douyin_parser-ios.zip", "w", zipfile.ZIP_DEFLATED) as zf:
+          source = root / "reels-ios-unsigned" / f"{product}.ipa"
+          with zipfile.ZipFile(release / "reels-ios.zip", "w", zipfile.ZIP_DEFLATED) as zf:
               zf.write(source, arcname=f"{product}.ipa")
           PY
 
@@ -600,15 +760,15 @@ jobs:
 
           product = os.environ["PRODUCT_NAME"]
           expected = {
-              "douyin_parser-win-x64.zip": [f"{product}.exe"],
-              "douyin_parser-win-x86.zip": [f"{product}.exe"],
-              "douyin_parser-win-arm64.zip": [f"{product}.exe"],
-              "douyin_parser-mac-x64.zip": [f"{product}.dmg"],
-              "douyin_parser-mac-arm64.zip": [f"{product}.dmg"],
-              "douyin_parser-android-armv7.zip": [f"{product}.apk"],
-              "douyin_parser-android-armv8.zip": [f"{product}.apk"],
-              "douyin_parser-android-universal.zip": [f"{product}.apk"],
-              "douyin_parser-ios.zip": [f"{product}.ipa"],
+              "reels-win-x64.zip": [f"{product}.exe"],
+              "reels-win-x86.zip": [f"{product}.exe"],
+              "reels-win-arm64.zip": [f"{product}.exe"],
+              "reels-mac-x64.zip": [f"{product}.dmg"],
+              "reels-mac-arm64.zip": [f"{product}.dmg"],
+              "reels-android-armv7.zip": [f"{product}.apk"],
+              "reels-android-armv8.zip": [f"{product}.apk"],
+              "reels-android-universal.zip": [f"{product}.apk"],
+              "reels-ios.zip": [f"{product}.ipa"],
           }
 
           for name, files in expected.items():
@@ -630,9 +790,20 @@ jobs:
           TAG: ${{ needs.version.outputs.tag }}
           VERSION: ${{ needs.version.outputs.base }}
         run: |
-          gh release create "$TAG" release/* \
-            -R "$GITHUB_REPOSITORY" \
-            --target "${{ github.sha }}" \
-            --title "抖音视频解析 $VERSION" \
-            --notes "GPUI 重写版自动构建 · ${{ github.event_name }} @ ${{ github.sha }}" \
-            --latest
+          set -euo pipefail
+          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" release/* \
+              -R "$GITHUB_REPOSITORY" --clobber
+            gh release edit "$TAG" \
+              -R "$GITHUB_REPOSITORY" \
+              --title "短视频解析 $VERSION" \
+              --notes "GPUI 重写版自动构建 · ${{ github.event_name }} @ ${{ github.sha }}" \
+              --latest
+          else
+            gh release create "$TAG" release/* \
+              -R "$GITHUB_REPOSITORY" \
+              --target "${{ github.sha }}" \
+              --title "短视频解析 $VERSION" \
+              --notes "GPUI 重写版自动构建 · ${{ github.event_name }} @ ${{ github.sha }}" \
+              --latest
+          fi

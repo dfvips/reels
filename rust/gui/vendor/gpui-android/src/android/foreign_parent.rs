@@ -347,6 +347,10 @@ pub fn android_foreign_key(
         log::warn!("GPUI Android foreign: ignoring key action {action}");
         return;
     }
+    if crate::native_editor_active() {
+        super::jni::dispatch_native_editor_key_android(action, key_code, meta_state);
+        return;
+    }
     let Some(editor) = clone_editor(editor_id) else {
         return;
     };

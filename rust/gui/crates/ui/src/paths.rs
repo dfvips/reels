@@ -31,8 +31,8 @@ impl AppPaths {
             let home = std::env::var_os("HOME")
                 .map(PathBuf::from)
                 .unwrap_or_else(std::env::temp_dir);
-            let config_dir = home.join(".config").join("douyin_parser");
-            let cache_dir = home.join("Library").join("Caches").join("douyin_parser");
+            let config_dir = home.join(".config").join("reels");
+            let cache_dir = home.join("Library").join("Caches").join("reels");
             let downloads = home.join("Documents");
             Self {
                 config_dir,
@@ -46,18 +46,18 @@ impl AppPaths {
             let config_dir = home
                 .join("Library")
                 .join("Application Support")
-                .join("com.dreamfly.douyinParser");
+                .join("com.dreamfly.reels");
             #[cfg(target_os = "windows")]
             let config_dir = std::env::var_os("APPDATA")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| home.clone())
                 .join("com.dreamfly")
-                .join("douyinParser");
+                .join("reels");
             #[cfg(not(any(target_os = "macos", target_os = "windows")))]
             let config_dir = std::env::var_os("XDG_CONFIG_HOME")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| home.join(".config"))
-                .join("douyin_parser");
+                .join("reels");
 
             let cache_dir = config_dir.join("cache");
             let default_download_dir = home.join("Downloads");
@@ -81,6 +81,74 @@ impl AppPaths {
 
     pub fn settings_file(&self) -> PathBuf {
         self.config_dir.join("settings.json")
+    }
+
+    /// 应用改名前（douyin_parser 时代）遗留的缓存目录，清理缓存时一并统计和删除。
+    pub fn legacy_cache_dirs(&self) -> Vec<PathBuf> {
+        let home = home_dir();
+        #[cfg(target_os = "ios")]
+        {
+            let mut paths = Vec::new();
+            for root in [
+                home.join("Library").join("Caches"),
+                home.join("Library").join("Application Support"),
+            ] {
+                for name in [
+                    "douyin_parser",
+                    "douyinParser",
+                    "douyin-parser",
+                    "com.dreamfly.douyinParser",
+                    "com.dreamfly.douyin-parser",
+                ] {
+                    paths.push(root.join(name));
+                }
+                if let Ok(entries) = std::fs::read_dir(&root) {
+                    for entry in entries.flatten() {
+                        let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+                        if name.contains("douyin") || name.contains("douyinparser") {
+                            paths.push(entry.path());
+                        }
+                    }
+                }
+            }
+            paths.push(home.join("Documents").join("douyin_parser"));
+            paths.sort();
+            paths.dedup();
+            paths
+        }
+        #[cfg(target_os = "android")]
+        {
+            Vec::new()
+        }
+        #[cfg(target_os = "macos")]
+        {
+            vec![home
+                .join("Library")
+                .join("Application Support")
+                .join("com.dreamfly.douyinParser")
+                .join("cache")]
+        }
+        #[cfg(target_os = "windows")]
+        {
+            vec![std::env::var_os("APPDATA")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| home.clone())
+                .join("com.dreamfly")
+                .join("douyinParser")
+                .join("cache")]
+        }
+        #[cfg(not(any(
+            target_os = "ios",
+            target_os = "android",
+            target_os = "macos",
+            target_os = "windows"
+        )))]
+        {
+            let config = std::env::var_os("XDG_CONFIG_HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| home.join(".config"));
+            vec![config.join("douyin_parser").join("cache")]
+        }
     }
 }
 
@@ -119,10 +187,105 @@ pub fn dir_size(path: &Path) -> u64 {
         if meta.is_dir() {
             total += dir_size(&entry.path());
         } else {
-            total += meta.len();
+            // 与系统存储统计口径一致：按实际占用的磁盘块计算，
+            // 预分配的分片文件未写入的部分（稀疏空洞）不计入。
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                total += meta.blocks() * 512;
+            }
+            #[cfg(not(unix))]
+            {
+                total += meta.len();
+            }
         }
     }
     total
+}
+
+/// 单个文件实际占用的磁盘字节数（与系统存储统计口径一致）。
+pub fn allocated_file_size(path: &Path) -> u64 {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return 0;
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        meta.blocks() * 512
+    }
+    #[cfg(not(unix))]
+    {
+        meta.len()
+    }
+}
+
+/// iOS 旧版本把下载成品直接留在沙盒 `Documents` 里，这些文件不在缓存目录
+/// 中，清理缓存时扫不到却一直占用系统“文稿与数据”空间。只挑下载产物的
+/// 后缀，避免误删用户自己放进去的其他文件。
+pub fn leftover_download_files() -> Vec<PathBuf> {
+    #[cfg(target_os = "ios")]
+    {
+        let home = home_dir();
+        let mut files = Vec::new();
+        for root in [
+            home.join("Documents"),
+            home.join("tmp"),
+            home.join("Library").join("Application Support"),
+        ] {
+            collect_download_artifacts(&root, &mut files);
+        }
+        files.sort();
+        files.dedup();
+        files
+    }
+    #[cfg(not(target_os = "ios"))]
+    {
+        Vec::new()
+    }
+}
+
+#[cfg(target_os = "ios")]
+fn collect_download_artifacts(directory: &Path, files: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if metadata.file_type().is_symlink() {
+            continue;
+        }
+        if metadata.is_dir() {
+            collect_download_artifacts(&path, files);
+            continue;
+        }
+        let extension = path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(str::to_ascii_lowercase);
+        if extension.as_deref().is_some_and(|extension| {
+            matches!(
+                extension,
+                "mp4"
+                    | "mov"
+                    | "m4v"
+                    | "jpg"
+                    | "jpeg"
+                    | "png"
+                    | "webp"
+                    | "heic"
+                    | "heif"
+                    | "gif"
+                    | "part"
+                    | "download"
+                    | "tmp"
+            )
+        }) {
+            files.push(path);
+        }
+    }
 }
 
 pub fn format_size(bytes: u64) -> String {
@@ -156,5 +319,29 @@ pub fn open_directory(path: &Path) {
     #[cfg(target_os = "linux")]
     {
         let _ = std::process::Command::new("xdg-open").arg(path).spawn();
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dir_size_reports_allocated_blocks_for_sparse_files() {
+        let directory = std::env::temp_dir().join("reels_sparse_test");
+        let _ = std::fs::create_dir_all(&directory);
+        let file = directory.join("sparse.part");
+        std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&file)
+            .and_then(|file| file.set_len(10 * 1024 * 1024))
+            .expect("pre-allocate sparse file");
+
+        let size = dir_size(&directory);
+        assert!(size < 1024 * 1024, "sparse file counted as {size} bytes");
+
+        let _ = std::fs::remove_dir_all(&directory);
     }
 }

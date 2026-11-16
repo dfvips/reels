@@ -46,7 +46,7 @@ use gpui::{Modifiers, MouseButton, MouseUpEvent, PlatformInput};
 
 #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 use crate::download_flow::has_multiple_video_qualities;
-use crate::paths::{format_size, is_desktop, is_windows};
+use crate::paths::{format_size, is_desktop};
 use crate::theme::Palette;
 use crate::widgets::{self, ActionButton};
 use crate::{icons, AppView, Dialog, ResourceScope, ResultItem, ToastKind, MOBILE_APPBAR_HEIGHT};
@@ -449,9 +449,8 @@ impl AppView {
             cx.notify();
             return;
         }
-        #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         {
-            let _ = is_windows;
             let has_quality_choice = self.results.iter().any(has_multiple_video_qualities);
             if has_quality_choice {
                 self.dialog = Some(Dialog::ExportSelection);
@@ -464,6 +463,7 @@ impl AppView {
         {
             self.dialog = Some(Dialog::ExportSelection);
         }
+        #[cfg(not(target_os = "windows"))]
         cx.notify();
     }
 
@@ -518,10 +518,12 @@ impl AppView {
     #[cfg(target_os = "windows")]
     pub fn confirm_idm_export(&mut self, scope: ResourceScope, cx: &mut Context<Self>) {
         self.dialog = None;
+        let xhs_cookie = self.settings.xhs_cookie.clone();
         let links: Vec<crate::IdmLink> = self
             .results
             .iter()
             .flat_map(|item| {
+                let xhs_cookie = xhs_cookie.clone();
                 let selected = item.select_entries(scope);
                 let mut used_names = std::collections::HashSet::new();
                 selected.into_iter().map(move |entry| {
@@ -545,9 +547,9 @@ impl AppView {
                     } else {
                         "https://www.douyin.com/"
                     };
-                    let cookie = (!self.settings.xhs_cookie.is_empty()
+                    let cookie = (!xhs_cookie.is_empty()
                         && referer == "https://www.xiaohongshu.com/")
-                        .then(|| self.settings.xhs_cookie.clone());
+                        .then(|| xhs_cookie.clone());
                     crate::IdmLink {
                         url: entry.url.clone(),
                         referer: referer.to_string(),

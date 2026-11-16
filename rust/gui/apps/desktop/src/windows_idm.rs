@@ -4,19 +4,17 @@ use std::ffi::c_void;
 use std::ptr;
 
 use douyin_ui::IdmLink;
-use windows_sys::core::{GUID, HRESULT, PWSTR};
+use windows_sys::core::{GUID, HRESULT};
 use windows_sys::Win32::Foundation::{SysAllocString, SysFreeString};
-use windows_sys::Win32::Globalization::LOCALE_USER_DEFAULT;
 use windows_sys::Win32::System::Com::{
     CLSIDFromProgID, CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_LOCAL_SERVER,
-    DISPATCH_METHOD, DISPPARAMS,
 };
 use windows_sys::Win32::System::Variant::{
-    VariantInit, VARIANT, VARIANT_0, VARIANT_0_0, VARIANT_0_0_0, VT_BSTR, VT_I4,
+    VariantInit, VARIANT, VARIANT_0, VARIANT_0_0, VARIANT_0_0_0, VT_BSTR,
 };
 
-const IID_NULL: GUID = GUID::from_u128(0);
-const IID_IDISPATCH: GUID = GUID::from_u128(0x00020400_0000_0000_c000_000000000046);
+const CLSID_CIDM_LINK_TRANSMITTER: GUID = GUID::from_u128(0xac746233_e9d3_49cd_862f_068f7b7ccca4);
+const IID_ICIDM_LINK_TRANSMITTER2: GUID = GUID::from_u128(0x94d09862_1875_4fc9_b434_91cf25c840a1);
 const IDM_FLAG_NO_CONFIRMATION: i32 = 1;
 const COINIT_APARTMENTTHREADED: u32 = 2;
 const RPC_E_CHANGED_MODE: HRESULT = 0x80010106_u32 as HRESULT;
@@ -24,37 +22,44 @@ const S_FALSE: HRESULT = 1;
 const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
 #[repr(C)]
-struct IdmDispatch {
-    vtable: *const IdmDispatchVtable,
+struct CidmLinkTransmitter2 {
+    vtable: *const CidmLinkTransmitter2Vtable,
 }
 
 #[repr(C)]
-struct IdmDispatchVtable {
-    query_interface:
-        unsafe extern "system" fn(*mut IdmDispatch, *const GUID, *mut *mut c_void) -> HRESULT,
-    add_ref: unsafe extern "system" fn(*mut IdmDispatch) -> u32,
-    release: unsafe extern "system" fn(*mut IdmDispatch) -> u32,
-    get_type_info_count: unsafe extern "system" fn(*mut IdmDispatch, *mut u32) -> HRESULT,
-    get_type_info:
-        unsafe extern "system" fn(*mut IdmDispatch, u32, u32, *mut *mut c_void) -> HRESULT,
-    get_ids_of_names: unsafe extern "system" fn(
-        *mut IdmDispatch,
+struct CidmLinkTransmitter2Vtable {
+    query_interface: unsafe extern "system" fn(
+        *mut CidmLinkTransmitter2,
         *const GUID,
-        *mut PWSTR,
-        u32,
-        u32,
-        *mut i32,
+        *mut *mut c_void,
     ) -> HRESULT,
-    invoke: unsafe extern "system" fn(
-        *mut IdmDispatch,
+    add_ref: unsafe extern "system" fn(*mut CidmLinkTransmitter2) -> u32,
+    release: unsafe extern "system" fn(*mut CidmLinkTransmitter2) -> u32,
+    send_link_to_idm: unsafe extern "system" fn(
+        *mut CidmLinkTransmitter2,
+        *const u16,
+        *const u16,
+        *const u16,
+        *const u16,
+        *const u16,
+        *const u16,
+        *const u16,
+        *const u16,
         i32,
-        *const GUID,
-        u32,
-        u16,
-        *mut DISPPARAMS,
-        *mut VARIANT,
-        *mut c_void,
-        *mut u32,
+    ) -> HRESULT,
+    send_link_to_idm2: unsafe extern "system" fn(
+        *mut CidmLinkTransmitter2,
+        *const u16,
+        *const u16,
+        *const u16,
+        *const u16,
+        *const u16,
+        *const u16,
+        *const u16,
+        *const u16,
+        i32,
+        VARIANT,
+        VARIANT,
     ) -> HRESULT,
 }
 
@@ -95,10 +100,6 @@ impl Bstr {
         }
     }
 
-    fn empty() -> Self {
-        Self(ptr::null())
-    }
-
     fn as_ptr(&self) -> *const u16 {
         self.0
     }
@@ -118,9 +119,8 @@ fn empty_variant() -> VARIANT {
     variant
 }
 
-fn variant_str(value: &str) -> Result<(Bstr, VARIANT), String> {
-    let bstr = Bstr::new(value)?;
-    let variant = VARIANT {
+fn bstr_variant(value: &Bstr) -> VARIANT {
+    VARIANT {
         Anonymous: VARIANT_0 {
             Anonymous: VARIANT_0_0 {
                 vt: VT_BSTR,
@@ -128,23 +128,8 @@ fn variant_str(value: &str) -> Result<(Bstr, VARIANT), String> {
                 wReserved2: 0,
                 wReserved3: 0,
                 Anonymous: VARIANT_0_0_0 {
-                    bstrVal: bstr.as_ptr(),
+                    bstrVal: value.as_ptr(),
                 },
-            },
-        },
-    };
-    Ok((bstr, variant))
-}
-
-fn variant_i4(value: i32) -> VARIANT {
-    VARIANT {
-        Anonymous: VARIANT_0 {
-            Anonymous: VARIANT_0_0 {
-                vt: VT_I4,
-                wReserved1: 0,
-                wReserved2: 0,
-                wReserved3: 0,
-                Anonymous: VARIANT_0_0_0 { lVal: value },
             },
         },
     }
@@ -158,107 +143,52 @@ fn check(status: HRESULT, operation: &str) -> Result<(), String> {
     }
 }
 
-fn get_dispid(dispatch: *mut IdmDispatch) -> Result<i32, String> {
-    let mut method_name: Vec<u16> = "SendLinkToIDM2"
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect();
-    let mut names = [method_name.as_mut_ptr()];
-    let mut dispid = 0;
-    let get_ids_of_names = unsafe { (*(*dispatch).vtable).get_ids_of_names };
+fn send_one_link(transmitter: *mut CidmLinkTransmitter2, link: &IdmLink) -> Result<(), String> {
+    let url = Bstr::new(&link.url)?;
+    let referer = Bstr::new(&link.referer)?;
+    let cookie = Bstr::new(link.cookie.as_deref().unwrap_or_default())?;
+    let data = Bstr::new("")?;
+    let user = Bstr::new("")?;
+    let password = Bstr::new("")?;
+    let local_path = Bstr::new("")?;
+    let file_name = Bstr::new(&link.file_name)?;
+    let user_agent = Bstr::new(USER_AGENT)?;
+    let user_agent_variant = bstr_variant(&user_agent);
+    let reserved2 = empty_variant();
+
+    let send_link_to_idm2 = unsafe { (*(*transmitter).vtable).send_link_to_idm2 };
     check(
         unsafe {
-            get_ids_of_names(
-                dispatch,
-                &IID_NULL,
-                names.as_mut_ptr(),
-                1,
-                LOCALE_USER_DEFAULT,
-                &mut dispid,
+            send_link_to_idm2(
+                transmitter,
+                url.as_ptr(),
+                referer.as_ptr(),
+                cookie.as_ptr(),
+                data.as_ptr(),
+                user.as_ptr(),
+                password.as_ptr(),
+                local_path.as_ptr(),
+                file_name.as_ptr(),
+                IDM_FLAG_NO_CONFIRMATION,
+                user_agent_variant,
+                reserved2,
             )
         },
-        "查找 SendLinkToIDM2",
-    )?;
-    Ok(dispid)
-}
-
-fn send_one_link(dispatch: *mut IdmDispatch, dispid: i32, link: &IdmLink) -> Result<(), String> {
-    let (url, url_variant) = variant_str(&link.url)?;
-    let (referer, referer_variant) = variant_str(&link.referer)?;
-    let (user_agent, user_agent_variant) = variant_str(USER_AGENT)?;
-    let (file_name, file_name_variant) = variant_str(&link.file_name)?;
-    let (cookie, cookie_variant) = match link.cookie.as_deref() {
-        Some(value) if !value.is_empty() => variant_str(value)?,
-        _ => (Bstr::empty(), empty_variant()),
-    };
-    let (post_data, post_data_variant) = (Bstr::empty(), empty_variant());
-    let (user, user_variant) = (Bstr::empty(), empty_variant());
-    let (password, password_variant) = (Bstr::empty(), empty_variant());
-    let (path, path_variant) = (Bstr::empty(), empty_variant());
-    let reserved2 = empty_variant();
-    let flags = variant_i4(IDM_FLAG_NO_CONFIRMATION);
-
-    let mut arguments = vec![
-        url_variant,
-        referer_variant,
-        cookie_variant,
-        post_data_variant,
-        user_variant,
-        password_variant,
-        path_variant,
-        file_name_variant,
-        flags,
-        user_agent_variant,
-        reserved2,
-    ];
-    arguments.reverse();
-
-    let mut parameters = DISPPARAMS {
-        rgvarg: arguments.as_mut_ptr(),
-        rgdispidNamedArgs: ptr::null_mut(),
-        cArgs: arguments.len() as u32,
-        cNamedArgs: 0,
-    };
-    let mut result = empty_variant();
-    let mut argument_error = 0;
-    let invoke = unsafe { (*(*dispatch).vtable).invoke };
-    let status = unsafe {
-        invoke(
-            dispatch,
-            dispid,
-            &IID_NULL,
-            LOCALE_USER_DEFAULT,
-            DISPATCH_METHOD,
-            &mut parameters,
-            &mut result,
-            ptr::null_mut(),
-            &mut argument_error,
-        )
-    };
-    check(status, "SendLinkToIDM2")?;
-    drop(url);
-    drop(referer);
-    drop(user_agent);
-    drop(file_name);
-    drop(cookie);
-    drop(post_data);
-    drop(user);
-    drop(password);
-    drop(path);
-    Ok(())
+        "发送到 IDM",
+    )
 }
 
 pub fn send_links(links: &[IdmLink]) -> Result<(), String> {
+    if links.is_empty() {
+        return Err("没有可导出的内容".to_string());
+    }
     let _com = ComScope::new()?;
     let prog_id: Vec<u16> = "IDMan.CIDMLinkTransmitter"
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect();
-    let mut class_id = GUID::from_u128(0);
-    check(
-        unsafe { CLSIDFromProgID(prog_id.as_ptr(), &mut class_id) },
-        "查找 IDM COM 组件",
-    )?;
+    let mut class_id = CLSID_CIDM_LINK_TRANSMITTER;
+    let _ = unsafe { CLSIDFromProgID(prog_id.as_ptr(), &mut class_id) };
     let mut unknown = ptr::null_mut();
     check(
         unsafe {
@@ -266,23 +196,21 @@ pub fn send_links(links: &[IdmLink]) -> Result<(), String> {
                 &class_id,
                 ptr::null_mut(),
                 CLSCTX_LOCAL_SERVER,
-                &IID_IDISPATCH,
+                &IID_ICIDM_LINK_TRANSMITTER2,
                 &mut unknown,
             )
         },
         "唤醒 IDM",
     )?;
-    let dispatch = unknown as *mut IdmDispatch;
-    let mut result = get_dispid(dispatch).and_then(|dispid| {
-        for link in links {
-            send_one_link(dispatch, dispid, link)?;
+    let transmitter = unknown as *mut CidmLinkTransmitter2;
+    let mut result = Ok(());
+    for link in links {
+        result = send_one_link(transmitter, link);
+        if result.is_err() {
+            break;
         }
-        Ok(())
-    });
-    if result.is_ok() && links.is_empty() {
-        result = Err("没有可导出的内容".to_string());
     }
-    let release = unsafe { (*(*dispatch).vtable).release };
-    unsafe { release(dispatch) };
+    let release = unsafe { (*(*transmitter).vtable).release };
+    unsafe { release(transmitter) };
     result
 }

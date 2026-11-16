@@ -1093,6 +1093,7 @@ impl AppView {
                 .value(self.input.clone())
                 .placeholder("输入或粘贴短视频分享链接")
                 .size(InputSize::Lg)
+                .select_all_on_ctrl(cfg!(target_os = "windows"))
                 .bg_color(palette.bg)
                 .border_color(if is_desktop() {
                     gpui::rgba(0x00000000)

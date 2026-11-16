@@ -18,6 +18,10 @@ pub mod theme;
 pub mod titlebar;
 pub mod widgets;
 
+#[cfg(target_os = "windows")]
+pub use douyin_input::{
+    set_text_context_menu_hook, TextContextMenuAction, TextContextMenuHook, TextContextMenuRequest,
+};
 pub use download_icon::set_download_icon_progress_hook;
 pub use download_sound::set_download_sound_hook;
 #[cfg(target_os = "windows")]

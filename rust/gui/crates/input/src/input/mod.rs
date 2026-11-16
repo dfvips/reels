@@ -199,6 +199,27 @@ pub type TextMenuTextHook = Rc<dyn Fn() -> Option<String>>;
 pub type TextMenuBlurHook = Rc<dyn Fn()>;
 pub type NativeEditorLineRangesHook = Rc<dyn Fn() -> Option<(String, Vec<(usize, usize)>)>>;
 
+#[cfg(target_os = "windows")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TextContextMenuAction {
+    Cut,
+    Copy,
+    Paste,
+    SelectAll,
+}
+
+#[cfg(target_os = "windows")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TextContextMenuRequest {
+    pub has_selection: bool,
+    pub can_paste: bool,
+    pub password: bool,
+}
+
+#[cfg(target_os = "windows")]
+pub type TextContextMenuHook =
+    Box<dyn Fn(&TextContextMenuRequest) -> Option<TextContextMenuAction> + Send + Sync>;
+
 thread_local! {
     static TEXT_MENU_HOOK: RefCell<Option<TextMenuHook>> = RefCell::new(None);
     static TEXT_MENU_HIDE_HOOK: RefCell<Option<TextMenuHideHook>> = RefCell::new(None);
@@ -208,10 +229,22 @@ thread_local! {
     static TEXT_MENU_BLUR_HOOK: RefCell<Option<TextMenuBlurHook>> = RefCell::new(None);
     static NATIVE_EDITOR_LINE_RANGES_HOOK: RefCell<Option<NativeEditorLineRangesHook>> =
         RefCell::new(None);
+    #[cfg(target_os = "windows")]
+    static TEXT_CONTEXT_MENU_HOOK: RefCell<Option<TextContextMenuHook>> = RefCell::new(None);
     static NATIVE_EDITOR_VISIBLE: Cell<bool> = const { Cell::new(false) };
     static NATIVE_EDITOR_FOCUSED: Cell<bool> = const { Cell::new(false) };
     static NATIVE_EDITOR_FOCUS_REPORTED: Cell<bool> = const { Cell::new(false) };
     static ACTIVE_NATIVE_EDITOR_ID: RefCell<Option<ElementId>> = const { RefCell::new(None) };
+}
+
+#[cfg(target_os = "windows")]
+pub fn set_text_context_menu_hook(hook: Option<TextContextMenuHook>) {
+    TEXT_CONTEXT_MENU_HOOK.with(|cell| *cell.borrow_mut() = hook);
+}
+
+#[cfg(target_os = "windows")]
+fn dispatch_text_context_menu(request: &TextContextMenuRequest) -> Option<TextContextMenuAction> {
+    TEXT_CONTEXT_MENU_HOOK.with(|cell| cell.borrow().as_ref().and_then(|hook| hook(request)))
 }
 
 /// Register the platform text-menu bridge (mobile only; desktop is no-op).
@@ -1656,6 +1689,43 @@ impl InputEntity {
         }
     }
 
+    #[cfg(target_os = "windows")]
+    fn handle_right_mouse_down(
+        &mut self,
+        _event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        window.focus(&self.focus_handle, cx);
+        let mut state = self.edit_state.borrow_mut();
+        if !state.editing {
+            *state = EditState::new(self.props.value.as_ref());
+            state.editing = true;
+        }
+        let can_paste = cx
+            .read_from_clipboard()
+            .and_then(|clipboard| clipboard.text())
+            .is_some_and(|text| !text.is_empty());
+        let request = TextContextMenuRequest {
+            has_selection: state.has_selection(),
+            can_paste,
+            password: self.props.password,
+        };
+        let Some(action) = dispatch_text_context_menu(&request) else {
+            window.refresh();
+            return;
+        };
+        drop(state);
+        let key = match action {
+            TextContextMenuAction::Cut => "x",
+            TextContextMenuAction::Copy => "c",
+            TextContextMenuAction::Paste => "v",
+            TextContextMenuAction::SelectAll => "a",
+        };
+        self.handle_clipboard_key(key, false, true, false, window, cx);
+        window.refresh();
+    }
+
     /// Clipboard and undo shortcuts (platform or ctrl modifier).
     fn handle_clipboard_key(
         &mut self,
@@ -2790,6 +2860,17 @@ impl Render for InputEntity {
                         this.handle_mouse_down(event, window, cx);
                     }),
                 )
+                .when(cfg!(target_os = "windows"), |element| {
+                    element.on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                            #[cfg(target_os = "windows")]
+                            this.handle_right_mouse_down(event, window, cx);
+                            #[cfg(not(target_os = "windows"))]
+                            let _ = (this, event, window, cx);
+                        }),
+                    )
+                })
                 .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
                     this.handle_mouse_move(event, window, cx);
                 }))

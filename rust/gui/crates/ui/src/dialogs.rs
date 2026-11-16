@@ -937,6 +937,7 @@ impl AppView {
             .value(self.xhs_cookie_input.clone())
             .placeholder("请输入小红书 Cookie")
             .size(InputSize::Lg)
+            .select_all_on_ctrl(cfg!(target_os = "windows"))
             .min_lines(input_lines)
             .native_editor_min_height(146.0)
             .editor_viewport_height(input_box_height)

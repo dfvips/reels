@@ -11,6 +11,8 @@ mod macos_dock_progress;
 mod macos_icon;
 #[cfg(target_os = "windows")]
 mod windows_idm;
+#[cfg(target_os = "windows")]
+mod windows_text_menu;
 
 fn main() {
     let platform = match gpui_miniapp::current_platform() {
@@ -27,6 +29,8 @@ fn main() {
         douyin_ui::set_idm_export_hook(Some(Box::new(|links| {
             windows_idm::send_links(links).map_err(anyhow::Error::msg)
         })));
+        #[cfg(target_os = "windows")]
+        windows_text_menu::install();
         #[cfg(target_os = "macos")]
         macos_icon::set_app_icon_for_system_appearance();
         #[cfg(target_os = "macos")]

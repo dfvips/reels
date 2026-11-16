@@ -54,10 +54,20 @@ mod platform {
 
     use super::FINISH_WAV;
 
-    #[repr(C, align(8))]
-    struct AlignedWav([u8; FINISH_WAV.len()]);
+    const WAV_LEN: usize = include_bytes!("../../../../assets/finish.wav").len();
 
-    static ALIGNED_WAV: AlignedWav = AlignedWav(*FINISH_WAV);
+    #[repr(C, align(8))]
+    struct AlignedWav([u8; WAV_LEN]);
+
+    static ALIGNED_WAV: AlignedWav = {
+        let mut bytes = [0; WAV_LEN];
+        let mut index = 0;
+        while index < WAV_LEN {
+            bytes[index] = FINISH_WAV[index];
+            index += 1;
+        }
+        AlignedWav(bytes)
+    };
 
     pub(super) fn play() {
         unsafe {

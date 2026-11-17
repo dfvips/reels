@@ -53,3 +53,9 @@ pub const WIN_MAXIMIZE: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewB
 pub const WIN_RESTORE: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path d="M6 3.5h6.5V10" stroke="#000" stroke-width="1" fill="none" shape-rendering="crispEdges"/><rect x="3.5" y="6.5" width="6" height="6" stroke="#000" stroke-width="1" fill="none" shape-rendering="crispEdges"/></svg>"##;
 
 pub const WIN_CLOSE: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path d="M4.5 4.5l7 7M11.5 4.5l-7 7" stroke="#000" stroke-width="1" fill="none" shape-rendering="crispEdges"/></svg>"##;
+
+/// 与其他设置图标一致的蓝紫渐变成品矢量。
+pub const LIVE_PHOTO: &[u8] = include_bytes!("../../../../assets/icons/live-photo.svg");
+
+/// 勾选标记（currentColor），配合方形勾选框使用。
+pub const CHECK_MARK: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M4.8 12.6l4.6 4.6L19.4 6.9" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></svg>"##;

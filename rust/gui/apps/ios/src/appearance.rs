@@ -25,3 +25,14 @@ pub extern "C" fn reels_ios_refresh_system_appearance(system_dark: bool) {
     });
     gpui_ios::ios::ffi::gpui_ios_request_current_frame();
 }
+
+/// App 当前实际展示的主题是否为深色（显式主题优先，否则跟随系统）。
+#[unsafe(no_mangle)]
+pub extern "C" fn reels_ios_app_theme_is_dark(system_dark: bool) -> bool {
+    let settings = AppSettings::load(&paths::resolve().settings_file());
+    match settings.theme_mode.as_str() {
+        "light" => false,
+        "dark" => true,
+        _ => system_dark,
+    }
+}

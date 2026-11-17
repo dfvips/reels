@@ -4900,6 +4900,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "block",
+ "dispatch",
  "douyin-ui",
  "gpui-miniapp",
  "objc",

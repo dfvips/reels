@@ -53,3 +53,32 @@ pub fn save_media(path: &std::path::Path) -> bool {
 pub fn caller_deletes_source_after_save() -> bool {
     cfg!(target_os = "android")
 }
+
+/// 将照片与动轨封装为实况照片写入相册（图片高质量重编码以写入标识，视频不转码）。
+/// 返回是否已提交保存请求；iOS 原生层在完成后删除两个源文件。
+pub fn save_live_photo(image: &std::path::Path, video: &std::path::Path) -> bool {
+    #[cfg(target_os = "ios")]
+    {
+        let (Some(image), Some(video)) = (image.to_str(), video.to_str()) else {
+            return false;
+        };
+        let (Ok(image), Ok(video)) = (std::ffi::CString::new(image), std::ffi::CString::new(video))
+        else {
+            return false;
+        };
+        unsafe {
+            extern "C" {
+                fn reels_save_live_photo_to_photos(
+                    image_path: *const std::os::raw::c_char,
+                    video_path: *const std::os::raw::c_char,
+                ) -> bool;
+            }
+            reels_save_live_photo_to_photos(image.as_ptr(), video.as_ptr())
+        }
+    }
+    #[cfg(not(target_os = "ios"))]
+    {
+        let _ = (image, video);
+        false
+    }
+}

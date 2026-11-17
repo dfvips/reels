@@ -17,6 +17,8 @@ pub struct AppSettings {
     pub save_to_gallery: bool,
     /// 小红书请求 Cookie（可选，默认留白）。
     pub xhs_cookie: String,
+    /// iOS 导出到相册时，将实况图封装为 Live Photo；false 则保存为照片 + 视频。
+    pub live_photo_export: bool,
 }
 
 impl Default for AppSettings {
@@ -28,6 +30,7 @@ impl Default for AppSettings {
             remember_location: false,
             save_to_gallery: true,
             xhs_cookie: String::new(),
+            live_photo_export: true,
         }
     }
 }

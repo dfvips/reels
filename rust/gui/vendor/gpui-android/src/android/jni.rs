@@ -71,6 +71,24 @@ pub fn record_native_editor_bounds(bounds: Option<(f32, f32, f32, f32)>) {
     *NATIVE_EDITOR_BOUNDS.lock() = bounds;
 }
 
+/// Finish the current Android task and terminate the app process.
+pub fn exit_app_android() {
+    let result = with_env(|env| {
+        let activity = activity(env)?;
+        env.call_method(
+            &activity,
+            jni::jni_str!("gpuiExitApp"),
+            jni::jni_sig!("()V"),
+            &[],
+        )
+        .e()?;
+        Ok(())
+    });
+    if let Err(error) = result {
+        log::warn!("gpuiExitApp failed: {error}");
+    }
+}
+
 /// Whether the GPUI native library has completed initialization.
 ///
 /// Set to `true` after the first frame is rendered. This can be queried
@@ -884,10 +902,7 @@ fn process_input_events(app: &AndroidApp) {
 
                             let key_code: u32 = key_event.key_code().into();
                             if key_code as i32 == crate::android::AKEYCODE_BACK {
-                                if matches!(direction, KeyDirection::Press) {
-                                    crate::dispatch_back_handler();
-                                }
-                                return android_activity::InputStatus::Handled;
+                                return android_activity::InputStatus::Unhandled;
                             }
                             let meta_state: u32 = key_event.meta_state().0;
 

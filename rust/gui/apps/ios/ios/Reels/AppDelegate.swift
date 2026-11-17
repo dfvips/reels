@@ -23,11 +23,20 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
     private var launchAnimationSettled = false
     private var launchOverlayRemoved = false
     private var iconSyncInFlight = false
+    private var isFirstLaunch = false
+    private static let launchedBeforeKey = "reels.hasLaunchedBefore"
+    private static let appIconSchemeKey = "reels.appIconScheme"
 
     func application(
         _ application: UIApplication,
         didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?
     ) -> Bool {
+        // 首次安装启动时不同步图标，避免系统立刻弹出“已更换图标”提示。
+        let defaults = UserDefaults.standard
+        isFirstLaunch = !defaults.bool(forKey: Self.launchedBeforeKey)
+        if isFirstLaunch {
+            defaults.set(true, forKey: Self.launchedBeforeKey)
+        }
         reels_ios_start()
         DispatchQueue.main.async { [weak self] in
             self?.showLaunchOverlay()
@@ -136,15 +145,54 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
         }
     }
 
+    /// 当前图标对应的深浅色：备用图标优先，否则取上次记录（默认图标为浅色）。
+    private func currentAppIconScheme() -> String {
+        switch UIApplication.shared.alternateIconName {
+        case "AppIconDark":
+            return "dark"
+        case "AppIconLight":
+            return "light"
+        default:
+            return UserDefaults.standard.string(forKey: Self.appIconSchemeKey) ?? "light"
+        }
+    }
+
     private func updateAppIcon(_ systemDark: Bool) {
+        if isFirstLaunch {
+            // 首次启动不切换图标，但记录当前实际状态，供下次启动判断。
+            UserDefaults.standard.set(currentAppIconScheme(), forKey: Self.appIconSchemeKey)
+            return
+        }
         let application = UIApplication.shared
         guard application.supportsAlternateIcons, !iconSyncInFlight else { return }
-        let iconName = systemDark ? "AppIconDark" : "AppIconLight"
-        guard application.alternateIconName != iconName else { return }
+        guard let window = currentKeyWindow() else {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+                self?.updateAppIcon(systemDark)
+            }
+            return
+        }
+        let style = window.traitCollection.userInterfaceStyle
+        guard style != .unspecified else {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+                self?.updateAppIcon(systemDark)
+            }
+            return
+        }
+        // 跟随 App 实际展示的主题，而非只按系统外观。
+        let appDark = reels_ios_app_theme_is_dark(style == .dark)
+        let desiredScheme = appDark ? "dark" : "light"
+        guard currentAppIconScheme() != desiredScheme else { return }
+        let iconName = appDark ? "AppIconDark" : "AppIconLight"
         iconSyncInFlight = true
         let applyIcon = { [weak self] in
             application.setAlternateIconName(iconName) { error in
                 DispatchQueue.main.async {
+                    if error == nil {
+                        UserDefaults.standard.set(
+                            desiredScheme,
+                            forKey: Self.appIconSchemeKey
+                        )
+                    }
                     self?.iconSyncInFlight = false
                 }
                 if let error {

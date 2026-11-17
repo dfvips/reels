@@ -18,10 +18,15 @@ pub mod theme;
 pub mod titlebar;
 pub mod widgets;
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+pub use douyin_input::TextContextMenuAction;
+#[cfg(target_os = "macos")]
 pub use douyin_input::{
-    set_text_context_menu_hook, TextContextMenuAction, TextContextMenuHook, TextContextMenuRequest,
+    dispatch_mac_text_context_menu_action, set_mac_text_context_menu_request_hook,
+    MacTextContextMenuRequest, MacTextContextMenuRequestHook,
 };
+#[cfg(target_os = "windows")]
+pub use douyin_input::{set_text_context_menu_hook, TextContextMenuHook, TextContextMenuRequest};
 pub use download_icon::set_download_icon_progress_hook;
 pub use download_sound::set_download_sound_hook;
 #[cfg(target_os = "windows")]
@@ -90,8 +95,9 @@ impl ResultItem {
     }
 
     /// 按范围选择资源；图片全部保留，视频只保留首选条目。
+    /// 图文 / 实况里每个视频对应不同的图片，不做画质去重。
     pub fn select_entries<'a>(&'a self, scope: ResourceScope) -> Vec<&'a MediaEntry> {
-        if scope == ResourceScope::All {
+        if scope == ResourceScope::All || self.media_kind == MediaKind::Image {
             return self.entries.iter().collect();
         }
 
@@ -113,7 +119,7 @@ impl ResultItem {
             .collect()
     }
 
-    fn is_video_entry(entry: &MediaEntry) -> bool {
+    pub fn is_video_entry(entry: &MediaEntry) -> bool {
         let extension = entry
             .extension
             .as_deref()
@@ -177,6 +183,14 @@ pub struct PageTransition {
     animation: Option<PageAnimation>,
 }
 
+#[cfg(target_os = "macos")]
+struct MacWindowClosedGuard {
+    _window_closed: Subscription,
+}
+
+#[cfg(target_os = "macos")]
+impl gpui::Global for MacWindowClosedGuard {}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ToastKind {
     Success,
@@ -202,6 +216,7 @@ pub enum Dialog {
     About,
     SaveLocation,
     XhsCookie,
+    LivePhotoExport,
     ClearCache,
     ClearCacheResult {
         success: bool,
@@ -223,6 +238,7 @@ pub enum Dialog {
     DownloadSaved {
         count: usize,
         failed: usize,
+        skipped: usize,
     },
     DownloadSummary {
         files: Vec<PathBuf>,
@@ -237,6 +253,8 @@ pub struct DownloadUi {
     pub total_bytes: Vec<u64>,
     pub files: Vec<PathBuf>,
     pub errors: Vec<String>,
+    /// 手机端跳过的音频条目数（相册不支持 MP3）。
+    pub skipped_audio: usize,
     pub finished: bool,
     pub cancel: Arc<AtomicBool>,
 }
@@ -251,6 +269,7 @@ impl DownloadUi {
             total_bytes: vec![0; total],
             files: Vec::new(),
             errors: Vec::new(),
+            skipped_audio: 0,
             finished: false,
             cancel: Arc::new(AtomicBool::new(false)),
         }
@@ -391,8 +410,12 @@ pub struct AppView {
     pub download_rx: Option<Receiver<DownloadEvent>>,
     pub location_dialog_directory: String,
     pub location_dialog_remember: bool,
+    /// 实况照片弹窗的草稿选择；点“确定”后才写入设置。
+    pub live_photo_dialog_choice: bool,
     pub xhs_cookie_input: String,
     _appearance_sub: Option<Subscription>,
+    #[cfg(target_os = "android")]
+    android_back_pressed_at: Option<Instant>,
 }
 
 impl AppView {
@@ -429,7 +452,7 @@ impl AppView {
                 async_cx
                     .spawn(async move |cx| {
                         let _ = window_handle.update(cx, |view, window, cx| {
-                            view.handle_page_back(window, cx);
+                            view.handle_android_system_back(window, cx);
                         });
                     })
                     .detach();
@@ -484,8 +507,11 @@ impl AppView {
             download_rx: None,
             location_dialog_directory: String::new(),
             location_dialog_remember: false,
+            live_photo_dialog_choice: false,
             xhs_cookie_input: String::new(),
             _appearance_sub,
+            #[cfg(target_os = "android")]
+            android_back_pressed_at: None,
         };
         view.refresh_cache_info();
         view
@@ -673,6 +699,32 @@ impl AppView {
         } else if window.is_fullscreen() {
             window.toggle_fullscreen();
         }
+    }
+
+    #[cfg(target_os = "android")]
+    fn handle_android_system_back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let at_home =
+            self.dialog.is_none() && self.transition.is_none() && self.route == Route::Home;
+        if !at_home {
+            self.android_back_pressed_at = None;
+            self.handle_page_back(window, cx);
+            return;
+        }
+
+        let now = Instant::now();
+        let should_exit_app = self
+            .android_back_pressed_at
+            .is_some_and(|pressed_at| now.duration_since(pressed_at) <= Duration::from_secs(2));
+        if should_exit_app {
+            self.android_back_pressed_at = None;
+            hide_soft_keyboard();
+            gpui_android::exit_app();
+            return;
+        }
+
+        self.android_back_pressed_at = Some(now);
+        hide_soft_keyboard();
+        self.toast("再按一次退出", ToastKind::Info, cx);
     }
 
     fn settle_transition_now(&mut self) {
@@ -1122,6 +1174,18 @@ impl AppView {
 
 /// 打开主窗口（桌面端 1024x720 居中、无标题栏；移动端全屏）。
 pub fn open_main_window(cx: &mut App) -> anyhow::Result<()> {
+    #[cfg(target_os = "macos")]
+    if cx.try_global::<MacWindowClosedGuard>().is_none() {
+        douyin_input::clear_all_input_states();
+    }
+    #[cfg(target_os = "macos")]
+    let window_closed = cx
+        .try_global::<MacWindowClosedGuard>()
+        .map(|_| None)
+        .unwrap_or_else(|| {
+            Some(cx.on_window_closed(|_, _| douyin_input::clear_all_input_states()))
+        });
+
     let paths = paths::resolve();
     let settings = AppSettings::load(&paths.settings_file());
     let desktop = is_desktop();
@@ -1133,7 +1197,8 @@ pub fn open_main_window(cx: &mut App) -> anyhow::Result<()> {
         traffic_light_position: None,
     };
 
-    cx.open_window(
+    #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
+    let window = cx.open_window(
         WindowOptions {
             window_bounds: if desktop {
                 Some(WindowBounds::Windowed(bounds))
@@ -1156,6 +1221,14 @@ pub fn open_main_window(cx: &mut App) -> anyhow::Result<()> {
         },
         move |window, cx| cx.new(|cx| AppView::new(paths.clone(), settings.clone(), window, cx)),
     )?;
+    #[cfg(target_os = "macos")]
+    if let Some(window_closed) = window_closed {
+        window.update(cx, |_, _, cx| {
+            cx.set_global(MacWindowClosedGuard {
+                _window_closed: window_closed,
+            })
+        })?;
+    }
 
     Ok(())
 }

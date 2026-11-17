@@ -77,6 +77,8 @@ import org.json.JSONException;
 import org.json.JSONObject;
 
 import androidx.core.splashscreen.SplashScreen;
+import androidx.activity.OnBackPressedCallback;
+import androidx.activity.OnBackPressedDispatcher;
 
 /**
  * NativeActivity host used by GPUI Android applications.
@@ -235,6 +237,9 @@ public class GpuiActivity extends NativeActivity {
     private static final String CREDENTIAL_PREFS = "gpui_secure_credentials";
     private GpuiInputView inputView;
     private final AtomicBoolean accessibilityChangeScheduled = new AtomicBoolean();
+    private final OnBackPressedDispatcher onBackPressedDispatcher =
+            new OnBackPressedDispatcher();
+    private OnBackPressedCallback gpuiBackCallback;
 
     private static native boolean nativeIsInitialized();
     private static native boolean nativeIsFirstFramePresented();
@@ -448,6 +453,31 @@ public class GpuiActivity extends NativeActivity {
         splashScreen.setKeepOnScreenCondition(
                 () -> !nativeIsFirstFramePresented());
         super.onCreate(state);
+        gpuiBackCallback = new OnBackPressedCallback(true) {
+            @Override
+            public void handleOnBackPressed() {
+                if (textMenuEditor != null
+                        && textMenuEditor.getVisibility() == View.VISIBLE
+                        && textMenuEditor.hasFocus()
+                        && (imeVisible || imeInsetsAnimating)) {
+                    if (imeVisible || imeInsetsAnimating) {
+                        hideNativeEditorBeforeImePreview();
+                    }
+                    blurTextMenuEditor();
+                    InputMethodManager manager =
+                            (InputMethodManager) getSystemService(Context.INPUT_METHOD_SERVICE);
+                    if (manager != null) {
+                        manager.hideSoftInputFromWindow(inputView.getWindowToken(), 0);
+                    }
+                    return;
+                }
+                nativeOnBackPressed();
+            }
+        };
+        onBackPressedDispatcher.addCallback(gpuiBackCallback);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            onBackPressedDispatcher.setOnBackInvokedDispatcher(getOnBackInvokedDispatcher());
+        }
         textMenuEditor = new MirrorEditText(this);
         // setHint() before the first addView() calls TextView.checkForRelayout(),
         // which dereferences LayoutParams. Give the detached view a default set
@@ -681,20 +711,16 @@ public class GpuiActivity extends NativeActivity {
 
     @Override
     public void onBackPressed() {
-        if (textMenuEditor != null
-                && textMenuEditor.getVisibility() == View.VISIBLE) {
-            if (imeVisible || imeInsetsAnimating) {
-                hideNativeEditorBeforeImePreview();
-            }
-            blurTextMenuEditor();
-            InputMethodManager manager =
-                    (InputMethodManager) getSystemService(Context.INPUT_METHOD_SERVICE);
-            if (manager != null) {
-                manager.hideSoftInputFromWindow(inputView.getWindowToken(), 0);
-            }
-            return;
-        }
-        nativeOnBackPressed();
+        onBackPressedDispatcher.onBackPressed();
+    }
+
+    /** Finish the task and terminate the app process. */
+    public void gpuiExitApp() {
+        runOnUiThreadBlocking(() -> {
+            finishAndRemoveTask();
+            android.os.Process.killProcess(android.os.Process.myPid());
+            System.exit(0);
+        });
     }
 
     @Override

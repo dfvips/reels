@@ -635,6 +635,16 @@ pub fn set_back_handler(callback: Option<BackHandlerFn>) {
     });
 }
 
+/// Finish the current Android task and terminate the app process.
+#[cfg(target_os = "android")]
+pub fn exit_app() {
+    android::jni::exit_app_android();
+}
+
+/// Finish the current Android task and terminate the app process.
+#[cfg(not(target_os = "android"))]
+pub fn exit_app() {}
+
 /// Deliver a back request to the registered application handler.
 ///
 /// Returns `true` when a handler consumed the request.

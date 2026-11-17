@@ -10,7 +10,7 @@ static PAGE_LINK: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"(?i)https?://[a-z0-9.-]*douyin\.com/[^\s"'<>]+"#).unwrap());
 
 static SHARE_LINK: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)https?://(?:www\.)?iesdouyin\.com/share/(?:video|note)/(\d+)").unwrap()
+    Regex::new(r"(?i)https?://(?:www\.)?iesdouyin\.com/share/(?:video|note|slides)/(\d+)").unwrap()
 });
 
 static XHS_SHORT_LINK: LazyLock<Regex> =
@@ -30,7 +30,7 @@ static TRAILING_PUNCTUATION: &[char] = &[
 static MODAL_ID: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)modal_id=(\d+)").unwrap());
 
 static VIDEO_OR_NOTE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)/(?:video|note)/(\d+)").unwrap());
+    LazyLock::new(|| Regex::new(r"(?i)/(?:video|note|slides)/(\d+)").unwrap());
 
 static VIDEO_URL_PATTERN: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^https?://(?:www\.)?douyin\.com/video/(\d+)/?$").unwrap());
@@ -101,7 +101,7 @@ fn trim_trailing_punctuation(url: &str) -> &str {
     url.trim_end_matches(TRAILING_PUNCTUATION)
 }
 
-/// 从链接中提取数字视频 ID（`modal_id=` / `video/{id}` / `note/{id}`）。
+/// 从链接中提取数字视频 ID（`modal_id=` / `video/{id}` / `note/{id}` / `slides/{id}`）。
 pub fn extract_aweme_id(url: &str) -> Option<String> {
     if let Some(caps) = MODAL_ID.captures(url) {
         return Some(caps[1].to_string());
@@ -225,6 +225,33 @@ mod tests {
                 "https://v.douyin.com/AbC-12".to_string(),
                 "https://www.iesdouyin.com/share/video/7588361322312650038/".to_string(),
                 "https://www.iesdouyin.com/share/video/7701193143558901018/".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn extracts_slides_and_note_ids() {
+        assert_eq!(
+            extract_aweme_id(
+                "https://www.iesdouyin.com/share/slides/7707588334482361210/?from_ssr=1"
+            )
+            .as_deref(),
+            Some("7707588334482361210")
+        );
+        assert_eq!(
+            extract_aweme_id("https://www.iesdouyin.com/share/note/7703501941162624249/")
+                .as_deref(),
+            Some("7703501941162624249")
+        );
+        let urls = extract_urls(
+            "看看 https://www.iesdouyin.com/share/slides/7707588334482361210/ 和 \
+             https://www.iesdouyin.com/share/note/7703501941162624249/",
+        );
+        assert_eq!(
+            urls,
+            vec![
+                "https://www.iesdouyin.com/share/video/7707588334482361210/".to_string(),
+                "https://www.iesdouyin.com/share/video/7703501941162624249/".to_string(),
             ]
         );
     }

@@ -1,5 +1,7 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
+#[cfg(target_os = "macos")]
+use gpui::AppCell;
 use gpui::{actions, App, Application, KeyBinding};
 
 actions!(reels, [Quit]);
@@ -9,6 +11,8 @@ mod desktop_sound;
 mod macos_dock_progress;
 #[cfg(target_os = "macos")]
 mod macos_icon;
+#[cfg(target_os = "macos")]
+mod macos_text_menu;
 #[cfg(target_os = "windows")]
 mod windows_idm;
 #[cfg(target_os = "windows")]
@@ -23,7 +27,29 @@ fn main() {
         }
     };
 
-    Application::with_platform(platform).run(|cx: &mut App| {
+    let application = Application::with_platform(platform);
+    #[cfg(target_os = "macos")]
+    let app_cell: std::rc::Rc<AppCell> = application.clone_app_cell();
+    #[cfg(target_os = "macos")]
+    {
+        application.on_reopen(|cx: &mut App| {
+            if cx.windows().is_empty() {
+                if let Err(error) = douyin_ui::open_main_window(cx) {
+                    eprintln!("窗口创建失败: {error}");
+                    cx.quit();
+                    return;
+                }
+                macos_icon::refresh_app_icon();
+            } else {
+                for window in cx.windows() {
+                    let _ = window.update(cx, |_, window, _| window.activate_window());
+                }
+            }
+            cx.activate(true);
+        });
+    }
+
+    application.run(|cx: &mut App| {
         douyin_ui::set_download_sound_hook(Some(Box::new(desktop_sound::play_finish_sound)));
         #[cfg(target_os = "windows")]
         douyin_ui::set_idm_export_hook(Some(Box::new(|links| {
@@ -31,6 +57,8 @@ fn main() {
         })));
         #[cfg(target_os = "windows")]
         windows_text_menu::install();
+        #[cfg(target_os = "macos")]
+        macos_text_menu::install(app_cell);
         #[cfg(target_os = "macos")]
         macos_icon::set_app_icon_for_system_appearance();
         #[cfg(target_os = "macos")]

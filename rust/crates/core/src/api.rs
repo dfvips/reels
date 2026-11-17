@@ -27,6 +27,35 @@ pub struct AwemeDetail {
     pub height: Option<u64>,
     pub size_bytes: Option<u64>,
     pub quality: Option<String>,
+    /// 图文 / 实况（图 + 视频）作品的图片列表。
+    pub images: Vec<AwemeImage>,
+    /// 图文作品的背景音乐。
+    pub music: Option<AwemeMusic>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct AwemeImage {
+    pub url: String,
+    pub width: Option<u64>,
+    pub height: Option<u64>,
+    pub live_video: Option<AwemeLiveVideo>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct AwemeLiveVideo {
+    pub play_uri: Option<String>,
+    pub play_urls: Vec<String>,
+    pub duration_ms: Option<u64>,
+    pub width: Option<u64>,
+    pub height: Option<u64>,
+    pub size_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct AwemeMusic {
+    pub url: String,
+    /// `music.duration` 的单位是秒（与视频的毫秒不同）。
+    pub duration_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -155,6 +184,29 @@ impl DouyinApi {
             return None;
         }
         let detail = data.get("aweme_detail")?;
+        let desc = detail
+            .get("desc")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        // 图文 / 实况作品的 top-level video 只是幻灯片或背景音乐占位，
+        // 真正的媒体在 images 里（实况图会额外带一段 video）。
+        let images = parse_images(detail);
+        if !images.is_empty() {
+            return Some(AwemeDetail {
+                aweme_id: aweme_id.to_string(),
+                desc,
+                play_uri: None,
+                play_urls: Vec::new(),
+                bit_rates: Vec::new(),
+                duration_ms: None,
+                width: None,
+                height: None,
+                size_bytes: None,
+                quality: None,
+                images,
+                music: parse_music(detail),
+            });
+        }
         let play_addr = detail.get("video")?.get("play_addr")?;
         let urls: Vec<String> = play_addr
             .get("url_list")
@@ -238,10 +290,7 @@ impl DouyinApi {
         }
         Some(AwemeDetail {
             aweme_id: aweme_id.to_string(),
-            desc: detail
-                .get("desc")
-                .and_then(Value::as_str)
-                .map(str::to_string),
+            desc,
             play_uri: play_uri.map(str::to_string),
             play_urls: urls,
             bit_rates,
@@ -250,6 +299,8 @@ impl DouyinApi {
             height,
             size_bytes,
             quality,
+            images: Vec::new(),
+            music: None,
         })
     }
 
@@ -290,6 +341,101 @@ impl DouyinApi {
         }
         token
     }
+}
+
+fn parse_images(detail: &Value) -> Vec<AwemeImage> {
+    detail
+        .get("images")
+        .and_then(Value::as_array)
+        .map(|items| items.iter().filter_map(parse_image).collect())
+        .unwrap_or_default()
+}
+
+fn parse_image(image: &Value) -> Option<AwemeImage> {
+    let url = image_url(image)?;
+    let live_video = image.get("video").and_then(parse_live_video);
+    Some(AwemeImage {
+        url,
+        width: image.get("width").and_then(Value::as_u64),
+        height: image.get("height").and_then(Value::as_u64),
+        live_video,
+    })
+}
+
+/// `url_list` 同时给出 webp 与 jpeg 的压缩预览地址，优先 jpeg 以便
+/// 本地查看器和相册直接识别；签名绑定完整路径，不能改成原图地址。
+fn image_url(image: &Value) -> Option<String> {
+    let urls: Vec<&str> = image
+        .get("url_list")
+        .and_then(Value::as_array)?
+        .iter()
+        .filter_map(Value::as_str)
+        .filter(|url| !url.is_empty())
+        .collect();
+    urls.iter()
+        .find(|url| {
+            let path = url.split('?').next().unwrap_or(url).to_ascii_lowercase();
+            path.ends_with(".jpeg") || path.ends_with(".jpg")
+        })
+        .or_else(|| urls.first())
+        .map(|url| (*url).to_string())
+}
+
+fn parse_live_video(video: &Value) -> Option<AwemeLiveVideo> {
+    let play_addr = video.get("play_addr");
+    let play_uri = play_addr
+        .and_then(|addr| addr.get("uri"))
+        .and_then(Value::as_str)
+        .filter(|uri| !uri.is_empty())
+        .map(str::to_string);
+    let play_urls: Vec<String> = play_addr
+        .and_then(|addr| addr.get("url_list"))
+        .and_then(Value::as_array)
+        .map(|urls| {
+            urls.iter()
+                .filter_map(Value::as_str)
+                .filter(|url| !url.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    if play_uri.is_none() && play_urls.is_empty() {
+        return None;
+    }
+    Some(AwemeLiveVideo {
+        play_uri,
+        play_urls,
+        duration_ms: video.get("duration").and_then(Value::as_u64),
+        width: play_addr
+            .and_then(|addr| addr.get("width"))
+            .and_then(Value::as_u64),
+        height: play_addr
+            .and_then(|addr| addr.get("height"))
+            .and_then(Value::as_u64),
+        size_bytes: play_addr
+            .and_then(|addr| addr.get("data_size"))
+            .and_then(Value::as_u64),
+    })
+}
+
+/// `music.play_url.url_list` 是背景音乐 mp3 的直链；缺少地址时返回 None。
+fn parse_music(detail: &Value) -> Option<AwemeMusic> {
+    let music = detail.get("music")?;
+    let url = music
+        .get("play_url")
+        .and_then(|play_url| play_url.get("url_list"))
+        .and_then(Value::as_array)?
+        .iter()
+        .filter_map(Value::as_str)
+        .find(|url| url.starts_with("http"))?
+        .to_string();
+    Some(AwemeMusic {
+        url,
+        duration_secs: music
+            .get("duration")
+            .and_then(Value::as_u64)
+            .filter(|secs| *secs > 0),
+    })
 }
 
 pub fn now_ms() -> i64 {
@@ -428,5 +574,71 @@ mod tests {
     fn base36_and_md5() {
         assert_eq!(to_base36(1_763_000_000_000), "mhwsoi68");
         assert_eq!(md5_hex("abc"), "900150983cd24fb0d6963f7d28e17f72");
+    }
+
+    #[test]
+    fn parses_music_play_url() {
+        let detail = json!({
+            "music": {
+                "duration": 32,
+                "play_url": {
+                    "uri": "https://sf11.douyinstatic.com/obj/ies-music/bgm.mp3",
+                    "url_list": [
+                        "https://sf11.douyinstatic.com/obj/ies-music/bgm.mp3"
+                    ]
+                }
+            }
+        });
+        let music = parse_music(&detail).unwrap();
+        assert!(music.url.ends_with("bgm.mp3"));
+        assert_eq!(music.duration_secs, Some(32));
+
+        let zero_duration = json!({
+            "music": {
+                "duration": 0,
+                "play_url": { "url_list": ["https://sf11.douyinstatic.com/obj/ies-music/bgm.mp3"] }
+            }
+        });
+        assert_eq!(parse_music(&zero_duration).unwrap().duration_secs, None);
+    }
+
+    #[test]
+    fn parses_image_and_live_video() {
+        let detail = json!({
+            "images": [
+                {
+                    "url_list": [
+                        "https://p3.douyinpic.com/a~tplv-dy-aweme-images:q75.webp?x=1",
+                        "https://p3.douyinpic.com/a~tplv-dy-aweme-images:q75.jpeg?x=1"
+                    ],
+                    "width": 2160,
+                    "height": 2880,
+                    "video": {
+                        "duration": 2809,
+                        "play_addr": {
+                            "uri": "v0200fg10000abc",
+                            "width": 720,
+                            "height": 960,
+                            "data_size": 571289,
+                            "url_list": ["https://v95.douyinvod.com/live.mp4"]
+                        }
+                    }
+                },
+                {
+                    "url_list": ["https://p3.douyinpic.com/b~tplv-dy-aweme-images:q75.webp?x=1"],
+                    "width": 720,
+                    "height": 958
+                }
+            ]
+        });
+        let images = parse_images(&detail);
+        assert_eq!(images.len(), 2);
+        assert!(images[0].url.ends_with(".jpeg?x=1"));
+        assert_eq!(images[0].width, Some(2160));
+        let live = images[0].live_video.as_ref().unwrap();
+        assert_eq!(live.play_uri.as_deref(), Some("v0200fg10000abc"));
+        assert_eq!(live.duration_ms, Some(2809));
+        assert_eq!(live.size_bytes, Some(571289));
+        assert!(images[1].live_video.is_none());
     }
 }

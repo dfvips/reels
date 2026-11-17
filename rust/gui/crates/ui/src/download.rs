@@ -39,6 +39,7 @@ pub fn start_downloads(
     urls: Vec<String>,
     titles: Vec<String>,
     extensions: Vec<Option<String>>,
+    live_videos: Vec<Option<String>>,
     directory: PathBuf,
     cache_dir: PathBuf,
     cancel: Arc<AtomicBool>,
@@ -103,10 +104,47 @@ pub fn start_downloads(
 
             match download_one(&client, url, &temp_path, &extension, index, &cancel, &tx) {
                 Ok(()) => {
+                    let live_path = match live_videos.get(index).cloned().flatten() {
+                        Some(companion_url) => {
+                            match download_live_companion(
+                                &client,
+                                &companion_url,
+                                &cache_dir,
+                                &file_name,
+                                index,
+                                &cancel,
+                                &tx,
+                            ) {
+                                Ok(path) => Some(path),
+                                Err(error) => {
+                                    if cancel.load(Ordering::Relaxed) {
+                                        let _ = std::fs::remove_file(&temp_path);
+                                        let _ = tx.send(DownloadEvent::Failed { index, error });
+                                        continue;
+                                    }
+                                    // 动轨下载失败时仍保存照片，避免整条丢失。
+                                    eprintln!("实况动轨下载失败，改为仅保存照片: {error}");
+                                    None
+                                }
+                            }
+                        }
+                        None => None,
+                    };
                     let _ = std::fs::create_dir_all(&directory);
-                    match std::fs::rename(&temp_path, &destination) {
+                    match move_into_place(&temp_path, &destination) {
                         Ok(()) => {
-                            let saved_to_gallery = crate::gallery::save_media(&destination);
+                            let saved_to_gallery = if let Some(live_path) = live_path.as_deref() {
+                                let saved =
+                                    crate::gallery::save_live_photo(&destination, live_path);
+                                if !saved {
+                                    let _ = std::fs::remove_file(live_path);
+                                    crate::gallery::save_media(&destination)
+                                } else {
+                                    true
+                                }
+                            } else {
+                                crate::gallery::save_media(&destination)
+                            };
                             if crate::gallery::caller_deletes_source_after_save()
                                 && saved_to_gallery
                             {
@@ -118,30 +156,13 @@ pub fn start_downloads(
                                 path: destination,
                             });
                         }
-                        Err(rename_error) => match std::fs::copy(&temp_path, &destination) {
-                            Ok(_) => {
-                                let _ = std::fs::remove_file(&temp_path);
-                                let saved_to_gallery = crate::gallery::save_media(&destination);
-                                if crate::gallery::caller_deletes_source_after_save()
-                                    && saved_to_gallery
-                                {
-                                    let _ = std::fs::remove_file(&destination);
-                                }
-                                let _ = tx.send(DownloadEvent::Completed {
-                                    index,
-                                    path: destination,
-                                });
+                        Err(error) => {
+                            if let Some(live_path) = live_path.as_deref() {
+                                let _ = std::fs::remove_file(live_path);
                             }
-                            Err(copy_error) => {
-                                let _ = std::fs::remove_file(&temp_path);
-                                let _ = tx.send(DownloadEvent::Failed {
-                                    index,
-                                    error: format!(
-                                        "保存文件失败: 移动失败: {rename_error}; 复制失败: {copy_error}"
-                                    ),
-                                });
-                            }
-                        },
+                            let _ = std::fs::remove_file(&temp_path);
+                            let _ = tx.send(DownloadEvent::Failed { index, error });
+                        }
                     }
                 }
                 Err(error) => {
@@ -152,6 +173,53 @@ pub fn start_downloads(
 
         let _ = tx.send(DownloadEvent::Finished);
     });
+}
+
+fn move_into_place(temp_path: &Path, destination: &Path) -> Result<(), String> {
+    match std::fs::rename(temp_path, destination) {
+        Ok(()) => Ok(()),
+        Err(rename_error) => match std::fs::copy(temp_path, destination) {
+            Ok(_) => {
+                let _ = std::fs::remove_file(temp_path);
+                Ok(())
+            }
+            Err(copy_error) => Err(format!(
+                "保存文件失败: 移动失败: {rename_error}; 复制失败: {copy_error}"
+            )),
+        },
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn download_live_companion(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    cache_dir: &Path,
+    file_name: &str,
+    index: usize,
+    cancel: &Arc<AtomicBool>,
+    tx: &Sender<DownloadEvent>,
+) -> Result<PathBuf, String> {
+    let companion_name = format!("{file_name}-live.mp4");
+    let temp_path = cache_dir.join(format!("{companion_name}.part"));
+    download_one(client, url, &temp_path, "mp4", index, cancel, tx)?;
+    let destination = cache_dir.join(&companion_name);
+    let _ = std::fs::remove_file(&destination);
+    match std::fs::rename(&temp_path, &destination) {
+        Ok(()) => Ok(destination),
+        Err(rename_error) => match std::fs::copy(&temp_path, &destination) {
+            Ok(_) => {
+                let _ = std::fs::remove_file(&temp_path);
+                Ok(destination)
+            }
+            Err(copy_error) => {
+                let _ = std::fs::remove_file(&temp_path);
+                Err(format!(
+                    "保存实况视频失败: 移动失败: {rename_error}; 复制失败: {copy_error}"
+                ))
+            }
+        },
+    }
 }
 
 fn download_file_name(directory: &Path, base: &str, extension: &str) -> String {

@@ -199,7 +199,7 @@ pub type TextMenuTextHook = Rc<dyn Fn() -> Option<String>>;
 pub type TextMenuBlurHook = Rc<dyn Fn()>;
 pub type NativeEditorLineRangesHook = Rc<dyn Fn() -> Option<(String, Vec<(usize, usize)>)>>;
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TextContextMenuAction {
     Cut,
@@ -220,6 +220,18 @@ pub struct TextContextMenuRequest {
 pub type TextContextMenuHook =
     Box<dyn Fn(&TextContextMenuRequest) -> Option<TextContextMenuAction> + Send + Sync>;
 
+#[cfg(target_os = "macos")]
+#[derive(Clone, Debug)]
+pub struct MacTextContextMenuRequest {
+    pub input_id: String,
+    pub has_selection: bool,
+    pub can_paste: bool,
+    pub password: bool,
+}
+
+#[cfg(target_os = "macos")]
+pub type MacTextContextMenuRequestHook = Rc<dyn Fn(&MacTextContextMenuRequest)>;
+
 thread_local! {
     static TEXT_MENU_HOOK: RefCell<Option<TextMenuHook>> = RefCell::new(None);
     static TEXT_MENU_HIDE_HOOK: RefCell<Option<TextMenuHideHook>> = RefCell::new(None);
@@ -231,6 +243,9 @@ thread_local! {
         RefCell::new(None);
     #[cfg(target_os = "windows")]
     static TEXT_CONTEXT_MENU_HOOK: RefCell<Option<TextContextMenuHook>> = RefCell::new(None);
+    #[cfg(target_os = "macos")]
+    static MAC_TEXT_CONTEXT_MENU_REQUEST_HOOK: RefCell<Option<MacTextContextMenuRequestHook>> =
+        RefCell::new(None);
     static NATIVE_EDITOR_VISIBLE: Cell<bool> = const { Cell::new(false) };
     static NATIVE_EDITOR_FOCUSED: Cell<bool> = const { Cell::new(false) };
     static NATIVE_EDITOR_FOCUS_REPORTED: Cell<bool> = const { Cell::new(false) };
@@ -242,9 +257,63 @@ pub fn set_text_context_menu_hook(hook: Option<TextContextMenuHook>) {
     TEXT_CONTEXT_MENU_HOOK.with(|cell| *cell.borrow_mut() = hook);
 }
 
+#[cfg(target_os = "macos")]
+pub fn set_mac_text_context_menu_request_hook(hook: Option<MacTextContextMenuRequestHook>) {
+    MAC_TEXT_CONTEXT_MENU_REQUEST_HOOK.with(|cell| *cell.borrow_mut() = hook);
+}
+
 #[cfg(target_os = "windows")]
 fn dispatch_text_context_menu(request: &TextContextMenuRequest) -> Option<TextContextMenuAction> {
     TEXT_CONTEXT_MENU_HOOK.with(|cell| cell.borrow().as_ref().and_then(|hook| hook(request)))
+}
+
+#[cfg(target_os = "macos")]
+fn dispatch_mac_text_context_menu_request(request: &MacTextContextMenuRequest) {
+    MAC_TEXT_CONTEXT_MENU_REQUEST_HOOK.with(|cell| {
+        let hook = cell.borrow().as_ref().cloned();
+        if let Some(hook) = hook {
+            hook(request);
+        }
+    });
+}
+
+#[cfg(target_os = "macos")]
+pub fn dispatch_mac_text_context_menu_action(
+    input_id: &str,
+    action: TextContextMenuAction,
+    cx: &mut App,
+) {
+    let element_id = ElementId::from(input_id.to_string());
+    let entity = INPUT_ENTITIES.with(|entities| {
+        entities
+            .borrow()
+            .get(&element_id)
+            .and_then(|weak| weak.upgrade())
+    });
+    let Some(entity) = entity else {
+        return;
+    };
+    let entity_id = entity.entity_id();
+    let applied = cx.with_window(entity_id, |window, cx| {
+        entity.update(cx, |entity, cx| {
+            entity.handle_mac_text_context_menu_action(action, window, cx);
+        });
+    });
+    if applied.is_some() {
+        return;
+    }
+    let Some(window) = cx
+        .active_window()
+        .or_else(|| cx.window_stack().and_then(|stack| stack.into_iter().next()))
+        .or_else(|| cx.windows().into_iter().next())
+    else {
+        return;
+    };
+    let _ = window.update(cx, |_, window, cx| {
+        entity.update(cx, |entity, cx| {
+            entity.handle_mac_text_context_menu_action(action, window, cx);
+        });
+    });
 }
 
 /// Register the platform text-menu bridge (mobile only; desktop is no-op).
@@ -1722,7 +1791,65 @@ impl InputEntity {
             TextContextMenuAction::Paste => "v",
             TextContextMenuAction::SelectAll => "a",
         };
-        self.handle_clipboard_key(key, false, true, false, window, cx);
+        self.handle_clipboard_key(
+            key,
+            false,
+            cfg!(target_os = "windows"),
+            cfg!(target_os = "macos"),
+            window,
+            cx,
+        );
+        window.refresh();
+    }
+
+    #[cfg(target_os = "macos")]
+    fn handle_right_mouse_down(
+        &mut self,
+        _event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        window.focus(&self.focus_handle, cx);
+        let mut state = self.edit_state.borrow_mut();
+        if !state.editing {
+            *state = EditState::new(self.props.value.as_ref());
+            state.editing = true;
+        }
+        let can_paste = cx
+            .read_from_clipboard()
+            .and_then(|clipboard| clipboard.text())
+            .is_some_and(|text| !text.is_empty());
+        let request = MacTextContextMenuRequest {
+            input_id: self.props.id.to_string(),
+            has_selection: state.has_selection(),
+            can_paste,
+            password: self.props.password,
+        };
+        drop(state);
+        dispatch_mac_text_context_menu_request(&request);
+        window.refresh();
+    }
+
+    #[cfg(target_os = "macos")]
+    fn handle_mac_text_context_menu_action(
+        &mut self,
+        action: TextContextMenuAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mut state = self.edit_state.borrow_mut();
+        if !state.editing {
+            *state = EditState::new_fresh(self.props.value.as_ref());
+            state.editing = true;
+        }
+        drop(state);
+        let key = match action {
+            TextContextMenuAction::Cut => "x",
+            TextContextMenuAction::Copy => "c",
+            TextContextMenuAction::Paste => "v",
+            TextContextMenuAction::SelectAll => "a",
+        };
+        self.handle_clipboard_key(key, false, false, true, window, cx);
         window.refresh();
     }
 
@@ -2860,17 +2987,20 @@ impl Render for InputEntity {
                         this.handle_mouse_down(event, window, cx);
                     }),
                 )
-                .when(cfg!(target_os = "windows"), |element| {
-                    element.on_mouse_down(
-                        MouseButton::Right,
-                        cx.listener(|this, event: &MouseDownEvent, window, cx| {
-                            #[cfg(target_os = "windows")]
-                            this.handle_right_mouse_down(event, window, cx);
-                            #[cfg(not(target_os = "windows"))]
-                            let _ = (this, event, window, cx);
-                        }),
-                    )
-                })
+                .when(
+                    cfg!(any(target_os = "windows", target_os = "macos")),
+                    |element| {
+                        element.on_mouse_down(
+                            MouseButton::Right,
+                            cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                                #[cfg(any(target_os = "windows", target_os = "macos"))]
+                                this.handle_right_mouse_down(event, window, cx);
+                                #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+                                let _ = (this, event, window, cx);
+                            }),
+                        )
+                    },
+                )
                 .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
                     this.handle_mouse_move(event, window, cx);
                 }))

@@ -30,6 +30,14 @@ const SUPPORTED_FORMATS: [&str; 7] = [
     "https://www.douyin.com/jingxuan?modal_id=7701193143558901018",
     "https://www.douyin.com/jingxuan?modal_id=7674934407219793171",
 ];
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+const IDM_HOMEPAGE_URL: &str = "https://www.internetdownloadmanager.com/";
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+const ARIA2C_URL: &str = "https://aria2.org/";
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+const ROBUST_DOWNLOADER_URL: &str = "https://github.com/nilaoda/RobustDownloader/releases";
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+const DOWNLOADER_URL: &str = "https://github.com/nilaoda/SharpTools/tree/main/downloader";
 const SUPPORTED_XHS_FORMATS: [&str; 5] = [
     "75 【新巡演，整起！^_^ - 张杰 | 小红书 - 你的生活兴趣社区】 😆 RC8p7DRyJZO8KBy 😆 https://www.xiaohongshu.com/discovery/item/6a9e414d000000002a02d317?xsec_token=ABxxxx",
     "https://www.xiaohongshu.com/discovery/item/6a9e414d000000002a02d317?xsec_token=ABxxxx",
@@ -58,6 +66,42 @@ fn cookie_input_bg(dark: bool) -> gpui::Rgba {
     } else {
         gpui::rgb(0xffffff)
     }
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+fn link_text(
+    id: &'static str,
+    label: &'static str,
+    url: &'static str,
+    palette: Palette,
+) -> gpui::Stateful<Div> {
+    div()
+        .id(id)
+        .text_color(palette.primary)
+        .underline()
+        .text_decoration_color(palette.primary)
+        .text_decoration_solid()
+        .cursor_pointer()
+        .child(label.to_string())
+        .on_click(move |_, _, cx| cx.open_url(url))
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+fn plain_text(label: &'static str) -> Div {
+    div().child(label.to_string())
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+fn dialog_text_line(color: gpui::Rgba) -> Div {
+    div()
+        .w_full()
+        .flex()
+        .flex_wrap()
+        .items_center()
+        .gap_x(px(0.0))
+        .text_size(px(14.0))
+        .line_height(px(22.0))
+        .text_color(color)
 }
 
 #[cfg(any(target_os = "android", target_os = "ios"))]
@@ -345,6 +389,9 @@ impl AppView {
                 window,
                 cx,
             ),
+            Dialog::LivePhotoExport => {
+                self.dialog_live_photo_export(palette, card_width, max_card_height, cx)
+            }
             Dialog::ClearCache => self.dialog_clear_cache(palette, card_width, max_card_height, cx),
             Dialog::ClearCacheResult {
                 success,
@@ -380,9 +427,19 @@ impl AppView {
             Dialog::DownloadProgress => {
                 self.dialog_download_progress(palette, card_width, max_card_height, cx)
             }
-            Dialog::DownloadSaved { count, failed } => {
-                self.dialog_download_saved(palette, card_width, max_card_height, count, failed, cx)
-            }
+            Dialog::DownloadSaved {
+                count,
+                failed,
+                skipped,
+            } => self.dialog_download_saved(
+                palette,
+                card_width,
+                max_card_height,
+                count,
+                failed,
+                skipped,
+                cx,
+            ),
             Dialog::DownloadSummary { files } => {
                 self.dialog_download_summary(palette, card_width, max_card_height, files, cx)
             }
@@ -1021,8 +1078,8 @@ impl AppView {
             && gpui_android::native_editor_ime_preview_visible()
             && !self.xhs_cookie_editor_warmup
             && native_editor_owned_by(&xhs_cookie_input_id());
-        #[cfg(not(target_os = "android"))]
-        let ime_preview_visible = false;
+        #[cfg(all(not(target_os = "android"), not(target_os = "ios")))]
+        let _ime_preview_visible = false;
 
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
         let input_scroll = input_scroll.on_mouse_up_out(MouseButton::Left, {
@@ -1075,32 +1132,30 @@ impl AppView {
             // while the IME animates, so GPUI has to paint the field (chrome
             // and text) for those frames; otherwise the box looks empty.
             #[cfg(target_os = "android")]
-            // Always paint a GPUI copy underneath the native editor. The
-            // native view covers it while opaque, and the copy is already in
-            // place when that view turns transparent for the warm-up or IME
-            // animation, so the field can never flash empty between the two.
-            let gpui_paints_cookie_input = native_editor_enabled;
+            // In landscape the native editor has an opaque GPUI background
+            // but no IME preview, so its EditText remains transparent. A
+            // permanent GPUI text copy would then show through it as a glyph
+            // double image. Keep the copy only for warm-up and portrait IME
+            // animation frames, when Java hides the native text on purpose.
+            let gpui_paints_cookie_input = native_editor_enabled
+                && (!landscape || self.xhs_cookie_editor_warmup || ime_preview_visible);
             #[cfg(not(target_os = "android"))]
             let gpui_paints_cookie_input = false;
-            // While the IME animation runs, the native editor is transparent
-            // and GPUI paints the field. Show the same chrome the native view
-            // will draw so the box never flashes empty during the hand-off.
-            let draw_gpui_input_chrome =
-                !cfg!(target_os = "android") || !native_editor_enabled || gpui_paints_cookie_input;
-            if draw_gpui_input_chrome {
-                input_box = input_box.bg(cookie_input_bg(palette.dark)).child(
-                    div()
-                        .absolute()
-                        .inset_0()
-                        .rounded_md()
-                        .border_1()
-                        .border_color(if input_focused {
-                            palette.input_focus
-                        } else {
-                            palette.input_border
-                        }),
-                );
-            }
+            // The native editor paints its own border. Keep an opaque GPUI
+            // background and border underneath it so warm-up and IME preview
+            // frames still show the field without changing its geometry.
+            input_box = input_box.bg(cookie_input_bg(palette.dark)).child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(if input_focused {
+                        palette.input_focus
+                    } else {
+                        palette.input_border
+                    }),
+            );
             if gpui_paints_cookie_input {
                 // The native editor is transparent for the whole IME
                 // animation, so GPUI has to show the field's text too. It
@@ -1686,6 +1741,170 @@ impl AppView {
             .child(actions)
     }
 
+    fn dialog_live_photo_export(
+        &self,
+        palette: Palette,
+        width: f32,
+        max_height: f32,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let normal_entity = cx.entity();
+        let live_entity = cx.entity();
+        let cancel_entity = cx.entity();
+        let confirm_entity = cx.entity();
+        let live_selected = self.live_photo_dialog_choice;
+
+        let header = div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap(px(6.0))
+            .flex_shrink_0()
+            .child(self.dialog_title(palette, "导出格式", 20.0))
+            .child(
+                div()
+                    .text_size(px(14.0))
+                    .text_color(palette.text_secondary)
+                    .child("选择默认的导出方式"),
+            );
+
+        let normal_row = self.live_photo_option(
+            palette,
+            "live-photo-option-normal",
+            "普通视频 / 图片",
+            "按照原始格式保存",
+            !live_selected,
+            move |_, _, cx| {
+                normal_entity.update(cx, |this, cx| {
+                    this.live_photo_dialog_choice = false;
+                    cx.notify();
+                });
+            },
+        );
+        let live_row = self.live_photo_option(
+            palette,
+            "live-photo-option-live",
+            "实况照片（Live Photo）",
+            "保存为 iPhone 实况照片",
+            live_selected,
+            move |_, _, cx| {
+                live_entity.update(cx, |this, cx| {
+                    this.live_photo_dialog_choice = true;
+                    cx.notify();
+                });
+            },
+        );
+
+        let actions = self
+            .action_row()
+            .flex_shrink_0()
+            .child(
+                self.plain_action(palette, "live-photo-cancel", "取消", move |_, _, cx| {
+                    cancel_entity.update(cx, |this, cx| {
+                        this.dialog = None;
+                        cx.notify();
+                    });
+                }),
+            )
+            .child(self.primary_action(
+                palette,
+                "live-photo-confirm",
+                "确定",
+                move |_, _, cx| {
+                    confirm_entity.update(cx, |this, cx| {
+                        this.settings.live_photo_export = this.live_photo_dialog_choice;
+                        this.save_settings();
+                        this.dialog = None;
+                        let message = if this.settings.live_photo_export {
+                            "导出到相册时将封装为实况照片"
+                        } else {
+                            "导出到相册时将保存为图片和视频"
+                        };
+                        this.toast(message, ToastKind::Info, cx);
+                        cx.notify();
+                    });
+                },
+            ));
+
+        self.dialog_card(palette, width, max_height)
+            .child(header)
+            .child(
+                div()
+                    .w_full()
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.0))
+                    .child(normal_row)
+                    .child(live_row),
+            )
+            .child(actions)
+    }
+
+    fn live_photo_option(
+        &self,
+        palette: Palette,
+        id: &'static str,
+        title: &str,
+        subtitle: &str,
+        selected: bool,
+        on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    ) -> AnyElement {
+        let indicator = if selected {
+            div()
+                .w(px(22.0))
+                .h(px(22.0))
+                .flex_shrink_0()
+                .rounded(px(6.0))
+                .bg(palette.primary)
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(widgets::icon(icons::CHECK_MARK, 14.0, gpui::rgb(0xffffff)))
+                .into_any_element()
+        } else {
+            div()
+                .w(px(22.0))
+                .h(px(22.0))
+                .flex_shrink_0()
+                .rounded(px(6.0))
+                .border_1()
+                .border_color(palette.text_muted)
+                .into_any_element()
+        };
+        div()
+            .id(id)
+            .w_full()
+            .py(px(12.0))
+            .rounded(px(12.0))
+            .flex()
+            .items_center()
+            .gap(px(12.0))
+            .cursor_pointer()
+            .on_click(on_click)
+            .child(
+                div()
+                    .flex_1()
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.0))
+                    .child(
+                        div()
+                            .text_size(px(17.0))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(palette.text)
+                            .child(title.to_string()),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(14.0))
+                            .text_color(palette.text_secondary)
+                            .child(subtitle.to_string()),
+                    ),
+            )
+            .child(indicator)
+            .into_any_element()
+    }
+
     #[cfg(target_os = "windows")]
     fn dialog_export_method(
         &self,
@@ -1696,6 +1915,7 @@ impl AppView {
     ) -> Div {
         let script_entity = cx.entity();
         let idm_entity = cx.entity();
+        let cancel_entity = cx.entity();
         self.dialog_card(palette, width, max_height)
             .child(
                 self.dialog_title(palette, "导出与下载", 20.0)
@@ -1704,16 +1924,33 @@ impl AppView {
             .child(
                 self.dialog_content_scroll("export-method-content-scroll")
                     .child(
-                        div()
-                            .text_size(px(14.0))
-                            .line_height(px(22.0))
-                            .text_color(palette.text)
-                            .child("请选择导出方式。"),
+                        dialog_text_line(palette.text)
+                            .child(plain_text(
+                                "请根据需求选择导出的方式，支持导出下载脚本和使用 ",
+                            ))
+                            .child(link_text(
+                                "export-method-idm-homepage-link",
+                                "Internet Download Manager (IDM) ",
+                                IDM_HOMEPAGE_URL,
+                                palette,
+                            ))
+                            .child(plain_text("下载")),
                     ),
             )
             .child(
                 self.action_row()
                     .flex_shrink_0()
+                    .child(self.plain_action(
+                        palette,
+                        "export-method-cancel",
+                        "取消",
+                        move |_, _, cx| {
+                            cancel_entity.update(cx, |this, cx| {
+                                this.dialog = None;
+                                cx.notify();
+                            });
+                        },
+                    ))
                     .child(self.outline_action(
                         palette,
                         "export-method-script",
@@ -1752,11 +1989,15 @@ impl AppView {
             .child(
                 self.dialog_content_scroll("idm-selection-content-scroll")
                     .child(
-                        div()
-                            .text_size(px(14.0))
-                            .line_height(px(22.0))
-                            .text_color(palette.text)
-                            .child("请选择要导出到 IDM 的资源范围：原画仅保留视频中的原画条目。"),
+                        dialog_text_line(palette.text)
+                            .child(plain_text("请选择要导出到 "))
+                            .child(link_text(
+                                "idm-selection-homepage-link",
+                                "IDM",
+                                IDM_HOMEPAGE_URL,
+                                palette,
+                            ))
+                            .child(plain_text(" 的资源范围：原画仅保留视频中的原画条目")),
                     ),
             )
             .child(
@@ -1856,6 +2097,42 @@ impl AppView {
         let all_entity = cx.entity();
         let original_entity = cx.entity();
 
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
+        let export_selection_content = dialog_text_line(palette.text)
+            .child(plain_text(
+                "请选择要导出的资源范围：原画仅导出视频中的原画条目，支持 ",
+            ))
+            .child(link_text(
+                "export-selection-aria2c-link",
+                "aria2c",
+                ARIA2C_URL,
+                palette,
+            ))
+            .child(plain_text("、"))
+            .child(link_text(
+                "export-selection-downloader-link",
+                "downloader",
+                DOWNLOADER_URL,
+                palette,
+            ))
+            .child(plain_text("、"))
+            .child(link_text(
+                "export-selection-robust-downloader-link",
+                "RobustDownloader",
+                ROBUST_DOWNLOADER_URL,
+                palette,
+            ))
+            .child(plain_text(" 下载脚本"))
+            .into_any_element();
+
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+        let export_selection_content = div()
+            .text_size(px(14.0))
+            .line_height(px(22.0))
+            .text_color(palette.text)
+            .child("请选择要导出的资源范围：原画仅导出视频中的原画条目，支持 aria2c、downloader、RobustDownloader 下载脚本")
+            .into_any_element();
+
         self.dialog_card(palette, width, max_height)
             .child(
                 self.dialog_title(palette, "导出下载脚本", 20.0)
@@ -1863,13 +2140,7 @@ impl AppView {
             )
             .child(
                 self.dialog_content_scroll("export-selection-content-scroll")
-                    .child(
-                        div()
-                            .text_size(px(14.0))
-                            .line_height(px(22.0))
-                            .text_color(palette.text)
-                            .child("请选择要导出的资源范围：原画仅导出视频中的原画条目。"),
-                    ),
+                    .child(export_selection_content),
             )
             .child(
                 self.action_row()
@@ -2160,9 +2431,33 @@ impl AppView {
         max_height: f32,
         count: usize,
         failed: usize,
+        skipped: usize,
         cx: &mut Context<Self>,
     ) -> Div {
         let entity = cx.entity();
+        let summary = if failed > 0 {
+            format!("{count} 个资源已保存到系统相册，{failed} 个下载失败")
+        } else {
+            format!("{count} 个资源已保存到系统相册")
+        };
+        let mut content = self
+            .dialog_content_scroll("download-saved-content-scroll")
+            .child(
+                div()
+                    .text_size(px(14.0))
+                    .line_height(px(22.0))
+                    .text_color(palette.text)
+                    .child(summary),
+            );
+        if skipped > 0 {
+            content = content.child(
+                div()
+                    .text_size(px(14.0))
+                    .line_height(px(22.0))
+                    .text_color(palette.text_secondary)
+                    .child(format!("已跳过 {skipped} 个 MP3 文件（相册不支持音频）")),
+            );
+        }
         self.dialog_card(palette, width, max_height)
             .child(
                 div()
@@ -2177,16 +2472,7 @@ impl AppView {
                     ))
                     .child(self.dialog_title(palette, "下载完成", 20.0)),
             )
-            .child(
-                self.dialog_content_scroll("download-saved-content-scroll")
-                    .child(div().text_size(px(14.0)).text_color(palette.text).child(
-                        if failed > 0 {
-                            format!("{count} 个资源已保存到系统相册，{failed} 个下载失败")
-                        } else {
-                            format!("{count} 个资源已保存到系统相册")
-                        },
-                    )),
-            )
+            .child(content)
             .child(self.action_row().flex_shrink_0().child(self.primary_action(
                 palette,
                 "download-saved-ok",

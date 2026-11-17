@@ -6,6 +6,8 @@ use std::time::Duration;
 
 use gpui::{Context, WeakEntity};
 
+use douyin_core::extractor::{MediaEntry, MediaKind};
+
 use crate::download::{self, DownloadEvent};
 use crate::download_icon::report as report_download_icon_progress;
 use crate::download_sound::play_finish_sound;
@@ -13,6 +15,10 @@ use crate::paths::is_desktop;
 use crate::{AppView, Dialog, DownloadUi, ResourceScope, ResultItem, ToastKind};
 
 pub(crate) fn has_multiple_video_qualities(item: &ResultItem) -> bool {
+    // 图文笔记里的视频是各张实况图自带的，不算同一视频的画质选择。
+    if item.media_kind == MediaKind::Image {
+        return false;
+    }
     let mut qualities = std::collections::HashSet::new();
     for entry in item
         .entries
@@ -35,12 +41,83 @@ pub(crate) fn has_multiple_video_qualities(item: &ResultItem) -> bool {
     false
 }
 
+#[derive(Default)]
+struct DownloadPlan {
+    urls: Vec<String>,
+    titles: Vec<String>,
+    extensions: Vec<Option<String>>,
+    live_videos: Vec<Option<String>>,
+    skipped_audio: usize,
+}
+
+fn build_download_plan(
+    results: &[ResultItem],
+    scope: ResourceScope,
+    live_mode: bool,
+    skip_audio: bool,
+) -> DownloadPlan {
+    let mut plan = DownloadPlan::default();
+    for item in results {
+        let selected = item.select_entries(scope);
+        let mut paired = vec![false; selected.len()];
+        for (index, entry) in selected.iter().enumerate() {
+            if paired[index] {
+                continue;
+            }
+            // 相册不支持音频：手机端跳过背景音乐等音频条目。
+            if skip_audio && is_audio_entry(entry) {
+                plan.skipped_audio += 1;
+                continue;
+            }
+            // 实况模式：图片与其后的 LIVE 动轨配对，动轨随照片封装，不再单独保存。
+            let mut live_video = None;
+            if live_mode && !ResultItem::is_video_entry(entry) {
+                if let Some(next) = selected.get(index + 1) {
+                    if !paired[index + 1] && is_live_entry(next) {
+                        paired[index + 1] = true;
+                        live_video = Some(next.url.clone());
+                    }
+                }
+            }
+            plan.urls.push(entry.url.clone());
+            plan.titles.push(item.title.clone());
+            plan.extensions.push(entry.extension.clone());
+            plan.live_videos.push(live_video);
+        }
+    }
+    plan
+}
+
+fn is_audio_entry(entry: &MediaEntry) -> bool {
+    let extension = entry
+        .extension
+        .as_deref()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if matches!(extension.as_str(), "mp3" | "m4a" | "aac" | "wav" | "flac") {
+        return true;
+    }
+    let path = entry.url.split('?').next().unwrap_or(&entry.url);
+    path.to_ascii_lowercase()
+        .rsplit('.')
+        .next()
+        .is_some_and(|ext| matches!(ext, "mp3" | "m4a" | "aac" | "wav" | "flac"))
+}
+
+/// 抖音与小红书的实况动轨都紧跟其图片并标记 `LIVE`。
+fn is_live_entry(entry: &MediaEntry) -> bool {
+    entry
+        .quality
+        .as_deref()
+        .is_some_and(|quality| quality.trim().eq_ignore_ascii_case("LIVE"))
+}
+
 #[cfg(test)]
 mod tests {
     use douyin_core::extractor::{MediaEntry, MediaKind, MediaPlatform};
 
-    use super::has_multiple_video_qualities;
-    use crate::ResultItem;
+    use super::{build_download_plan, has_multiple_video_qualities};
+    use crate::{ResourceScope, ResultItem};
 
     fn video(quality: Option<&str>) -> MediaEntry {
         MediaEntry {
@@ -82,6 +159,101 @@ mod tests {
             video(Some("720P")),
             video(None),
         ])));
+    }
+
+    #[test]
+    fn image_note_live_videos_are_not_quality_choices() {
+        let mut image_item = item(vec![video(Some("原画")), video(Some("LIVE"))]);
+        image_item.media_kind = MediaKind::Image;
+        assert!(!has_multiple_video_qualities(&image_item));
+    }
+
+    fn image_note(entries: Vec<MediaEntry>) -> ResultItem {
+        let mut image_item = item(entries);
+        image_item.media_kind = MediaKind::Image;
+        image_item
+    }
+
+    fn image(url: &str) -> MediaEntry {
+        MediaEntry {
+            url: url.to_string(),
+            extension: Some("jpg".to_string()),
+            ..Default::default()
+        }
+    }
+
+    fn audio() -> MediaEntry {
+        MediaEntry {
+            url: "https://example.com/music.mp3".to_string(),
+            extension: Some("mp3".to_string()),
+            quality: Some("背景音乐".to_string()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn mobile_skips_audio_entries() {
+        let plan = build_download_plan(
+            &[image_note(vec![
+                image("https://example.com/a.jpg"),
+                audio(),
+            ])],
+            ResourceScope::All,
+            false,
+            true,
+        );
+        assert_eq!(plan.urls.len(), 1);
+        assert_eq!(plan.skipped_audio, 1);
+    }
+
+    #[test]
+    fn desktop_keeps_audio_entries() {
+        let plan = build_download_plan(
+            &[image_note(vec![
+                image("https://example.com/a.jpg"),
+                audio(),
+            ])],
+            ResourceScope::All,
+            false,
+            false,
+        );
+        assert_eq!(plan.urls.len(), 2);
+        assert_eq!(plan.skipped_audio, 0);
+    }
+
+    #[test]
+    fn live_mode_pairs_image_with_following_live_video() {
+        let plan = build_download_plan(
+            &[image_note(vec![
+                image("https://example.com/a.jpg"),
+                video(Some("LIVE")),
+                image("https://example.com/b.jpg"),
+            ])],
+            ResourceScope::All,
+            true,
+            true,
+        );
+        assert_eq!(plan.urls.len(), 2);
+        assert_eq!(
+            plan.live_videos[0].as_deref(),
+            Some("https://example.com/video.mp4")
+        );
+        assert_eq!(plan.live_videos[1], None);
+    }
+
+    #[test]
+    fn non_live_mode_keeps_motion_videos_separate() {
+        let plan = build_download_plan(
+            &[image_note(vec![
+                image("https://example.com/a.jpg"),
+                video(Some("LIVE")),
+            ])],
+            ResourceScope::All,
+            false,
+            true,
+        );
+        assert_eq!(plan.urls.len(), 2);
+        assert!(plan.live_videos.iter().all(Option::is_none));
     }
 }
 
@@ -145,30 +317,38 @@ impl AppView {
     }
 
     fn begin_download(&mut self, directory: PathBuf, cx: &mut Context<Self>) {
-        let mut urls = Vec::new();
-        let mut titles = Vec::new();
-        let mut extensions = Vec::new();
-        for item in &self.results {
-            let selected = item.select_entries(self.download_scope);
-            for entry in selected {
-                urls.push(entry.url.clone());
-                titles.push(item.title.clone());
-                extensions.push(entry.extension.clone());
-            }
-        }
-        let total = urls.len();
+        let plan = build_download_plan(
+            &self.results,
+            self.download_scope,
+            cfg!(target_os = "ios") && self.settings.live_photo_export,
+            !is_desktop(),
+        );
+        let total = plan.urls.len();
         if total == 0 {
             report_download_icon_progress(None);
+            if !is_desktop() {
+                let message = if plan.skipped_audio > 0 {
+                    format!(
+                        "已跳过 {} 个 MP3 文件，没有可保存到相册的资源",
+                        plan.skipped_audio
+                    )
+                } else {
+                    "没有可保存到相册的资源".to_string()
+                };
+                self.toast(message, ToastKind::Info, cx);
+            }
             return;
         }
-        let ui = DownloadUi::new(total);
+        let mut ui = DownloadUi::new(total);
+        ui.skipped_audio = plan.skipped_audio;
         let cancel = ui.cancel.clone();
         let (tx, rx) = std::sync::mpsc::channel();
         crate::paths::ensure_dir(&self.paths.cache_dir);
         download::start_downloads(
-            urls,
-            titles,
-            extensions,
+            plan.urls,
+            plan.titles,
+            plan.extensions,
+            plan.live_videos,
             directory,
             self.paths.cache_dir.clone(),
             cancel,
@@ -279,6 +459,7 @@ impl AppView {
         let total = ui.total;
         let files = ui.files.clone();
         let errors = ui.errors.clone();
+        let skipped_audio = ui.skipped_audio;
         let cancelled = ui.cancel.load(Ordering::Relaxed);
         let failed = errors.len().min(total.saturating_sub(success));
 
@@ -306,15 +487,26 @@ impl AppView {
             self.dialog = Some(Dialog::DownloadSaved {
                 count: files.len(),
                 failed,
+                skipped: skipped_audio,
             });
         } else if cancelled {
             self.toast("下载已取消", ToastKind::Info, cx);
             self.dialog = None;
         } else if let Some(error) = errors.first() {
-            self.toast(format!("下载失败: {error}"), ToastKind::Error, cx);
+            let message = if skipped_audio > 0 {
+                format!("下载失败: {error}（已跳过 {skipped_audio} 个 MP3 文件）")
+            } else {
+                format!("下载失败: {error}")
+            };
+            self.toast(message, ToastKind::Error, cx);
             self.dialog = None;
         } else {
-            self.toast(format!("下载失败: 0/{total} 个视频"), ToastKind::Error, cx);
+            let message = if skipped_audio > 0 {
+                format!("下载失败: 0/{total} 个视频（已跳过 {skipped_audio} 个 MP3 文件）")
+            } else {
+                format!("下载失败: 0/{total} 个视频")
+            };
+            self.toast(message, ToastKind::Error, cx);
             self.dialog = None;
         }
         cx.notify();

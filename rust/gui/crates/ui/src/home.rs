@@ -346,7 +346,10 @@ impl AppView {
                         .title
                         .filter(|title| !title.trim().is_empty())
                         .unwrap_or_else(|| match result.platform {
-                            MediaPlatform::Douyin => format!("抖音视频_{}", items.len() + 1),
+                            MediaPlatform::Douyin => match result.media_kind {
+                                MediaKind::Image => format!("抖音图文_{}", items.len() + 1),
+                                MediaKind::Video => format!("抖音视频_{}", items.len() + 1),
+                            },
                             MediaPlatform::Xhs => format!("小红书笔记_{}", items.len() + 1),
                         });
                     items.push(ResultItem {
@@ -1360,8 +1363,8 @@ impl AppView {
                 MediaKind::Image => "图片",
             };
             let kind_color = match item.media_kind {
-                MediaKind::Video => 0x2e7d32,
-                MediaKind::Image => 0x9c27b0,
+                MediaKind::Video => crate::theme::PRIMARY,
+                MediaKind::Image => 0xD12CFE,
             };
             let summary = self.entry_summary(item.primary_entry());
             let mut lines: Vec<AnyElement> = Vec::new();

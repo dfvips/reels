@@ -123,13 +123,42 @@ impl AppView {
                 self.render_item(
                     palette,
                     "settings-storage",
-                    icons::FOLDER.as_bytes(),
+                    widgets::gradient_icon(icons::FOLDER.as_bytes(), 24.0, &cx.svg_renderer()),
                     "存储设置",
                     "设置视频保存的默认位置",
                     move |window, cx| {
                         window.blur(cx);
                         entity.update(cx, |this, cx| {
                             this.open_save_location_dialog(cx);
+                        });
+                    },
+                )
+                .into_any_element(),
+            );
+            items.push(widgets::divider(palette).into_any_element());
+        }
+
+        #[cfg(target_os = "ios")]
+        {
+            let entity = cx.entity();
+            let live_subtitle = if self.settings.live_photo_export {
+                "导出到相册时封装为实况照片"
+            } else {
+                "导出到相册时保存为图片和视频"
+            };
+            items.push(
+                self.render_item(
+                    palette,
+                    "settings-live-photo",
+                    widgets::gradient_icon(icons::LIVE_PHOTO, 24.0, &cx.svg_renderer()),
+                    "实况照片",
+                    live_subtitle,
+                    move |window, cx| {
+                        window.blur(cx);
+                        entity.update(cx, |this, cx| {
+                            this.live_photo_dialog_choice = this.settings.live_photo_export;
+                            this.dialog = Some(Dialog::LivePhotoExport);
+                            cx.notify();
                         });
                     },
                 )
@@ -148,7 +177,7 @@ impl AppView {
             self.render_item(
                 palette,
                 "settings-cookie",
-                icons::LOCK.as_bytes(),
+                widgets::gradient_icon(icons::LOCK.as_bytes(), 24.0, &cx.svg_renderer()),
                 "Cookie 设置",
                 &format!("仅用于小红书 · {cookie_status}"),
                 move |window, cx| {
@@ -167,7 +196,7 @@ impl AppView {
             self.render_item(
                 palette,
                 "settings-help",
-                icons::HELP.as_bytes(),
+                widgets::gradient_icon(icons::HELP.as_bytes(), 24.0, &cx.svg_renderer()),
                 "使用说明",
                 "查看支持的链接格式与使用方式",
                 move |window, cx| {
@@ -187,7 +216,7 @@ impl AppView {
             self.render_item(
                 palette,
                 "settings-about",
-                icons::INFO.as_bytes(),
+                widgets::gradient_icon(icons::INFO.as_bytes(), 24.0, &cx.svg_renderer()),
                 "关于",
                 &format!("应用版本: {APP_VERSION}"),
                 move |window, cx| {
@@ -212,7 +241,7 @@ impl AppView {
             self.render_item(
                 palette,
                 "settings-cache",
-                icons::TRASH.as_bytes(),
+                widgets::gradient_icon(icons::TRASH.as_bytes(), 24.0, &cx.svg_renderer()),
                 "清除缓存",
                 &cache_subtitle,
                 move |window, cx| {
@@ -239,7 +268,7 @@ impl AppView {
         &self,
         palette: Palette,
         id: &'static str,
-        icon: &'static [u8],
+        icon: AnyElement,
         title: &str,
         subtitle: &str,
         on_click: impl Fn(&mut Window, &mut gpui::App) + 'static,
@@ -257,11 +286,7 @@ impl AppView {
             .on_click(move |_, window, cx| {
                 handler(window, cx);
             })
-            .child(
-                div()
-                    .mr(px(16.0))
-                    .child(widgets::GradientIcon::new(icon, 24.0)),
-            )
+            .child(div().mr(px(16.0)).child(icon))
             .child(
                 div()
                     .flex_1()

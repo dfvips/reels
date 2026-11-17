@@ -1,6 +1,6 @@
 //! 解析编排：链接解析、接口请求与播放地址提取。
 
-use crate::api::DouyinApi;
+use crate::api::{AwemeDetail, DouyinApi};
 use crate::http::HttpClient;
 use crate::url_parser;
 use crate::xhs;
@@ -195,6 +195,55 @@ impl VideoExtractor {
         }
     }
 
+    /// 图文 / 实况作品：每张图一条，实况图紧跟其动轨视频，
+    /// 动轨与小红书一致标记 `LIVE`。
+    fn image_entries(&self, detail: &AwemeDetail) -> Vec<MediaEntry> {
+        let mut entries = Vec::new();
+        for image in &detail.images {
+            entries.push(MediaEntry {
+                url: image.url.clone(),
+                extension: image_extension(&image.url),
+                size_bytes: self.http.head_content_length(&image.url),
+                width: image.width,
+                height: image.height,
+                ..Default::default()
+            });
+            let Some(live) = image.live_video.as_ref() else {
+                continue;
+            };
+            let original_url = live
+                .play_uri
+                .as_deref()
+                .and_then(|uri| self.http.get_final_video_url(uri))
+                .filter(|url| is_original_video_url(url));
+            let (video_url, is_original) = match original_url {
+                Some(original_url) => (original_url, true),
+                None => {
+                    let Some(live_url) = live.play_urls.first().cloned() else {
+                        continue;
+                    };
+                    (live_url, false)
+                }
+            };
+            let size_bytes = if is_original {
+                self.http.head_content_length(&video_url)
+            } else {
+                live.size_bytes
+                    .or_else(|| self.http.head_content_length(&video_url))
+            };
+            entries.push(MediaEntry {
+                url: video_url,
+                extension: Some("mp4".to_string()),
+                duration_secs: live.duration_ms.map(|ms| ms / 1000),
+                size_bytes,
+                quality: Some("LIVE".to_string()),
+                width: live.width,
+                height: live.height,
+            });
+        }
+        entries
+    }
+
     fn extract_douyin(&self, url: &str) -> ExtractionResult {
         let mut page_url = url.to_string();
         let mut aweme_id = url_parser::extract_aweme_id(url);
@@ -226,6 +275,35 @@ impl VideoExtractor {
 
         // 首选：签名接口（不依赖页面结构）
         if let Some(detail) = self.api.fetch_aweme_detail(&aweme_id) {
+            // 图文 / 实况作品：图片逐张输出，实况图额外带上对应的视频；
+            // 视频若存在原画源（aweme/v1/play 解析到 tos-cn-v 原画）再补一条“原画”。
+            if !detail.images.is_empty() {
+                let mut entries = self.image_entries(&detail);
+                if let Some(music) = &detail.music {
+                    entries.push(MediaEntry {
+                        url: music.url.clone(),
+                        extension: Some("mp3".to_string()),
+                        duration_secs: music.duration_secs,
+                        size_bytes: self.http.head_content_length(&music.url),
+                        quality: Some("背景音乐".to_string()),
+                        ..Default::default()
+                    });
+                }
+                if entries.is_empty() {
+                    return ExtractionResult::failure(
+                        url,
+                        MediaPlatform::Douyin,
+                        "未找到可下载的图片或视频",
+                    );
+                }
+                return ExtractionResult::success(
+                    url,
+                    MediaPlatform::Douyin,
+                    MediaKind::Image,
+                    detail.desc.clone(),
+                    entries,
+                );
+            }
             // 原画优先：play_addr.uri 通过 aweme/v1/play 会重定向到
             // tos-cn-v-0015c002 原画（通常为 4K/H.265，远大于 web 播放地址）。
             // 接口失败时回退到 web play_addr。
@@ -361,6 +439,22 @@ impl VideoExtractor {
             vec![entry],
         )
     }
+}
+
+fn image_extension(url: &str) -> Option<String> {
+    let path = url.split('?').next().unwrap_or(url).to_ascii_lowercase();
+    let extension = path.rsplit('.').next()?;
+    match extension {
+        "jpg" | "jpeg" => Some("jpg".to_string()),
+        "png" | "webp" | "gif" | "heic" | "avif" => Some(extension.to_string()),
+        _ => None,
+    }
+}
+
+/// 抖音原画源路径形如 `/video/tos/cn/tos-cn-v-0015c002/...`；
+/// 普通 web 清晰度为 `tos-cn-ve-...`，不视为原画。
+fn is_original_video_url(url: &str) -> bool {
+    url.contains("tos-cn-v-")
 }
 
 /// gear_name 形如 `adapt_720_1080`、`normal_540_720`；提取分辨率

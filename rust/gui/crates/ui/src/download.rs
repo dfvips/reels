@@ -27,6 +27,7 @@ pub enum DownloadEvent {
     Failed {
         index: usize,
         error: String,
+        timed_out: bool,
     },
     Finished,
 }
@@ -34,6 +35,51 @@ pub enum DownloadEvent {
 const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 const PARALLEL_THRESHOLD_BYTES: u64 = 50 * 1024 * 1024;
 const PARALLEL_SEGMENT_COUNT: u64 = 6;
+/// 链接超过该时间没有任何进展（连接、响应头或读取数据）就判定为卡死并跳过。
+const STALL_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[derive(Debug)]
+struct DownloadError {
+    message: String,
+    timed_out: bool,
+}
+
+impl DownloadError {
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            timed_out: false,
+        }
+    }
+
+    fn timeout() -> Self {
+        Self {
+            message: "下载超时（超过 10 秒无响应）".to_string(),
+            timed_out: true,
+        }
+    }
+
+    fn from_reqwest(context: &str, error: reqwest::Error) -> Self {
+        if error.is_timeout() {
+            Self::timeout()
+        } else {
+            Self::new(format!("{context}: {error}"))
+        }
+    }
+
+    fn from_io(context: &str, error: std::io::Error) -> Self {
+        // 阻塞版 reqwest 把读取超时包装成 io::Error，原始类型藏在 source 里。
+        let timed_out = error
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<reqwest::Error>())
+            .is_some_and(reqwest::Error::is_timeout);
+        if timed_out {
+            Self::timeout()
+        } else {
+            Self::new(format!("{context}: {error}"))
+        }
+    }
+}
 
 pub fn start_downloads(
     urls: Vec<String>,
@@ -47,8 +93,10 @@ pub fn start_downloads(
 ) {
     std::thread::spawn(move || {
         let client = match reqwest::blocking::Client::builder()
-            .connect_timeout(Duration::from_secs(30))
-            .timeout(Duration::from_secs(12 * 60 * 60))
+            .connect_timeout(STALL_TIMEOUT)
+            // 阻塞版 reqwest 的 timeout 按单次读写（及等待响应头）计时，
+            // 因此只限制“停滞”，不会截断长时间的大文件下载。
+            .timeout(STALL_TIMEOUT)
             .build()
         {
             Ok(client) => client,
@@ -56,6 +104,7 @@ pub fn start_downloads(
                 let _ = tx.send(DownloadEvent::Failed {
                     index: 0,
                     error: format!("初始化下载失败: {error}"),
+                    timed_out: false,
                 });
                 let _ = tx.send(DownloadEvent::Finished);
                 return;
@@ -119,11 +168,18 @@ pub fn start_downloads(
                                 Err(error) => {
                                     if cancel.load(Ordering::Relaxed) {
                                         let _ = std::fs::remove_file(&temp_path);
-                                        let _ = tx.send(DownloadEvent::Failed { index, error });
+                                        let _ = tx.send(DownloadEvent::Failed {
+                                            index,
+                                            error: error.message,
+                                            timed_out: error.timed_out,
+                                        });
                                         continue;
                                     }
                                     // 动轨下载失败时仍保存照片，避免整条丢失。
-                                    eprintln!("实况动轨下载失败，改为仅保存照片: {error}");
+                                    eprintln!(
+                                        "实况动轨下载失败，改为仅保存照片: {}",
+                                        error.message
+                                    );
                                     None
                                 }
                             }
@@ -161,12 +217,20 @@ pub fn start_downloads(
                                 let _ = std::fs::remove_file(live_path);
                             }
                             let _ = std::fs::remove_file(&temp_path);
-                            let _ = tx.send(DownloadEvent::Failed { index, error });
+                            let _ = tx.send(DownloadEvent::Failed {
+                                index,
+                                error,
+                                timed_out: false,
+                            });
                         }
                     }
                 }
                 Err(error) => {
-                    let _ = tx.send(DownloadEvent::Failed { index, error });
+                    let _ = tx.send(DownloadEvent::Failed {
+                        index,
+                        error: error.message,
+                        timed_out: error.timed_out,
+                    });
                 }
             }
         }
@@ -199,7 +263,7 @@ fn download_live_companion(
     index: usize,
     cancel: &Arc<AtomicBool>,
     tx: &Sender<DownloadEvent>,
-) -> Result<PathBuf, String> {
+) -> Result<PathBuf, DownloadError> {
     let companion_name = format!("{file_name}-live.mp4");
     let temp_path = cache_dir.join(format!("{companion_name}.part"));
     download_one(client, url, &temp_path, "mp4", index, cancel, tx)?;
@@ -214,9 +278,9 @@ fn download_live_companion(
             }
             Err(copy_error) => {
                 let _ = std::fs::remove_file(&temp_path);
-                Err(format!(
+                Err(DownloadError::new(format!(
                     "保存实况视频失败: 移动失败: {rename_error}; 复制失败: {copy_error}"
-                ))
+                )))
             }
         },
     }
@@ -238,7 +302,7 @@ fn download_one(
     index: usize,
     cancel: &Arc<AtomicBool>,
     tx: &Sender<DownloadEvent>,
-) -> Result<(), String> {
+) -> Result<(), DownloadError> {
     if is_video_extension(extension) {
         if let Some(total) = probe_range_total(client, url) {
             if total > PARALLEL_THRESHOLD_BYTES {
@@ -252,31 +316,31 @@ fn download_one(
         .header(reqwest::header::USER_AGENT, USER_AGENT)
         .header(reqwest::header::REFERER, referer_for(url))
         .send()
-        .map_err(|error| format!("下载请求失败: {error}"))?
+        .map_err(|error| DownloadError::from_reqwest("下载请求失败", error))?
         .error_for_status()
-        .map_err(|error| format!("服务器返回错误: {error}"))?;
+        .map_err(|error| DownloadError::from_reqwest("服务器返回错误", error))?;
 
     let total = response.content_length().unwrap_or(0);
     let _ = tx.send(DownloadEvent::Started { index, total });
 
-    let mut file =
-        std::fs::File::create(temp_path).map_err(|error| format!("创建临时文件失败: {error}"))?;
+    let mut file = std::fs::File::create(temp_path)
+        .map_err(|error| DownloadError::new(format!("创建临时文件失败: {error}")))?;
     let mut buffer = vec![0u8; 64 * 1024];
     let mut downloaded = 0u64;
     let mut last_reported = 0u64;
 
     loop {
         if cancel.load(Ordering::Relaxed) {
-            return Err("下载已取消".to_string());
+            return Err(DownloadError::new("下载已取消"));
         }
         let read = response
             .read(&mut buffer)
-            .map_err(|error| format!("读取数据失败: {error}"))?;
+            .map_err(|error| DownloadError::from_io("读取数据失败", error))?;
         if read == 0 {
             break;
         }
         file.write_all(&buffer[..read])
-            .map_err(|error| format!("写入文件失败: {error}"))?;
+            .map_err(|error| DownloadError::new(format!("写入文件失败: {error}")))?;
         downloaded += read as u64;
         if downloaded - last_reported >= 128 * 1024 || downloaded == total {
             last_reported = downloaded;
@@ -328,7 +392,7 @@ fn download_parallel(
     index: usize,
     cancel: &Arc<AtomicBool>,
     tx: &Sender<DownloadEvent>,
-) -> Result<(), String> {
+) -> Result<(), DownloadError> {
     let segment_count = PARALLEL_SEGMENT_COUNT.min(total);
     let segment_size = total / segment_count;
     let progress = Arc::new(Mutex::new(vec![0u64; segment_count as usize]));
@@ -342,7 +406,7 @@ fn download_parallel(
         .truncate(true)
         .open(temp_path)
         .and_then(|file| file.set_len(total))
-        .map_err(|error| format!("创建临时文件失败: {error}"))?;
+        .map_err(|error| DownloadError::new(format!("创建临时文件失败: {error}")))?;
 
     let mut results = Vec::new();
     std::thread::scope(|scope| {
@@ -370,13 +434,18 @@ fn download_parallel(
         for handle in handles {
             results.push(match handle.join() {
                 Ok(result) => result,
-                Err(_) => Err("下载线程异常退出".to_string()),
+                Err(_) => Err(DownloadError::new("下载线程异常退出")),
             });
         }
     });
 
-    if let Some(error) = results.into_iter().find_map(|result| result.err()) {
-        return Err(error);
+    // 任一分片失败会中断其余分片；优先上报超时，避免被“已中断”掩盖。
+    let mut errors: Vec<DownloadError> = results.into_iter().filter_map(Result::err).collect();
+    if let Some(index) = errors.iter().position(|error| error.timed_out) {
+        return Err(errors.swap_remove(index));
+    }
+    if !errors.is_empty() {
+        return Err(errors.swap_remove(0));
     }
     Ok(())
 }
@@ -395,7 +464,7 @@ fn download_segment(
     cancel: &Arc<AtomicBool>,
     abort: &Arc<AtomicBool>,
     tx: &Sender<DownloadEvent>,
-) -> Result<u64, String> {
+) -> Result<u64, DownloadError> {
     let expected = end - start + 1;
     let mut response = client
         .get(url)
@@ -403,38 +472,38 @@ fn download_segment(
         .header(reqwest::header::REFERER, referer_for(url))
         .header(reqwest::header::RANGE, format!("bytes={start}-{end}"))
         .send()
-        .map_err(|error| format!("下载请求失败: {error}"))?
+        .map_err(|error| DownloadError::from_reqwest("下载请求失败", error))?
         .error_for_status()
-        .map_err(|error| format!("服务器返回错误: {error}"))?;
+        .map_err(|error| DownloadError::from_reqwest("服务器返回错误", error))?;
     if response.status().as_u16() != 206 {
-        return Err("服务器不支持分段下载".to_string());
+        return Err(DownloadError::new("服务器不支持分段下载"));
     }
 
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .open(temp_path)
-        .map_err(|error| format!("打开临时文件失败: {error}"))?;
+        .map_err(|error| DownloadError::new(format!("打开临时文件失败: {error}")))?;
     file.seek(SeekFrom::Start(start))
-        .map_err(|error| format!("定位写入位置失败: {error}"))?;
+        .map_err(|error| DownloadError::new(format!("定位写入位置失败: {error}")))?;
     let mut buffer = vec![0u8; 64 * 1024];
     let mut downloaded = 0u64;
     let mut last_reported = 0u64;
 
     loop {
         if cancel.load(Ordering::Relaxed) {
-            return Err("下载已取消".to_string());
+            return Err(DownloadError::new("下载已取消"));
         }
         if abort.load(Ordering::Relaxed) {
-            return Err("下载已中断".to_string());
+            return Err(DownloadError::new("下载已中断"));
         }
         let read = response
             .read(&mut buffer)
-            .map_err(|error| format!("读取数据失败: {error}"))?;
+            .map_err(|error| DownloadError::from_io("读取数据失败", error))?;
         if read == 0 {
             break;
         }
         file.write_all(&buffer[..read])
-            .map_err(|error| format!("写入分片失败: {error}"))?;
+            .map_err(|error| DownloadError::new(format!("写入分片失败: {error}")))?;
         downloaded += read as u64;
         if downloaded - last_reported >= 128 * 1024 {
             last_reported = downloaded;
@@ -443,9 +512,9 @@ fn download_segment(
     }
 
     if downloaded != expected {
-        return Err(format!(
+        return Err(DownloadError::new(format!(
             "分片长度错误: 期望 {expected} 字节，实际 {downloaded} 字节"
-        ));
+        )));
     }
     report_segment_progress(progress, segment, downloaded, index, total, tx);
     Ok(downloaded)
@@ -520,6 +589,44 @@ mod tests {
             download_file_name(&directory, "测试标题", "mp4"),
             "测试标题.mp4"
         );
+    }
+
+    #[test]
+    fn stalled_response_is_reported_as_timeout() {
+        use std::net::TcpListener;
+        use std::sync::mpsc;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let url = format!("http://{}/stall.jpg", listener.local_addr().expect("addr"));
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut buffer = [0u8; 1024];
+            let _ = stream.read(&mut buffer);
+            // 收到请求后不返回任何响应，直到测试确认超时。
+            let _ = release_rx.recv();
+            drop(stream);
+        });
+
+        let client = reqwest::blocking::Client::builder()
+            .connect_timeout(Duration::from_millis(200))
+            .timeout(Duration::from_millis(200))
+            .build()
+            .expect("client");
+        let directory = std::env::temp_dir().join("reels_stall_test");
+        std::fs::create_dir_all(&directory).expect("create dir");
+        let temp_path = directory.join("stall.jpg.part");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        let error = download_one(&client, &url, &temp_path, "jpg", 0, &cancel, &tx)
+            .expect_err("stalled response should fail");
+        assert!(error.timed_out, "expected timeout, got {error:?}");
+
+        let _ = release_tx.send(());
+        server.join().expect("server thread");
+        let _ = std::fs::remove_file(&temp_path);
+        let _ = std::fs::remove_dir(&directory);
     }
 
     #[test]

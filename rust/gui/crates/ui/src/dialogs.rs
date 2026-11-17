@@ -432,6 +432,7 @@ impl AppView {
                 count,
                 failed,
                 skipped,
+                timed_out,
             } => self.dialog_download_saved(
                 palette,
                 card_width,
@@ -439,6 +440,7 @@ impl AppView {
                 count,
                 failed,
                 skipped,
+                timed_out,
                 cx,
             ),
             Dialog::DownloadSummary { files } => {
@@ -2465,6 +2467,7 @@ impl AppView {
         count: usize,
         failed: usize,
         skipped: usize,
+        timed_out: usize,
         cx: &mut Context<Self>,
     ) -> Div {
         let entity = cx.entity();
@@ -2489,6 +2492,15 @@ impl AppView {
                     .line_height(px(22.0))
                     .text_color(palette.text_secondary)
                     .child(format!("已跳过 {skipped} 个 MP3 文件（相册不支持音频）")),
+            );
+        }
+        if timed_out > 0 {
+            content = content.child(
+                div()
+                    .text_size(px(14.0))
+                    .line_height(px(22.0))
+                    .text_color(palette.text_secondary)
+                    .child(format!("已跳过 {timed_out} 个超时链接（超过 10 秒无响应）")),
             );
         }
         self.dialog_card(palette, width, max_height)

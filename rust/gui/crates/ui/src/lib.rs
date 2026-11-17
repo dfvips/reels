@@ -240,6 +240,7 @@ pub enum Dialog {
         count: usize,
         failed: usize,
         skipped: usize,
+        timed_out: usize,
     },
     DownloadSummary {
         files: Vec<PathBuf>,
@@ -256,6 +257,8 @@ pub struct DownloadUi {
     pub errors: Vec<String>,
     /// 手机端跳过的音频条目数（相册不支持 MP3）。
     pub skipped_audio: usize,
+    /// 因超过 10 秒无响应被跳过的链接数。
+    pub timed_out: usize,
     pub finished: bool,
     pub cancel: Arc<AtomicBool>,
 }
@@ -271,6 +274,7 @@ impl DownloadUi {
             files: Vec::new(),
             errors: Vec::new(),
             skipped_audio: 0,
+            timed_out: 0,
             finished: false,
             cancel: Arc::new(AtomicBool::new(false)),
         }

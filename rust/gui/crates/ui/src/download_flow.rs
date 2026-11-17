@@ -433,7 +433,14 @@ impl AppView {
                     ui.current = index + 1;
                 }
             }
-            DownloadEvent::Failed { index, error } => {
+            DownloadEvent::Failed {
+                index,
+                error,
+                timed_out,
+            } => {
+                if timed_out {
+                    ui.timed_out += 1;
+                }
                 ui.errors.push(error);
                 if let Some(slot) = ui.completed.get_mut(index) {
                     *slot = true;
@@ -460,8 +467,14 @@ impl AppView {
         let files = ui.files.clone();
         let errors = ui.errors.clone();
         let skipped_audio = ui.skipped_audio;
+        let timed_out = ui.timed_out;
         let cancelled = ui.cancel.load(Ordering::Relaxed);
         let failed = errors.len().min(total.saturating_sub(success));
+        let timeout_note = if timed_out > 0 {
+            format!("，跳过 {timed_out} 个超时链接")
+        } else {
+            String::new()
+        };
 
         if is_desktop() {
             if success > 0 {
@@ -469,14 +482,24 @@ impl AppView {
                     play_finish_sound();
                 }
                 self.toast(
-                    format!("批量下载完成: {success}/{total} 个视频"),
+                    format!("批量下载完成: {success}/{total} 个视频{timeout_note}"),
                     ToastKind::Success,
                     cx,
                 );
             } else if cancelled {
                 self.toast("下载已取消", ToastKind::Info, cx);
+            } else if timed_out > 0 && timed_out == errors.len() {
+                self.toast(
+                    format!("{timed_out} 个链接超过 10 秒无响应，已跳过"),
+                    ToastKind::Error,
+                    cx,
+                );
             } else if let Some(error) = errors.first() {
-                self.toast(format!("下载失败: {error}"), ToastKind::Error, cx);
+                self.toast(
+                    format!("下载失败: {error}{timeout_note}"),
+                    ToastKind::Error,
+                    cx,
+                );
             } else {
                 self.toast(format!("下载失败: 0/{total} 个视频"), ToastKind::Error, cx);
             }
@@ -488,9 +511,17 @@ impl AppView {
                 count: files.len(),
                 failed,
                 skipped: skipped_audio,
+                timed_out,
             });
         } else if cancelled {
             self.toast("下载已取消", ToastKind::Info, cx);
+            self.dialog = None;
+        } else if timed_out > 0 && timed_out == errors.len() {
+            self.toast(
+                format!("{timed_out} 个链接超过 10 秒无响应，已跳过"),
+                ToastKind::Error,
+                cx,
+            );
             self.dialog = None;
         } else if let Some(error) = errors.first() {
             let message = if skipped_audio > 0 {
@@ -500,13 +531,18 @@ impl AppView {
             };
             self.toast(message, ToastKind::Error, cx);
             self.dialog = None;
-        } else {
-            let message = if skipped_audio > 0 {
-                format!("下载失败: 0/{total} 个视频（已跳过 {skipped_audio} 个 MP3 文件）")
+        } else if skipped_audio > 0 {
+            let message = if timed_out > 0 {
+                format!(
+                    "下载失败: 0/{total} 个视频（已跳过 {skipped_audio} 个 MP3 文件、{timed_out} 个超时链接）"
+                )
             } else {
-                format!("下载失败: 0/{total} 个视频")
+                format!("下载失败: 0/{total} 个视频（已跳过 {skipped_audio} 个 MP3 文件）")
             };
             self.toast(message, ToastKind::Error, cx);
+            self.dialog = None;
+        } else {
+            self.toast(format!("下载失败: 0/{total} 个视频"), ToastKind::Error, cx);
             self.dialog = None;
         }
         cx.notify();

@@ -1569,13 +1569,12 @@ impl AppView {
         self.dialog_card(palette, width, max_height)
             .child(self.dialog_title(palette, "暂无缓存", 20.0).flex_shrink_0())
             .child(
-                self.dialog_content_scroll("no-cache-content-scroll")
-                    .child(
-                        div()
-                            .text_size(px(14.0))
-                            .text_color(palette.text_secondary)
-                            .child("当前没有可清理的缓存，无需清理。"),
-                    ),
+                self.dialog_content_scroll("no-cache-content-scroll").child(
+                    div()
+                        .text_size(px(14.0))
+                        .text_color(palette.text_secondary)
+                        .child("当前没有可清理的缓存，无需清理"),
+                ),
             )
             .child(self.action_row().flex_shrink_0().child(self.text_action(
                 palette,

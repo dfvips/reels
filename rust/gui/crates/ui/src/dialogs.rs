@@ -1288,11 +1288,7 @@ impl AppView {
                                     sync_xhs_cookie_editor_text(this);
                                     let cookie = this.xhs_cookie_input.trim().to_string();
                                     if !is_valid_cookie_header(&cookie) {
-                                        this.toast(
-                                            "Cookie 格式不正确",
-                                            ToastKind::Error,
-                                            cx,
-                                        );
+                                        this.toast("Cookie 格式不正确", ToastKind::Error, cx);
                                         return;
                                     }
                                     this.settings.xhs_cookie = cookie;

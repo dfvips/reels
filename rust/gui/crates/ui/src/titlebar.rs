@@ -338,6 +338,8 @@ impl AppView {
             .items_center()
             .gap(px(5.0))
             .cursor_pointer()
+            // 按钮浮在 Windows 标题栏的拖动区域上，不 occlude 会被 WM_NCHITTEST 当成 HTCAPTION 吞掉点击。
+            .occlude()
             .hover(|style| style.opacity(0.6))
             .on_click(move |_, _, cx| {
                 entity.update(cx, |this, cx| this.toggle_result_view(cx));

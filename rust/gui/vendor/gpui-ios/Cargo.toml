@@ -1,0 +1,61 @@
+# Vendored from pierreaubert/gpui-toolkit at
+# 8e3a43549c2f8dd6ae43fda875fcf2f2812d1095, with local patches on top
+# (see PATCHES.md). Kept in-tree so every build environment, including CI,
+# compiles the same iOS touch/hover behavior.
+[package]
+name = "gpui-ios"
+version = "0.11.0"
+edition = "2024"
+license = "ISC"
+description = "iOS platform backend for GPUI (vendored from gpui-mobile)"
+publish = false
+
+[lib]
+crate-type = ["rlib"]
+
+[features]
+default = []
+autoeq = []
+gpu-2d = []
+gpu-3d = []
+reqwest = []
+showcase = []
+spinorama = []
+tokio = []
+urlencoding = []
+
+[dependencies]
+anyhow = "1.0"
+accesskit = "0.25"
+log = { version = "0.4.28", features = ["kv_unstable_serde", "serde"] }
+parking_lot = "0.13.0"
+futures = "0.3"
+raw-window-handle = "0.6"
+serde_json = "1.0"
+
+# GPUI core (same sotf-3rdparties rev as the desktop/macOS backend)
+gpui = { package = "sotf-gpui-toolkit-gpui", git = "https://github.com/pierreaubert/sotf-3rdparties", version = "0.2.3", default-features = false }
+
+# Shared foreign-parent embedding core (registry, throttle, debounce, slots)
+gpui-foreign-parent = { git = "https://github.com/pierreaubert/gpui-toolkit", version = "0.11" }
+
+# wgpu renderer from Zed (Metal backend on iOS)
+gpui_wgpu = { package = "sotf-gpui-toolkit-gpui-wgpu", git = "https://github.com/pierreaubert/sotf-3rdparties", version = "0.1.3" }
+wgpu = { package = "sotf-wgpu", git = "https://github.com/pierreaubert/sotf-3rdparties", version = "29.0.0" }
+
+# Text / font stack
+pathfinder_geometry = "0.5"
+smallvec = { version = "1.6", features = ["union", "const_new"] }
+
+# UUID for display identification
+uuid = { version = "1", features = ["v5"] }
+
+# Apple-only deps (Objective-C runtime, Apple frameworks, font-kit)
+[target.'cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))'.dependencies]
+objc = { package = "sotf-objc", git = "https://github.com/pierreaubert/sotf-3rdparties", version = "0.2" }
+core-foundation = "0.10"
+# Must match font-kit's core-graphics version for type compatibility
+core-graphics = "0.25"
+core-text = "22"
+block2 = "0.6"
+font-kit = { package = "sotf-zed-font-kit", version = "0.14.1-zed", git = "https://github.com/pierreaubert/sotf-3rdparties", default-features = false, features = ["source"] }

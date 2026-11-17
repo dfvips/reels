@@ -1,0 +1,121 @@
+use gpui::RequestFrameOptions;
+use objc::{
+    class, msg_send,
+    runtime::{BOOL, Object},
+    sel, sel_impl,
+};
+use std::ffi::c_void;
+use std::panic::{self, AssertUnwindSafe};
+use std::sync::atomic::Ordering;
+
+#[link(name = "Metal", kind = "framework")]
+unsafe extern "C" {
+    fn MTLCreateSystemDefaultDevice() -> *mut c_void;
+}
+
+#[inline(never)]
+pub(crate) fn request_frame_for_window(window: &super::super::window::IosWindow) {
+    window.pump_momentum();
+    let text_dirty = crate::TEXT_INPUT_DIRTY.swap(false, Ordering::AcqRel);
+    let forced_frame = window.forced_frame_pending.replace(false);
+    let callback = window.request_frame_callback.borrow_mut().take();
+    if let Some(mut cb) = callback {
+        let result = panic::catch_unwind(AssertUnwindSafe(|| {
+            cb(RequestFrameOptions {
+                force_render: text_dirty || forced_frame,
+                ..Default::default()
+            });
+        }));
+        let mut slot = window.request_frame_callback.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(cb);
+        }
+        drop(slot);
+        if let Err(payload) = result {
+            panic::resume_unwind(payload);
+        }
+    } else {
+        if text_dirty {
+            crate::TEXT_INPUT_DIRTY.store(true, Ordering::Release);
+        }
+        if forced_frame {
+            window.forced_frame_pending.set(true);
+        }
+    }
+}
+
+pub(super) fn begin_platform_metal_capture() -> bool {
+    unsafe {
+        // SAFETY: Metal capture APIs are process-global developer tooling
+        // hooks. We create the default device and ask MTLCaptureManager to
+        // capture all queues for that device until `stopCapture`.
+        let device = MTLCreateSystemDefaultDevice() as *mut Object;
+        if device.is_null() {
+            return false;
+        }
+
+        let manager: *mut Object = msg_send![class!(MTLCaptureManager), sharedCaptureManager];
+        if manager.is_null() {
+            let _: () = msg_send![device, release];
+            return false;
+        }
+
+        let is_capturing: BOOL = msg_send![manager, isCapturing];
+        if is_capturing {
+            let _: () = msg_send![device, release];
+            return false;
+        }
+
+        let descriptor: *mut Object = msg_send![class!(MTLCaptureDescriptor), alloc];
+        let descriptor: *mut Object = msg_send![descriptor, init];
+        if descriptor.is_null() {
+            let _: () = msg_send![device, release];
+            return false;
+        }
+
+        let _: () = msg_send![descriptor, setCaptureObject: device];
+        let _: () = msg_send![descriptor, setDestination: 1_isize];
+        let started: BOOL = msg_send![
+            manager,
+            startCaptureWithDescriptor: descriptor
+            error: std::ptr::null_mut::<*mut Object>()
+        ];
+        let _: () = msg_send![descriptor, release];
+        let _: () = msg_send![device, release];
+        started
+    }
+}
+
+pub(super) fn end_platform_metal_capture() {
+    unsafe {
+        // SAFETY: `sharedCaptureManager` returns the process-wide manager; if a
+        // capture is active, `stopCapture` is the documented balanced teardown
+        // for captures started from code or Xcode.
+        let manager: *mut Object = msg_send![class!(MTLCaptureManager), sharedCaptureManager];
+        if manager.is_null() {
+            return;
+        }
+        let is_capturing: BOOL = msg_send![manager, isCapturing];
+        if is_capturing {
+            let _: () = msg_send![manager, stopCapture];
+        }
+    }
+}
+
+pub(super) fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> &str {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        message
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.as_str()
+    } else {
+        "<non-string panic payload>"
+    }
+}
+
+pub(super) fn retain_application_for_process_lifetime(app: &gpui::Application) {
+    // iOS does not let `Platform::run` block forever like desktop platforms do,
+    // so retain the app state after the launch callback returns.
+    let retained = app.clone_app_cell();
+    std::mem::forget(retained);
+    log::info!("GPUI iOS: Retained application for process lifetime");
+}

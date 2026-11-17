@@ -2375,7 +2375,6 @@ dependencies = [
 [[package]]
 name = "gpui-ios"
 version = "0.11.0"
-source = "git+https://github.com/pierreaubert/gpui-toolkit#8e3a43549c2f8dd6ae43fda875fcf2f2812d1095"
 dependencies = [
  "accesskit",
  "anyhow",

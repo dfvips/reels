@@ -1,0 +1,140 @@
+use super::PlatformView;
+use super::platform_view_factory::PlatformViewFactory;
+use super::platform_view_id::PlatformViewId;
+use super::platform_view_kind::PlatformViewKind;
+use super::platform_view_record::PlatformViewRecord;
+use super::swift_platform_view_factory::SwiftPlatformViewFactory;
+use super::types::PlatformViewBounds;
+use super::types::PlatformViewParams;
+use super::types::SwiftPlatformViewCallbacks;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
+
+pub struct PlatformViewRegistry {
+    pub(super) factories: Mutex<HashMap<String, Box<dyn PlatformViewFactory>>>,
+    pub(super) views: Mutex<HashMap<PlatformViewId, PlatformViewRecord>>,
+    snapshot_cache: Mutex<Option<Arc<[PlatformViewRecord]>>>,
+}
+
+impl PlatformViewRegistry {
+    pub fn new() -> Self {
+        Self {
+            factories: Mutex::new(HashMap::new()),
+            views: Mutex::new(HashMap::new()),
+            snapshot_cache: Mutex::new(None),
+        }
+    }
+
+    fn invalidate_snapshot_cache(&self) {
+        self.snapshot_cache.lock().unwrap().take();
+    }
+
+    pub fn global() -> &'static Self {
+        static INSTANCE: OnceLock<PlatformViewRegistry> = OnceLock::new();
+        INSTANCE.get_or_init(Self::new)
+    }
+
+    pub fn register_factory(&self, factory: Box<dyn PlatformViewFactory>) {
+        self.factories
+            .lock()
+            .unwrap()
+            .insert(factory.view_type().to_string(), factory);
+    }
+
+    pub fn register_swift_factory(
+        &self,
+        view_type: impl Into<String>,
+        kind: PlatformViewKind,
+        callbacks: SwiftPlatformViewCallbacks,
+    ) {
+        self.register_factory(Box::new(SwiftPlatformViewFactory::new(
+            view_type, kind, callbacks,
+        )));
+    }
+
+    pub fn create_view(
+        &self,
+        view_type: &str,
+        params: &PlatformViewParams,
+    ) -> Result<Box<dyn PlatformView>, String> {
+        let factories = self.factories.lock().unwrap();
+        let factory = factories
+            .get(view_type)
+            .ok_or_else(|| format!("no platform view factory registered for {view_type:?}"))?;
+        let view = factory.create(params)?;
+        let id = view.id();
+        self.register_view(PlatformViewRecord {
+            id,
+            view_type: view_type.to_string(),
+            kind: factory.kind(),
+            bounds: params.bounds,
+            visible: true,
+            z_index: 0,
+            accessibility: params.accessibility.clone(),
+        });
+        Ok(view)
+    }
+
+    pub fn register_view(&self, record: PlatformViewRecord) {
+        self.views.lock().unwrap().insert(record.id, record);
+        self.invalidate_snapshot_cache();
+    }
+
+    pub fn update_view_bounds(&self, id: PlatformViewId, bounds: PlatformViewBounds) {
+        if let Some(entry) = self.views.lock().unwrap().get_mut(&id) {
+            entry.bounds = bounds;
+            self.invalidate_snapshot_cache();
+        }
+    }
+
+    pub fn update_view_visibility(&self, id: PlatformViewId, visible: bool) {
+        if let Some(entry) = self.views.lock().unwrap().get_mut(&id) {
+            entry.visible = visible;
+            self.invalidate_snapshot_cache();
+        }
+    }
+
+    pub fn update_view_z_index(&self, id: PlatformViewId, z_index: i32) {
+        if let Some(entry) = self.views.lock().unwrap().get_mut(&id) {
+            entry.z_index = z_index;
+            self.invalidate_snapshot_cache();
+        }
+    }
+
+    pub fn remove_view(&self, id: PlatformViewId) {
+        self.views.lock().unwrap().remove(&id);
+        self.invalidate_snapshot_cache();
+    }
+
+    pub fn view_snapshot(&self) -> Arc<[PlatformViewRecord]> {
+        if let Some(cached) = self.snapshot_cache.lock().unwrap().as_ref() {
+            return Arc::clone(cached);
+        }
+
+        let mut views: Vec<_> = self.views.lock().unwrap().values().cloned().collect();
+        views.sort_by_key(|view| (view.z_index, view.id.0));
+        let snapshot: Arc<[PlatformViewRecord]> = Arc::from(views);
+        *self.snapshot_cache.lock().unwrap() = Some(Arc::clone(&snapshot));
+        snapshot
+    }
+
+    pub fn view_count(&self) -> usize {
+        self.views.lock().unwrap().len()
+    }
+
+    pub fn hit_test(&self, x: f32, y: f32) -> bool {
+        let views = self.views.lock().unwrap();
+        for record in views.values() {
+            if record.contains(x, y) {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+impl Default for PlatformViewRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}

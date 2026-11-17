@@ -1289,7 +1289,7 @@ impl AppView {
                                     let cookie = this.xhs_cookie_input.trim().to_string();
                                     if !is_valid_cookie_header(&cookie) {
                                         this.toast(
-                                            "Cookie 格式不正确，请粘贴 name=value; name2=value2 形式的键值对",
+                                            "Cookie 格式不正确",
                                             ToastKind::Error,
                                             cx,
                                         );

@@ -393,6 +393,7 @@ impl AppView {
                 self.dialog_live_photo_export(palette, card_width, max_card_height, cx)
             }
             Dialog::ClearCache => self.dialog_clear_cache(palette, card_width, max_card_height, cx),
+            Dialog::NoCache => self.dialog_no_cache(palette, card_width, max_card_height, cx),
             Dialog::ClearCacheResult {
                 success,
                 message,
@@ -1555,6 +1556,39 @@ impl AppView {
                         },
                     )),
             )
+    }
+
+    fn dialog_no_cache(
+        &self,
+        palette: Palette,
+        width: f32,
+        max_height: f32,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let entity = cx.entity();
+        self.dialog_card(palette, width, max_height)
+            .child(self.dialog_title(palette, "暂无缓存", 20.0).flex_shrink_0())
+            .child(
+                self.dialog_content_scroll("no-cache-content-scroll")
+                    .child(
+                        div()
+                            .text_size(px(14.0))
+                            .text_color(palette.text_secondary)
+                            .child("当前没有可清理的缓存，无需清理。"),
+                    ),
+            )
+            .child(self.action_row().flex_shrink_0().child(self.text_action(
+                palette,
+                "no-cache-ok",
+                "知道了",
+                true,
+                move |_, _, cx| {
+                    entity.update(cx, |this, cx| {
+                        this.dialog = None;
+                        cx.notify();
+                    });
+                },
+            )))
     }
 
     fn dialog_clear_result(

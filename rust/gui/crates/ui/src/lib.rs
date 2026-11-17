@@ -218,6 +218,7 @@ pub enum Dialog {
     XhsCookie,
     LivePhotoExport,
     ClearCache,
+    NoCache,
     ClearCacheResult {
         success: bool,
         message: String,

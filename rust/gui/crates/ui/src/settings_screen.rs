@@ -59,6 +59,16 @@ impl AppView {
         cx.notify();
     }
 
+    pub fn open_clear_cache(&mut self, cx: &mut Context<Self>) {
+        self.refresh_cache_info();
+        self.dialog = Some(if self.cache_size == 0 {
+            Dialog::NoCache
+        } else {
+            Dialog::ClearCache
+        });
+        cx.notify();
+    }
+
     pub fn clear_cache(&mut self, cx: &mut Context<Self>) {
         let mut cache_dirs = vec![self.paths.cache_dir.clone()];
         cache_dirs.extend(self.paths.legacy_cache_dirs());
@@ -247,8 +257,7 @@ impl AppView {
                 move |window, cx| {
                     window.blur(cx);
                     entity.update(cx, |this, cx| {
-                        this.dialog = Some(Dialog::ClearCache);
-                        cx.notify();
+                        this.open_clear_cache(cx);
                     });
                 },
             )

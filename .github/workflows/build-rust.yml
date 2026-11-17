@@ -61,6 +61,8 @@ jobs:
       tag: ${{ steps.v.outputs.tag }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - id: v
         env:
@@ -71,35 +73,22 @@ jobs:
         run: |
           set -euo pipefail
           seed="$(tr -d '[:space:]' < rust/VERSION)"
-          seed="${seed:-1.0.2}"
+          seed="${seed:-1.0.0}"
 
           if [[ "$EVENT_NAME" == "push" && "$REF_TYPE" == "tag" ]]; then
             BASE="${REF_NAME#v}"
             TAG="v${BASE}"
           else
-            latest_tag="$(git ls-remote --tags origin 'v*' \
-              | sed 's#.*refs/tags/##' \
-              | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
-              | sort -V | tail -n 1 || true)"
-
-            if [[ -n "$latest_tag" ]]; then
-              latest="${latest_tag#v}"
-              if [[ "$(printf '%s\n%s\n' "$latest" "$seed" | sort -V | tail -n 1)" == "$seed" && "$seed" != "$latest" ]]; then
-                BASE="$seed"
-              else
-                IFS=. read -r MAJOR MINOR PATCH <<< "$latest"
-                BASE="$MAJOR.$MINOR.$((PATCH + 1))"
-              fi
+            # 以 rust/VERSION 为起始版本，此后每次提交自动递增补丁号。
+            seed_commit="$(git log -1 --format=%H -- rust/VERSION || true)"
+            if [[ -n "$seed_commit" ]]; then
+              commits="$(git rev-list --count "${seed_commit}..HEAD")"
             else
-              BASE="$seed"
+              commits=0
             fi
-
+            IFS=. read -r MAJOR MINOR PATCH <<< "$seed"
+            BASE="$MAJOR.$MINOR.$((PATCH + commits))"
             TAG="v${BASE}"
-            while git ls-remote --tags origin "refs/tags/${TAG}" | grep -q .; do
-              IFS=. read -r MAJOR MINOR PATCH <<< "${TAG#v}"
-              BASE="$MAJOR.$MINOR.$((PATCH + 1))"
-              TAG="v${BASE}"
-            done
           fi
 
           {

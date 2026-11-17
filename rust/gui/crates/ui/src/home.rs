@@ -1148,7 +1148,7 @@ impl AppView {
                 .editor_viewport_height(max_input_height)
                 .editor_scroll_handle(self.input_scroll.clone())
                 .value(self.input.clone())
-                .placeholder("输入或粘贴短视频分享链接")
+                .placeholder("输入或粘贴短视频分享链接，支持多链接解析")
                 .size(InputSize::Lg)
                 .select_all_on_ctrl(cfg!(target_os = "windows"))
                 .bg_color(palette.bg)

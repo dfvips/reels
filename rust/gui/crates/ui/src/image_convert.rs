@@ -1,4 +1,5 @@
-//! 系统解码兜底：`image` crate 不支持 HEIC/HEIF，移动端交给系统解码并转成 JPEG。
+//! HEIC/HEIF 解码：`image` crate 不支持 HEIC，内置纯 Rust 解码器兜底，
+//! 各平台系统解码器（ImageIO/WIC/Android）优先或作为回退。
 //! 抖音/小红书的实况图片既可能是 HEIC 原图，也可能是 HEIC 缩略图。
 
 use std::path::Path;
@@ -25,24 +26,32 @@ pub fn needs_platform_decoder(data: &[u8]) -> bool {
     )
 }
 
-/// 用系统解码器把 `source` 转成 JPEG 写入 `target`。
+/// 把 `source` 转成 JPEG 写入 `target`。
 /// `max_dimension` 为 0 表示保持原始分辨率。
 pub fn convert_to_jpeg(source: &Path, target: &Path, max_dimension: u32, quality: u8) -> bool {
+    // Windows 的 WIC 只有装了可选的 HEIF/HEVC 扩展才能解 HEIC，
+    // 所以优先用内置解码器，系统解码器留给 AVIF 等格式。
+    #[cfg(target_os = "windows")]
+    {
+        if builtin_heif::convert(source, target, max_dimension, quality) {
+            return true;
+        }
+        windows_imaging::convert(source, target, max_dimension, quality)
+    }
     #[cfg(target_os = "android")]
     {
         android::convert(source, target, max_dimension, quality)
+            || builtin_heif::convert(source, target, max_dimension, quality)
     }
     #[cfg(target_os = "ios")]
     {
         ios::convert(source, target, max_dimension, quality)
-    }
-    #[cfg(target_os = "windows")]
-    {
-        windows_imaging::convert(source, target, max_dimension, quality)
+            || builtin_heif::convert(source, target, max_dimension, quality)
     }
     #[cfg(target_os = "macos")]
     {
         macos::convert(source, target, max_dimension, quality)
+            || builtin_heif::convert(source, target, max_dimension, quality)
     }
     #[cfg(not(any(
         target_os = "android",
@@ -51,8 +60,57 @@ pub fn convert_to_jpeg(source: &Path, target: &Path, max_dimension: u32, quality
         target_os = "macos"
     )))]
     {
-        let _ = (source, target, max_dimension, quality);
-        false
+        builtin_heif::convert(source, target, max_dimension, quality)
+    }
+}
+
+/// 内置纯 Rust HEIC 解码，不依赖系统 HEIF 扩展。
+mod builtin_heif {
+    use std::io::BufWriter;
+    use std::path::Path;
+
+    use image::imageops::FilterType;
+
+    pub fn convert(source: &Path, target: &Path, max_dimension: u32, quality: u8) -> bool {
+        let Ok(data) = std::fs::read(source) else {
+            return false;
+        };
+        let Ok(decoded) = heic_decoder::decode(&data) else {
+            return false;
+        };
+        let Ok(rgb) = decoded.to_rgb8() else {
+            return false;
+        };
+        let Some(image) = image::RgbImage::from_raw(rgb.width as u32, rgb.height as u32, rgb.data)
+        else {
+            return false;
+        };
+
+        let longest = image.width().max(image.height());
+        let image = if max_dimension > 0 && longest > max_dimension {
+            let ratio = max_dimension as f64 / longest as f64;
+            let width = ((image.width() as f64 * ratio).round() as u32).max(1);
+            let height = ((image.height() as f64 * ratio).round() as u32).max(1);
+            image::imageops::resize(&image, width, height, FilterType::Triangle)
+        } else {
+            image
+        };
+
+        let Ok(file) = std::fs::File::create(target) else {
+            return false;
+        };
+        let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(
+            BufWriter::new(file),
+            quality.clamp(1, 100),
+        );
+        match encoder.encode_image(&image) {
+            Ok(()) => true,
+            Err(error) => {
+                eprintln!("failed to encode HEIC as JPEG: {error}");
+                let _ = std::fs::remove_file(target);
+                false
+            }
+        }
     }
 }
 

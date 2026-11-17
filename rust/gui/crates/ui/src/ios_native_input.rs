@@ -238,7 +238,7 @@ pub fn show_placeholder(
         placeholder: Some(if id == dialogs_placeholder_id() {
             crate::dialogs::XHS_COOKIE_PLACEHOLDER.to_string()
         } else {
-            "输入或粘贴短视频分享链接".to_string()
+            "输入或粘贴短视频分享链接，支持多链接解析".to_string()
         }),
         placeholder_color: rgba_u32(palette.hint),
         corner_radius: 6.0,

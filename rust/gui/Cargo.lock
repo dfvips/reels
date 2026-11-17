@@ -1600,12 +1600,14 @@ dependencies = [
  "gpui-android 0.11.0",
  "gpui-ios",
  "gpui-ui-kit",
+ "image",
  "jni",
  "reqwest",
  "rfd",
  "serde",
  "serde_json",
  "sotf-gpui-toolkit-gpui",
+ "windows 0.61.3",
 ]
 
 [[package]]

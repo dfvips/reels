@@ -13,12 +13,23 @@ gpui-ui-kit.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 reqwest.workspace = true
+image = { version = "0.25", default-features = false, features = ["jpeg", "webp", "png", "gif"] }
 
 [target.'cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))'.dependencies]
 rfd.workspace = true
 
 [target.'cfg(target_os = "ios")'.dependencies]
 gpui-ios.workspace = true
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Imaging",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Ole",
+    "Win32_System_Variant",
+] }
 
 [target.'cfg(target_os = "android")'.dependencies]
 gpui-android.workspace = true

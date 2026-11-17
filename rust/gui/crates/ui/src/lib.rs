@@ -5,13 +5,16 @@ pub mod download;
 pub mod download_flow;
 mod download_icon;
 mod download_sound;
+pub mod experience;
 pub mod gallery;
 pub mod home;
 pub mod icons;
 #[cfg(target_os = "windows")]
 mod idm;
+mod image_convert;
 #[cfg(target_os = "ios")]
 mod ios_native_input;
+mod motion_photo;
 pub mod paths;
 pub mod settings_screen;
 pub mod theme;
@@ -32,6 +35,7 @@ pub use download_sound::set_download_sound_hook;
 #[cfg(target_os = "windows")]
 pub use idm::{set_idm_export_hook, IdmLink};
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::Receiver;
@@ -61,6 +65,15 @@ pub const SYSTEM_BAR_HEIGHT: f32 = 32.0;
 pub const TITLE_ROW_HEIGHT: f32 = 44.0;
 pub const MOBILE_APPBAR_HEIGHT: f32 = 56.0;
 
+/// iOS 使用系统 Live Photo，Android / Windows 使用 Google Motion Photo。
+pub const fn supports_live_photo_export() -> bool {
+    cfg!(any(
+        target_os = "ios",
+        target_os = "android",
+        target_os = "windows"
+    ))
+}
+
 gpui::actions!(
     douyin_ui,
     [
@@ -81,6 +94,8 @@ pub struct ResultItem {
     pub platform: MediaPlatform,
     pub media_kind: MediaKind,
     pub entries: Vec<MediaEntry>,
+    /// 视频封面（体验版轮播使用，手机/PC 封面可能不同）。
+    pub covers: Vec<MediaEntry>,
 }
 
 impl ResultItem {
@@ -183,6 +198,20 @@ pub struct PageTransition {
     animation: Option<PageAnimation>,
 }
 
+/// 预览图横滑：记录按下位置，位移随手指写入 `experience_slide_offset`。
+pub struct SlideDrag {
+    pub start_x: f32,
+}
+
+/// 松手后的回弹或翻页缓动。
+pub struct SlideAnim {
+    pub(crate) started_at: Instant,
+    pub(crate) from: f32,
+    pub(crate) to: f32,
+    /// 动画结束后要切换的轮播下标增量。
+    pub(crate) delta: i32,
+}
+
 #[cfg(target_os = "macos")]
 struct MacWindowClosedGuard {
     _window_closed: Subscription,
@@ -208,6 +237,43 @@ pub struct Toast {
 pub enum ResourceScope {
     All,
     Original,
+}
+
+/// 解析结果页展示版本。
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ResultViewMode {
+    Geek,
+    Simple,
+}
+
+impl ResultViewMode {
+    pub fn from_setting(value: &str) -> Self {
+        if value == "simple" {
+            Self::Simple
+        } else {
+            Self::Geek
+        }
+    }
+
+    pub fn setting_value(self) -> &'static str {
+        match self {
+            Self::Geek => "geek",
+            Self::Simple => "simple",
+        }
+    }
+}
+
+/// 体验版标签页。
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ExperienceTab {
+    All,
+    Title,
+}
+
+pub enum ThumbState {
+    Loading,
+    Ready(PathBuf),
+    Failed,
 }
 
 #[derive(Clone)]
@@ -406,6 +472,28 @@ pub struct AppView {
     pub loading: bool,
     pub spinner_phase: f32,
     pub results: Vec<ResultItem>,
+    pub result_view: ResultViewMode,
+    pub experience_item: usize,
+    pub experience_tab: ExperienceTab,
+    pub experience_slide: usize,
+    /// 每个解析结果的视频清晰度选择（取值为条目下标）。
+    pub experience_quality: HashMap<usize, usize>,
+    pub experience_quality_menu: bool,
+    /// 预览图横滑的手势状态：拖动、回弹动画与当前位移。
+    pub experience_slide_drag: Option<SlideDrag>,
+    pub experience_slide_anim: Option<SlideAnim>,
+    pub experience_slide_offset: f32,
+    pub experience_slide_seq: u64,
+    /// 已下载/下载中的预览缩略图。
+    pub thumbnails: HashMap<String, ThumbState>,
+    #[cfg(target_os = "windows")]
+    pub pending_single_export: Option<crate::home::SingleExport>,
+    /// macOS：导出脚本按钮的悬浮提示是否可见。
+    #[cfg(target_os = "macos")]
+    pub export_tooltip_visible: bool,
+    /// 延迟隐藏用的序号，进入按钮或提示时自增以取消旧的隐藏任务。
+    #[cfg(target_os = "macos")]
+    pub export_tooltip_seq: u64,
     pub toast: Option<Toast>,
     pub toast_seq: u64,
     pub dialog: Option<Dialog>,
@@ -449,6 +537,7 @@ impl AppView {
             });
         }));
         let input_focus = cx.focus_handle();
+        let result_view = ResultViewMode::from_setting(&settings.result_view);
         #[cfg(target_os = "android")]
         if let Some(window_handle) = window.window_handle().downcast::<AppView>() {
             let async_cx = cx.to_async();
@@ -503,6 +592,23 @@ impl AppView {
             loading: false,
             spinner_phase: 0.0,
             results: Vec::new(),
+            result_view,
+            experience_item: 0,
+            experience_tab: ExperienceTab::All,
+            experience_slide: 0,
+            experience_quality: HashMap::new(),
+            experience_quality_menu: false,
+            experience_slide_drag: None,
+            experience_slide_anim: None,
+            experience_slide_offset: 0.0,
+            experience_slide_seq: 0,
+            thumbnails: HashMap::new(),
+            #[cfg(target_os = "windows")]
+            pending_single_export: None,
+            #[cfg(target_os = "macos")]
+            export_tooltip_visible: false,
+            #[cfg(target_os = "macos")]
+            export_tooltip_seq: 0,
             toast: None,
             toast_seq: 0,
             dialog: None,
@@ -1160,6 +1266,7 @@ impl AppView {
                     div()
                         .min_w(px(0.0))
                         .max_w(px(560.0))
+                        .flex_shrink_1()
                         .px(px(16.0))
                         .py(px(10.0))
                         .rounded(px(8.0))
@@ -1168,8 +1275,8 @@ impl AppView {
                         .border_color(border)
                         .text_color(fg)
                         .text_size(px(15.0))
-                        .flex()
-                        .items_center()
+                        .line_height(px(22.0))
+                        .whitespace_normal()
                         .child(toast.message.clone()),
                 )
                 .into_any_element(),

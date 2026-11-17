@@ -52,6 +52,8 @@ pub struct XhsImageInfo {
     pub url: String,
     pub high_quality_url: String,
     pub raw_url: String,
+    /// 无水印预览地址：H5 预览图自带水印，这里用原图缩放到 1080 宽。
+    pub preview_url: String,
     pub size_bytes: Option<u64>,
     /// 按 CDN 响应的 Content-Type 得到的实际扩展名（heic/jpg/png/...）。
     pub extension: Option<String>,
@@ -418,7 +420,16 @@ fn extract_images(image_list: Option<&Value>, client: &HttpClient) -> Vec<XhsIma
     let Some(items) = image_list.and_then(Value::as_array) else {
         return Vec::new();
     };
-    let mut images = Vec::new();
+    struct PendingImage {
+        source: String,
+        raw_url: String,
+        width: Option<u64>,
+        height: Option<u64>,
+        live_photo: bool,
+        live_videos: Vec<XhsVideoInfo>,
+    }
+
+    let mut pending = Vec::new();
     for item in items {
         let Some(source) = item
             .get("urlDefault")
@@ -441,14 +452,9 @@ fn extract_images(image_list: Option<&Value>, client: &HttpClient) -> Vec<XhsIma
                 None => continue,
             },
         };
-        let raw_url = format!("{base}{key}");
-        let (size_bytes, content_type) = client.head_meta(&raw_url);
-        images.push(XhsImageInfo {
-            url: source.to_string(),
-            high_quality_url: format!("{base}{key}?imageView2/format/raw"),
-            raw_url,
-            size_bytes,
-            extension: image_extension(content_type.as_deref()),
+        pending.push(PendingImage {
+            source: source.to_string(),
+            raw_url: format!("{base}{key}"),
             width: item.get("width").and_then(Value::as_u64),
             height: item.get("height").and_then(Value::as_u64),
             live_photo: item
@@ -461,7 +467,28 @@ fn extract_images(image_list: Option<&Value>, client: &HttpClient) -> Vec<XhsIma
                 .unwrap_or_default(),
         });
     }
-    images
+
+    let raw_urls: Vec<&str> = pending.iter().map(|image| image.raw_url.as_str()).collect();
+    let metas = client.head_meta_batch(&raw_urls);
+    pending
+        .into_iter()
+        .zip(metas)
+        .map(|(image, (size_bytes, content_type))| {
+            let preview_url = format!("{}?imageView2/2/w/1080", image.raw_url);
+            XhsImageInfo {
+                high_quality_url: format!("{}?imageView2/format/raw", image.raw_url),
+                url: image.source,
+                raw_url: image.raw_url,
+                preview_url,
+                size_bytes,
+                extension: image_extension(content_type.as_deref()),
+                width: image.width,
+                height: image.height,
+                live_photo: image.live_photo,
+                live_videos: image.live_videos,
+            }
+        })
+        .collect()
 }
 
 fn image_extension(content_type: Option<&str>) -> Option<String> {
@@ -538,6 +565,10 @@ mod tests {
         assert_eq!(
             images[0].raw_url,
             "https://ci.xiaohongshu.com/notes_pre_post/1040g3k8key"
+        );
+        assert_eq!(
+            images[0].preview_url,
+            "https://ci.xiaohongshu.com/notes_pre_post/1040g3k8key?imageView2/2/w/1080"
         );
         assert!(images[0].live_photo);
     }

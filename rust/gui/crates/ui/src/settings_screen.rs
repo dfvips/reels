@@ -148,13 +148,22 @@ impl AppView {
             items.push(widgets::divider(palette).into_any_element());
         }
 
-        #[cfg(target_os = "ios")]
-        {
+        if crate::supports_live_photo_export() {
             let entity = cx.entity();
             let live_subtitle = if self.settings.live_photo_export {
-                "导出到相册时封装为实况照片"
-            } else {
+                if cfg!(target_os = "ios") {
+                    "导出到相册时封装为实况照片"
+                } else if cfg!(target_os = "android") {
+                    "保存到相册时封装为 Motion Photo"
+                } else {
+                    "下载时封装为 Google Motion Photo"
+                }
+            } else if cfg!(target_os = "ios") {
                 "导出到相册时保存为图片和视频"
+            } else if cfg!(target_os = "android") {
+                "保存到相册时保存为图片和视频"
+            } else {
+                "下载时保存为图片和视频"
             };
             items.push(
                 self.render_item(

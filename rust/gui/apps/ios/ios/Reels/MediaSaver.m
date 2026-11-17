@@ -149,6 +149,61 @@ static void ReelsCommitLivePhoto(
     }];
 }
 
+/// 把系统可解码的图片（HEIC/HEIF/AVIF 等）转成 JPEG；max_dimension <= 0 时保持原尺寸。
+bool reels_convert_image_to_jpeg(
+    const char *source_path, const char *target_path, int max_dimension, int quality) {
+    if (source_path == NULL || target_path == NULL) {
+        return false;
+    }
+    NSString *sourcePath = [NSString stringWithUTF8String:source_path];
+    NSString *targetPath = [NSString stringWithUTF8String:target_path];
+    NSData *data = [NSData dataWithContentsOfFile:sourcePath];
+    if (data.length == 0) {
+        return false;
+    }
+    CGImageSourceRef source = CGImageSourceCreateWithData((__bridge CFDataRef)data, NULL);
+    if (source == NULL) {
+        return false;
+    }
+    int limit = max_dimension;
+    if (limit <= 0) {
+        NSDictionary *properties = CFBridgingRelease(
+            CGImageSourceCopyPropertiesAtIndex(source, 0, NULL));
+        NSNumber *width = properties[(__bridge NSString *)kCGImagePropertyPixelWidth];
+        NSNumber *height = properties[(__bridge NSString *)kCGImagePropertyPixelHeight];
+        limit = (int)MAX(width.integerValue, height.integerValue);
+    }
+    NSDictionary *options = @{
+        (__bridge NSString *)kCGImageSourceCreateThumbnailFromImageAlways: @YES,
+        (__bridge NSString *)kCGImageSourceCreateThumbnailWithTransform: @YES,
+        (__bridge NSString *)kCGImageSourceShouldCacheImmediately: @YES,
+        (__bridge NSString *)kCGImageSourceThumbnailMaxPixelSize: @(MAX(limit, 1)),
+    };
+    CGImageRef image = CGImageSourceCreateThumbnailAtIndex(
+        source, 0, (__bridge CFDictionaryRef)options);
+    CFRelease(source);
+    if (image == NULL) {
+        return false;
+    }
+    NSURL *targetURL = [NSURL fileURLWithPath:targetPath];
+    CGImageDestinationRef destination = CGImageDestinationCreateWithURL(
+        (__bridge CFURLRef)targetURL, CFSTR("public.jpeg"), 1, NULL);
+    if (destination == NULL) {
+        CGImageRelease(image);
+        return false;
+    }
+    int clampedQuality = MAX(1, MIN(quality, 100));
+    NSDictionary *destinationOptions = @{
+        (__bridge NSString *)kCGImageDestinationLossyCompressionQuality: @(clampedQuality / 100.0),
+    };
+    CGImageDestinationAddImage(
+        destination, image, (__bridge CFDictionaryRef)destinationOptions);
+    bool written = CGImageDestinationFinalize(destination);
+    CFRelease(destination);
+    CGImageRelease(image);
+    return written;
+}
+
 void reels_save_media_to_photos(const char *path) {
     if (path == NULL) {
         return;

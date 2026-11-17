@@ -5,6 +5,16 @@ use gpui::{
     StatefulInteractiveElement, Styled, Window,
 };
 
+use gpui_ui_kit::{TooltipPlacement, WithTooltip};
+
+use crate::paths::is_desktop;
+use crate::theme::Palette;
+use crate::widgets::TitleIconButton;
+use crate::{
+    icons, is_double_click, AppView, ResultViewMode, Route, MOBILE_APPBAR_HEIGHT,
+    SYSTEM_BAR_HEIGHT, TITLE_ROW_HEIGHT,
+};
+
 fn home_logo() -> AnyElement {
     div()
         .w(px(20.0))
@@ -15,15 +25,6 @@ fn home_logo() -> AnyElement {
         .child(crate::widgets::GradientIcon::new(icons::HOME_LOGO, 20.0))
         .into_any_element()
 }
-use gpui_ui_kit::{TooltipPlacement, WithTooltip};
-
-use crate::paths::is_desktop;
-use crate::theme::Palette;
-use crate::widgets::TitleIconButton;
-use crate::{
-    icons, is_double_click, AppView, Route, MOBILE_APPBAR_HEIGHT, SYSTEM_BAR_HEIGHT,
-    TITLE_ROW_HEIGHT,
-};
 
 impl AppView {
     pub fn render_titlebar(
@@ -303,6 +304,60 @@ impl AppView {
             )
             .child(drag)
             .child(div().w(px(32.0)).h(px(32.0)))
+            .child(
+                div()
+                    .absolute()
+                    .right(px(12.0))
+                    .top_0()
+                    .h_full()
+                    .flex()
+                    .items_center()
+                    .child(self.render_result_view_toggle(palette, cx)),
+            )
+            .into_any_element()
+    }
+
+    /// 结果页右上角的极客版 / 体验版切换按钮：图标与文字整体可点击。
+    fn render_result_view_toggle(
+        &mut self,
+        palette: Palette,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let entity = cx.entity();
+        let label = match self.result_view {
+            ResultViewMode::Geek => "体验版",
+            ResultViewMode::Simple => "极客版",
+        };
+        let color = palette.text_secondary;
+        div()
+            .id("result-view-toggle")
+            .h(px(28.0))
+            .px(px(10.0))
+            .rounded(px(6.0))
+            .flex()
+            .items_center()
+            .gap(px(5.0))
+            .cursor_pointer()
+            .hover(|style| style.opacity(0.6))
+            .on_click(move |_, _, cx| {
+                entity.update(cx, |this, cx| this.toggle_result_view(cx));
+            })
+            .child(
+                gpui::svg()
+                    .data(icons::SWITCH)
+                    .text_color(color)
+                    .w(px(14.0))
+                    .h(px(14.0))
+                    .flex_shrink_0(),
+            )
+            .child(
+                div()
+                    .text_size(px(13.0))
+                    .line_height(px(18.0))
+                    .text_color(color)
+                    .whitespace_nowrap()
+                    .child(label),
+            )
             .into_any_element()
     }
 
@@ -413,6 +468,22 @@ impl AppView {
             div().w(px(32.0)).h(px(32.0)).into_any_element()
         };
 
+        let view_toggle = if route == Route::Results {
+            Some(
+                div()
+                    .absolute()
+                    .right(px(8.0))
+                    .top_0()
+                    .h_full()
+                    .flex()
+                    .items_center()
+                    .child(self.render_result_view_toggle(palette, cx))
+                    .into_any_element(),
+            )
+        } else {
+            None
+        };
+
         div()
             .h(px(MOBILE_APPBAR_HEIGHT))
             .w_full()
@@ -423,6 +494,7 @@ impl AppView {
             .child(leading)
             .child(title)
             .child(trailing)
+            .children(view_toggle)
             .into_any_element()
     }
 }

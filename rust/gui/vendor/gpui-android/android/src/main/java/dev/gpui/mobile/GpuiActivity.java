@@ -12,11 +12,16 @@ import android.content.pm.ActivityInfo;
 import android.content.pm.PackageManager;
 import android.content.res.Configuration;
 import android.content.res.ColorStateList;
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
 import android.graphics.Canvas;
+import android.graphics.ImageDecoder;
 import android.graphics.Insets;
+import android.graphics.Matrix;
 import android.graphics.Paint;
 import android.graphics.Rect;
 import android.graphics.drawable.Drawable;
+import android.media.ExifInterface;
 import android.net.Uri;
 import android.provider.MediaStore;
 import android.os.Build;
@@ -58,6 +63,7 @@ import android.widget.EditText;
 import android.graphics.Typeface;
 
 import java.io.File;
+import java.io.FileOutputStream;
 import java.io.IOException;
 import java.security.KeyStore;
 import java.util.HashMap;
@@ -233,6 +239,108 @@ public class GpuiActivity extends NativeActivity {
             return false;
         }
     }
+
+    /**
+     * 把系统能解码的图片（HEIC/HEIF/AVIF 等）转成 JPEG。
+     * maxDimension 小于等于 0 时保持原始分辨率。
+     */
+    public boolean convertImageToJpeg(
+            String sourcePath, String targetPath, int maxDimension, int quality) {
+        File source = new File(sourcePath);
+        if (!source.isFile()) {
+            return false;
+        }
+        int clampedQuality = Math.max(1, Math.min(quality, 100));
+        Bitmap bitmap = decodeImage(source, maxDimension);
+        if (bitmap == null) {
+            return false;
+        }
+        try (FileOutputStream output = new FileOutputStream(targetPath)) {
+            return bitmap.compress(Bitmap.CompressFormat.JPEG, clampedQuality, output);
+        } catch (IOException error) {
+            return false;
+        } finally {
+            bitmap.recycle();
+        }
+    }
+
+    private static Bitmap decodeImage(File source, int maxDimension) {
+        if (Build.VERSION.SDK_INT >= 28) {
+            try {
+                ImageDecoder.Source decoderSource = ImageDecoder.createSource(source);
+                return ImageDecoder.decodeBitmap(decoderSource, (decoder, info, src) -> {
+                    decoder.setAllocator(ImageDecoder.ALLOCATOR_SOFTWARE);
+                    decoder.setTargetSampleSize(sampleSize(
+                            info.getSize().getWidth(),
+                            info.getSize().getHeight(),
+                            maxDimension));
+                });
+            } catch (Throwable ignored) {
+                // ImageDecoder 失败时回退到 BitmapFactory。
+            }
+        }
+        BitmapFactory.Options bounds = new BitmapFactory.Options();
+        bounds.inJustDecodeBounds = true;
+        BitmapFactory.decodeFile(source.getAbsolutePath(), bounds);
+        BitmapFactory.Options options = new BitmapFactory.Options();
+        options.inSampleSize = sampleSize(bounds.outWidth, bounds.outHeight, maxDimension);
+        Bitmap bitmap = BitmapFactory.decodeFile(source.getAbsolutePath(), options);
+        if (bitmap == null) {
+            return null;
+        }
+        return applyOrientation(bitmap, readOrientation(source.getAbsolutePath()));
+    }
+
+    private static int sampleSize(int width, int height, int maxDimension) {
+        int longest = Math.max(width, height);
+        int sample = 1;
+        if (maxDimension > 0) {
+            while (longest / (sample * 2) >= maxDimension) {
+                sample *= 2;
+            }
+        }
+        return sample;
+    }
+
+    private static int readOrientation(String path) {
+        try {
+            ExifInterface exif = new ExifInterface(path);
+            return exif.getAttributeInt(
+                    ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL);
+        } catch (IOException | RuntimeException error) {
+            return ExifInterface.ORIENTATION_NORMAL;
+        }
+    }
+
+    private static Bitmap applyOrientation(Bitmap bitmap, int orientation) {
+        Matrix matrix = new Matrix();
+        switch (orientation) {
+            case ExifInterface.ORIENTATION_ROTATE_90:
+                matrix.postRotate(90);
+                break;
+            case ExifInterface.ORIENTATION_ROTATE_180:
+                matrix.postRotate(180);
+                break;
+            case ExifInterface.ORIENTATION_ROTATE_270:
+                matrix.postRotate(270);
+                break;
+            case ExifInterface.ORIENTATION_FLIP_HORIZONTAL:
+                matrix.postScale(-1, 1);
+                break;
+            case ExifInterface.ORIENTATION_FLIP_VERTICAL:
+                matrix.postScale(1, -1);
+                break;
+            default:
+                return bitmap;
+        }
+        Bitmap rotated = Bitmap.createBitmap(
+                bitmap, 0, 0, bitmap.getWidth(), bitmap.getHeight(), matrix, true);
+        if (rotated != bitmap) {
+            bitmap.recycle();
+        }
+        return rotated;
+    }
+
     private static final String KEYSTORE = "AndroidKeyStore";
     private static final String CREDENTIAL_PREFS = "gpui_secure_credentials";
     private GpuiInputView inputView;

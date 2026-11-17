@@ -31,6 +31,15 @@ pub struct AwemeDetail {
     pub images: Vec<AwemeImage>,
     /// 图文作品的背景音乐。
     pub music: Option<AwemeMusic>,
+    /// 视频封面（展示尺寸）。
+    pub cover: Option<String>,
+    /// 视频封面原图。
+    pub origin_cover: Option<String>,
+    /// 动态封面（首帧通常就是创作者上传的原始封面，分辨率远高于 cover）。
+    pub dynamic_cover: Option<String>,
+    pub cover_width: Option<u64>,
+    pub cover_height: Option<u64>,
+    pub cover_size_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -205,6 +214,12 @@ impl DouyinApi {
                 quality: None,
                 images,
                 music: parse_music(detail),
+                cover: None,
+                origin_cover: None,
+                dynamic_cover: None,
+                cover_width: None,
+                cover_height: None,
+                cover_size_bytes: None,
             });
         }
         let play_addr = detail.get("video")?.get("play_addr")?;
@@ -288,6 +303,14 @@ impl DouyinApi {
                 }
             }
         }
+        let cover_field = |field: &str| {
+            ["origin_cover", "cover"].iter().find_map(|key| {
+                video
+                    .get(*key)
+                    .and_then(|cover| cover.get(field))
+                    .and_then(Value::as_u64)
+            })
+        };
         Some(AwemeDetail {
             aweme_id: aweme_id.to_string(),
             desc,
@@ -301,6 +324,12 @@ impl DouyinApi {
             quality,
             images: Vec::new(),
             music: None,
+            cover: cover_url(video, "cover"),
+            origin_cover: cover_url(video, "origin_cover"),
+            dynamic_cover: cover_url(video, "dynamic_cover"),
+            cover_width: cover_field("width"),
+            cover_height: cover_field("height"),
+            cover_size_bytes: cover_field("data_size").or_else(|| cover_field("size")),
         })
     }
 
@@ -367,6 +396,25 @@ fn parse_image(image: &Value) -> Option<AwemeImage> {
 fn image_url(image: &Value) -> Option<String> {
     let urls: Vec<&str> = image
         .get("url_list")
+        .and_then(Value::as_array)?
+        .iter()
+        .filter_map(Value::as_str)
+        .filter(|url| !url.is_empty())
+        .collect();
+    urls.iter()
+        .find(|url| {
+            let path = url.split('?').next().unwrap_or(url).to_ascii_lowercase();
+            path.ends_with(".jpeg") || path.ends_with(".jpg")
+        })
+        .or_else(|| urls.first())
+        .map(|url| (*url).to_string())
+}
+
+/// 视频封面地址；`cover` 为展示尺寸，`origin_cover` 为原图。
+fn cover_url(video: &Value, key: &str) -> Option<String> {
+    let urls: Vec<&str> = video
+        .get(key)
+        .and_then(|cover| cover.get("url_list"))
         .and_then(Value::as_array)?
         .iter()
         .filter_map(Value::as_str)

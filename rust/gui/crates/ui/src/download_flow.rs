@@ -42,12 +42,47 @@ pub(crate) fn has_multiple_video_qualities(item: &ResultItem) -> bool {
 }
 
 #[derive(Default)]
-struct DownloadPlan {
+pub(crate) struct DownloadPlan {
     urls: Vec<String>,
     titles: Vec<String>,
     extensions: Vec<Option<String>>,
     live_videos: Vec<Option<String>>,
     skipped_audio: usize,
+}
+
+impl DownloadPlan {
+    fn push(&mut self, title: &str, entry: &MediaEntry, live_video: Option<String>) {
+        self.urls.push(entry.url.clone());
+        self.titles.push(title.to_string());
+        self.extensions.push(entry.extension.clone());
+        self.live_videos.push(live_video);
+    }
+}
+
+/// 单个媒体（或一组实况图 + 动轨）的下载计划。
+pub(crate) fn build_single_plan(
+    title: &str,
+    entries: &[MediaEntry],
+    live_mode: bool,
+) -> DownloadPlan {
+    let mut plan = DownloadPlan::default();
+    let mut paired = vec![false; entries.len()];
+    for (index, entry) in entries.iter().enumerate() {
+        if paired[index] {
+            continue;
+        }
+        let mut live_video = None;
+        if live_mode && !ResultItem::is_video_entry(entry) {
+            if let Some(next) = entries.get(index + 1) {
+                if !paired[index + 1] && is_live_entry(next) {
+                    paired[index + 1] = true;
+                    live_video = Some(next.url.clone());
+                }
+            }
+        }
+        plan.push(title, entry, live_video);
+    }
+    plan
 }
 
 fn build_download_plan(
@@ -79,16 +114,13 @@ fn build_download_plan(
                     }
                 }
             }
-            plan.urls.push(entry.url.clone());
-            plan.titles.push(item.title.clone());
-            plan.extensions.push(entry.extension.clone());
-            plan.live_videos.push(live_video);
+            plan.push(&item.title, entry, live_video);
         }
     }
     plan
 }
 
-fn is_audio_entry(entry: &MediaEntry) -> bool {
+pub(crate) fn is_audio_entry(entry: &MediaEntry) -> bool {
     let extension = entry
         .extension
         .as_deref()
@@ -105,7 +137,7 @@ fn is_audio_entry(entry: &MediaEntry) -> bool {
 }
 
 /// 抖音与小红书的实况动轨都紧跟其图片并标记 `LIVE`。
-fn is_live_entry(entry: &MediaEntry) -> bool {
+pub(crate) fn is_live_entry(entry: &MediaEntry) -> bool {
     entry
         .quality
         .as_deref()
@@ -134,6 +166,7 @@ mod tests {
             platform: MediaPlatform::Douyin,
             media_kind: MediaKind::Video,
             entries,
+            covers: Vec::new(),
         }
     }
 
@@ -279,13 +312,39 @@ impl AppView {
 
     pub fn confirm_download(&mut self, scope: ResourceScope, cx: &mut Context<Self>) {
         self.download_scope = scope;
+        let plan = build_download_plan(
+            &self.results,
+            self.download_scope,
+            crate::supports_live_photo_export() && self.settings.live_photo_export,
+            !is_desktop(),
+        );
+        self.confirm_download_plan(plan, cx);
+    }
+
+    /// 体验版单条资源下载：复用统一的目录选择与进度流程。
+    pub fn confirm_single_download(
+        &mut self,
+        title: &str,
+        entries: Vec<MediaEntry>,
+        live_mode: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if self.download.as_ref().is_some_and(|ui| !ui.finished) {
+            self.toast("当前正在下载中，请等待完成", ToastKind::Error, cx);
+            return;
+        }
+        let plan = build_single_plan(title, &entries, live_mode);
+        self.confirm_download_plan(plan, cx);
+    }
+
+    pub(crate) fn confirm_download_plan(&mut self, plan: DownloadPlan, cx: &mut Context<Self>) {
         if !is_desktop() {
-            self.begin_download(self.paths.default_download_dir.clone(), cx);
+            self.begin_download_plan(plan, self.paths.default_download_dir.clone(), cx);
             return;
         }
         if self.settings.skip_location_prompt && !self.settings.last_directory.is_empty() {
             let directory = PathBuf::from(&self.settings.last_directory);
-            self.begin_download(directory, cx);
+            self.begin_download_plan(plan, directory, cx);
             return;
         }
         // 原生目录选择框放在异步任务里执行：它自带的模态循环会阻塞
@@ -304,7 +363,7 @@ impl AppView {
                 Some(directory) => {
                     this.settings.last_directory = directory.display().to_string();
                     this.save_settings();
-                    this.begin_download(directory, cx);
+                    this.begin_download_plan(plan, directory, cx);
                 }
                 None => {
                     this.dialog = None;
@@ -316,13 +375,12 @@ impl AppView {
         .detach();
     }
 
-    fn begin_download(&mut self, directory: PathBuf, cx: &mut Context<Self>) {
-        let plan = build_download_plan(
-            &self.results,
-            self.download_scope,
-            cfg!(target_os = "ios") && self.settings.live_photo_export,
-            !is_desktop(),
-        );
+    fn begin_download_plan(
+        &mut self,
+        plan: DownloadPlan,
+        directory: PathBuf,
+        cx: &mut Context<Self>,
+    ) {
         let total = plan.urls.len();
         if total == 0 {
             report_download_icon_progress(None);

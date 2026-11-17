@@ -17,8 +17,11 @@ pub struct AppSettings {
     pub save_to_gallery: bool,
     /// 小红书请求 Cookie（可选，默认留白）。
     pub xhs_cookie: String,
-    /// iOS 导出到相册时，将实况图封装为 Live Photo；false 则保存为照片 + 视频。
+    /// 实况图导出：iOS 封装为 Live Photo，Android / Windows 封装为 Google Motion Photo；
+    /// false 则保存为照片 + 视频。
     pub live_photo_export: bool,
+    /// 解析结果页展示版本：`geek` | `simple`。
+    pub result_view: String,
 }
 
 impl Default for AppSettings {
@@ -31,6 +34,7 @@ impl Default for AppSettings {
             save_to_gallery: true,
             xhs_cookie: String::new(),
             live_photo_export: true,
+            result_view: "geek".to_string(),
         }
     }
 }

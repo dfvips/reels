@@ -10,7 +10,7 @@ pub fn safe_file_name(input: &str, max_chars: usize, max_bytes: usize) -> String
         .chars()
         .map(|c| {
             if matches!(c, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*')
-                || (c as u32) < 0x20
+                || ((c as u32) < 0x20 && !c.is_whitespace())
             {
                 '_'
             } else {
@@ -121,5 +121,13 @@ mod tests {
         assert_eq!(safe_file_name("CON", 100, 200), "_CON");
         assert_eq!(safe_file_name("结尾点...", 100, 200), "结尾点");
         assert_eq!(safe_file_name("a   b c", 100, 200), "a b c");
+    }
+
+    #[test]
+    fn newlines_become_spaces() {
+        assert_eq!(
+            safe_file_name("第一行\n第二行\r\n#话题", 100, 200),
+            "第一行 第二行 #话题"
+        );
     }
 }

@@ -9,6 +9,8 @@ use std::time::Duration;
 
 use douyin_core::files::{safe_file_name, unique_file_name};
 
+use crate::paths::is_desktop;
+
 #[derive(Debug)]
 pub enum DownloadEvent {
     Started {
@@ -32,7 +34,7 @@ pub enum DownloadEvent {
     Finished,
 }
 
-const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+pub(crate) const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 const PARALLEL_THRESHOLD_BYTES: u64 = 50 * 1024 * 1024;
 const PARALLEL_SEGMENT_COUNT: u64 = 6;
 /// 链接超过该时间没有任何进展（连接、响应头或读取数据）就判定为卡死并跳过。
@@ -189,14 +191,33 @@ pub fn start_downloads(
                     let _ = std::fs::create_dir_all(&directory);
                     match move_into_place(&temp_path, &destination) {
                         Ok(()) => {
+                            #[cfg(target_os = "ios")]
+                            let completed_path = destination.clone();
+                            #[cfg(not(target_os = "ios"))]
+                            let mut completed_path = destination.clone();
                             let saved_to_gallery = if let Some(live_path) = live_path.as_deref() {
-                                let saved =
-                                    crate::gallery::save_live_photo(&destination, live_path);
-                                if !saved {
-                                    let _ = std::fs::remove_file(live_path);
-                                    crate::gallery::save_media(&destination)
-                                } else {
-                                    true
+                                #[cfg(target_os = "ios")]
+                                {
+                                    let saved =
+                                        crate::gallery::save_live_photo(&destination, live_path);
+                                    if saved {
+                                        true
+                                    } else {
+                                        let _ = std::fs::remove_file(live_path);
+                                        crate::gallery::save_media(&destination)
+                                    }
+                                }
+                                #[cfg(not(target_os = "ios"))]
+                                {
+                                    let (path, saved) = finalize_live_download(
+                                        &destination,
+                                        live_path,
+                                        &directory,
+                                        &cache_dir,
+                                        &file_name,
+                                    );
+                                    completed_path = path;
+                                    saved
                                 }
                             } else {
                                 crate::gallery::save_media(&destination)
@@ -209,7 +230,7 @@ pub fn start_downloads(
                             }
                             let _ = tx.send(DownloadEvent::Completed {
                                 index,
-                                path: destination,
+                                path: completed_path,
                             });
                         }
                         Err(error) => {
@@ -252,6 +273,80 @@ fn move_into_place(temp_path: &Path, destination: &Path) -> Result<(), String> {
             )),
         },
     }
+}
+
+/// Android / Windows：把图片与动轨合成为 Google Motion Photo。
+/// 合成失败时回退为分别保存图片和视频，避免丢失动轨。
+fn finalize_live_download(
+    destination: &Path,
+    live_path: &Path,
+    directory: &Path,
+    cache_dir: &Path,
+    file_name: &str,
+) -> (PathBuf, bool) {
+    let stem = file_name
+        .rsplit_once('.')
+        .map(|(stem, _)| stem)
+        .unwrap_or(file_name);
+    let motion_name = format!(
+        "{}.jpg",
+        unique_file_name(directory, &format!("{stem}.MP"), "jpg")
+    );
+    let motion_path = directory.join(&motion_name);
+    let temp_path = cache_dir.join(format!("{motion_name}.part"));
+
+    let assembled = crate::motion_photo::write(destination, live_path, &temp_path)
+        .and_then(|()| move_into_place(&temp_path, &motion_path));
+    if let Err(error) = assembled {
+        eprintln!("实况照片合成失败，改为分别保存图片和视频: {error}");
+        let _ = std::fs::remove_file(&temp_path);
+        return fallback_live_download(destination, live_path, directory, stem);
+    }
+
+    let _ = std::fs::remove_file(destination);
+    let _ = std::fs::remove_file(live_path);
+    let saved_to_gallery = if is_desktop() {
+        true
+    } else {
+        let saved = crate::gallery::save_media(&motion_path);
+        if saved && crate::gallery::caller_deletes_source_after_save() {
+            let _ = std::fs::remove_file(&motion_path);
+        }
+        saved
+    };
+    (motion_path, saved_to_gallery)
+}
+
+fn fallback_live_download(
+    destination: &Path,
+    live_path: &Path,
+    directory: &Path,
+    stem: &str,
+) -> (PathBuf, bool) {
+    if is_desktop() {
+        let video_name = format!(
+            "{}.mp4",
+            unique_file_name(directory, &format!("{stem}-live"), "mp4")
+        );
+        let video_path = directory.join(video_name);
+        if std::fs::rename(live_path, &video_path).is_err()
+            && std::fs::copy(live_path, &video_path).is_ok()
+        {
+            let _ = std::fs::remove_file(live_path);
+        }
+        return (destination.to_path_buf(), true);
+    }
+    let photo_saved = crate::gallery::save_media(destination);
+    let video_saved = crate::gallery::save_media(live_path);
+    if crate::gallery::caller_deletes_source_after_save() {
+        if photo_saved {
+            let _ = std::fs::remove_file(destination);
+        }
+        if video_saved {
+            let _ = std::fs::remove_file(live_path);
+        }
+    }
+    (destination.to_path_buf(), photo_saved)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -543,7 +638,7 @@ fn report_segment_progress(
     });
 }
 
-fn referer_for(url: &str) -> &'static str {
+pub(crate) fn referer_for(url: &str) -> &'static str {
     if url.contains("xhscdn.com") || url.contains("xiaohongshu.com") {
         "https://www.xiaohongshu.com/"
     } else {

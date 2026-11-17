@@ -35,6 +35,13 @@ fn format_duration(total_seconds: u64) -> String {
     }
 }
 
+/// 体验版“导出与下载”只处理当前卡片，导出方式弹窗打开期间暂存其条目。
+#[cfg(target_os = "windows")]
+pub struct SingleExport {
+    pub title: String,
+    pub entries: Vec<MediaEntry>,
+}
+
 use douyin_core::extractor::{MediaEntry, MediaKind, MediaPlatform, VideoExtractor};
 use douyin_input::{Input, InputSize, MULTILINE_LINE_HEIGHT};
 use gpui::{
@@ -222,50 +229,20 @@ fn wrap_title_lines(
 }
 
 impl AppView {
-    /// 标题行摘要：视频显示时长 / 大小 / 清晰度，图片显示大小 / 分辨率。
-    fn entry_summary(&self, entry: Option<&MediaEntry>) -> String {
-        let Some(entry) = entry else {
-            return String::new();
-        };
+    /// 链接卡片第二行：清晰度 / 大小 / 分辨率 / 时长。
+    fn entry_meta(&self, entry: &MediaEntry) -> String {
         let mut parts: Vec<String> = Vec::new();
-        if let Some(duration) = entry.duration_secs {
-            parts.push(format!("时长 {}", format_duration(duration)));
-        }
-        if let Some(size) = entry.size_bytes {
-            parts.push(format!("大小 {}", format_size(size)));
-        }
-        if let Some(quality) = &entry.quality {
-            parts.push(quality.clone());
-        }
-        // 原画/RAW 条目也要展示识别出的分辨率。
-        if entry
-            .quality
-            .as_deref()
-            .map(|quality| matches!(quality, "RAW" | "原画"))
-            .unwrap_or(true)
-        {
-            if let (Some(width), Some(height)) = (entry.width, entry.height) {
-                parts.push(format!("{width}x{height}"));
-            }
-        }
-        parts.join(" · ")
-    }
-
-    /// 多行链接时每行的行内元数据。
-    fn entry_line_detail(&self, entry: &MediaEntry) -> String {
-        let mut parts: Vec<String> = Vec::new();
-        if let Some(quality) = &entry.quality {
+        if let Some(quality) = entry.quality.as_ref().filter(|quality| !quality.is_empty()) {
             parts.push(quality.clone());
         }
         if let Some(size) = entry.size_bytes {
             parts.push(format_size(size));
         }
-        if entry.quality.is_none() {
-            if let (Some(width), Some(height)) = (entry.width, entry.height) {
-                parts.push(format!("{width}x{height}"));
-            }
-        } else if let (Some(width), Some(height)) = (entry.width, entry.height) {
+        if let (Some(width), Some(height)) = (entry.width, entry.height) {
             parts.push(format!("{width}x{height}"));
+        }
+        if let Some(duration) = entry.duration_secs {
+            parts.push(format!("时长 {}", format_duration(duration)));
         }
         parts.join(" · ")
     }
@@ -357,6 +334,7 @@ impl AppView {
                         platform: result.platform,
                         media_kind: result.media_kind,
                         entries: result.entries,
+                        covers: result.covers,
                     });
                 }
             } else if let Some(error) = result.error {
@@ -376,6 +354,12 @@ impl AppView {
 
         let count: usize = items.iter().map(ResultItem::entry_count).sum();
         self.results = items;
+        self.experience_item = 0;
+        self.experience_tab = crate::ExperienceTab::All;
+        self.experience_slide = 0;
+        self.reset_experience_slide_gesture();
+        self.experience_quality.clear();
+        self.experience_quality_menu = false;
         self.toast(format!("成功解析 {count} 个链接"), ToastKind::Info, cx);
         self.navigate_to(crate::Route::Results, cx);
     }
@@ -430,15 +414,41 @@ impl AppView {
         self.toast("已复制所有链接到剪贴板", ToastKind::Info, cx);
     }
 
-    pub fn copy_single(&mut self, index: usize, cx: &mut Context<Self>) {
-        let Some(item) = self.results.get(index) else {
+    pub fn copy_entry(&mut self, index: usize, entry_index: usize, cx: &mut Context<Self>) {
+        let Some(entry) = self
+            .results
+            .get(index)
+            .and_then(|item| item.entries.get(entry_index))
+        else {
             return;
         };
-        let mut lines = vec![item.title.clone()];
-        lines.extend(item.entries.iter().map(|entry| entry.url.clone()));
-        let text = lines.join("\n");
-        cx.write_to_clipboard(ClipboardItem::new_string(text));
-        self.toast("已复制到剪贴板", ToastKind::Info, cx);
+        cx.write_to_clipboard(ClipboardItem::new_string(entry.url.clone()));
+        self.toast("已复制链接", ToastKind::Success, cx);
+    }
+
+    #[cfg(target_os = "macos")]
+    fn set_export_tooltip_hover(&mut self, hovered: bool, cx: &mut Context<Self>) {
+        self.export_tooltip_seq = self.export_tooltip_seq.wrapping_add(1);
+        let seq = self.export_tooltip_seq;
+        if hovered {
+            if !self.export_tooltip_visible {
+                self.export_tooltip_visible = true;
+                cx.notify();
+            }
+            return;
+        }
+        cx.spawn(async move |this: WeakEntity<AppView>, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(160))
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if this.export_tooltip_seq == seq && this.export_tooltip_visible {
+                    this.export_tooltip_visible = false;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
 
     pub fn export_scripts(&mut self, cx: &mut Context<Self>) {
@@ -448,6 +458,7 @@ impl AppView {
         }
         #[cfg(target_os = "windows")]
         {
+            self.pending_single_export = None;
             self.dialog = Some(Dialog::ExportMethod);
             cx.notify();
             return;
@@ -471,10 +482,40 @@ impl AppView {
     }
 
     pub fn confirm_export_scripts(&mut self, scope: ResourceScope, cx: &mut Context<Self>) {
+        let entries = self.result_script_entries(scope);
+        self.confirm_export_entries(entries, cx);
+    }
+
+    fn result_script_entries(&self, scope: ResourceScope) -> Vec<douyin_core::script::ScriptEntry> {
+        self.results
+            .iter()
+            .flat_map(|item| {
+                let selected = item.select_entries(scope);
+                selected
+                    .into_iter()
+                    .map(move |entry| douyin_core::script::ScriptEntry {
+                        title: item.title.clone(),
+                        url: entry.url.clone(),
+                        extension: entry.extension.clone(),
+                    })
+            })
+            .collect()
+    }
+
+    /// 导出指定条目：沿用上次目录，否则弹出目录选择框。
+    pub fn confirm_export_entries(
+        &mut self,
+        entries: Vec<douyin_core::script::ScriptEntry>,
+        cx: &mut Context<Self>,
+    ) {
         self.dialog = None;
+        if entries.is_empty() {
+            self.toast("没有可导出的内容", ToastKind::Error, cx);
+            return;
+        }
         if !self.settings.last_directory.is_empty() {
             let directory = PathBuf::from(&self.settings.last_directory);
-            self.export_scripts_to(directory, scope, cx);
+            self.export_entries_to(directory, entries, cx);
             return;
         }
         let initial = self
@@ -488,7 +529,7 @@ impl AppView {
                 Some(directory) => {
                     this.settings.last_directory = directory.display().to_string();
                     this.save_settings();
-                    this.export_scripts_to(directory, scope, cx);
+                    this.export_entries_to(directory, entries, cx);
                 }
                 None => this.toast("导出已取消", ToastKind::Info, cx),
             });
@@ -498,6 +539,19 @@ impl AppView {
 
     #[cfg(target_os = "windows")]
     pub fn choose_export_scripts(&mut self, cx: &mut Context<Self>) {
+        if let Some(single) = self.pending_single_export.take() {
+            let entries = single
+                .entries
+                .iter()
+                .map(|entry| douyin_core::script::ScriptEntry {
+                    title: single.title.clone(),
+                    url: entry.url.clone(),
+                    extension: entry.extension.clone(),
+                })
+                .collect();
+            self.confirm_export_entries(entries, cx);
+            return;
+        }
         let has_quality_choice = self.results.iter().any(has_multiple_video_qualities);
         if has_quality_choice {
             self.dialog = Some(Dialog::ExportSelection);
@@ -509,6 +563,12 @@ impl AppView {
 
     #[cfg(target_os = "windows")]
     pub fn request_idm_export(&mut self, cx: &mut Context<Self>) {
+        if let Some(single) = self.pending_single_export.take() {
+            let links =
+                Self::idm_links_for(&single.title, &single.entries, &self.settings.xhs_cookie);
+            self.finish_idm_export(links, cx);
+            return;
+        }
         let has_quality_choice = self.results.iter().any(has_multiple_video_qualities);
         if has_quality_choice {
             self.dialog = Some(Dialog::IdmSelection);
@@ -522,46 +582,54 @@ impl AppView {
     pub fn confirm_idm_export(&mut self, scope: ResourceScope, cx: &mut Context<Self>) {
         self.dialog = None;
         let xhs_cookie = self.settings.xhs_cookie.clone();
-        let links: Vec<crate::IdmLink> = self
-            .results
+        let mut links = Vec::new();
+        for item in &self.results {
+            let entries: Vec<MediaEntry> =
+                item.select_entries(scope).into_iter().cloned().collect();
+            links.extend(Self::idm_links_for(&item.title, &entries, &xhs_cookie));
+        }
+        self.finish_idm_export(links, cx);
+    }
+
+    #[cfg(target_os = "windows")]
+    fn idm_links_for(title: &str, entries: &[MediaEntry], xhs_cookie: &str) -> Vec<crate::IdmLink> {
+        let mut used_names = std::collections::HashSet::new();
+        entries
             .iter()
-            .flat_map(|item| {
-                let xhs_cookie = xhs_cookie.clone();
-                let selected = item.select_entries(scope);
-                let mut used_names = std::collections::HashSet::new();
-                selected.into_iter().map(move |entry| {
-                    let extension = entry
-                        .extension
-                        .as_deref()
-                        .filter(|value| !value.is_empty())
-                        .unwrap_or("mp4");
-                    let base = douyin_core::files::safe_file_name(&item.title, 80, 200);
-                    let mut name = format!("{base}.{extension}");
-                    let mut suffix = 2;
-                    while used_names.contains(&name) {
-                        name = format!("{base}_{suffix}.{extension}");
-                        suffix += 1;
-                    }
-                    used_names.insert(name.clone());
-                    let referer = if entry.url.contains("xhscdn.com")
-                        || entry.url.contains("xiaohongshu.com")
-                    {
+            .map(|entry| {
+                let extension = entry
+                    .extension
+                    .as_deref()
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or("mp4");
+                let base = douyin_core::files::safe_file_name(title, 80, 200);
+                let mut name = format!("{base}.{extension}");
+                let mut suffix = 2;
+                while used_names.contains(&name) {
+                    name = format!("{base}_{suffix}.{extension}");
+                    suffix += 1;
+                }
+                used_names.insert(name.clone());
+                let referer =
+                    if entry.url.contains("xhscdn.com") || entry.url.contains("xiaohongshu.com") {
                         "https://www.xiaohongshu.com/"
                     } else {
                         "https://www.douyin.com/"
                     };
-                    let cookie = (!xhs_cookie.is_empty()
-                        && referer == "https://www.xiaohongshu.com/")
-                        .then(|| xhs_cookie.clone());
-                    crate::IdmLink {
-                        url: entry.url.clone(),
-                        referer: referer.to_string(),
-                        cookie,
-                        file_name: name,
-                    }
-                })
+                let cookie = (!xhs_cookie.is_empty() && referer == "https://www.xiaohongshu.com/")
+                    .then(|| xhs_cookie.to_string());
+                crate::IdmLink {
+                    url: entry.url.clone(),
+                    referer: referer.to_string(),
+                    cookie,
+                    file_name: name,
+                }
             })
-            .collect();
+            .collect()
+    }
+
+    #[cfg(target_os = "windows")]
+    fn finish_idm_export(&mut self, links: Vec<crate::IdmLink>, cx: &mut Context<Self>) {
         if links.is_empty() {
             self.show_idm_result(false, "没有可导出的内容".to_string(), cx);
             return;
@@ -583,30 +651,16 @@ impl AppView {
         cx.notify();
     }
 
-    fn export_scripts_to(
+    fn export_entries_to(
         &mut self,
         directory: PathBuf,
-        scope: ResourceScope,
+        entries: Vec<douyin_core::script::ScriptEntry>,
         cx: &mut Context<Self>,
     ) {
         if let Err(error) = std::fs::create_dir_all(&directory) {
             self.toast(format!("导出下载脚本失败: {error}"), ToastKind::Error, cx);
             return;
         }
-        let entries: Vec<douyin_core::script::ScriptEntry> = self
-            .results
-            .iter()
-            .flat_map(|item| {
-                let selected = item.select_entries(scope);
-                selected
-                    .into_iter()
-                    .map(move |entry| douyin_core::script::ScriptEntry {
-                        title: item.title.clone(),
-                        url: entry.url.clone(),
-                        extension: entry.extension.clone(),
-                    })
-            })
-            .collect();
         let scripts = douyin_core::script::build_scripts(&entries, cfg!(target_os = "windows"));
         let mut written = 0;
         let mut first_error = None;
@@ -1345,6 +1399,57 @@ impl AppView {
         self.navigate_back(cx);
     }
 
+    /// macOS 导出脚本按钮的悬浮提示，三个下载器名称可点击打开浏览器。
+    #[cfg(target_os = "macos")]
+    fn render_export_script_tooltip(&self, palette: Palette, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .id("export-script-tooltip")
+            .absolute()
+            .left(px(0.0))
+            .bottom_full()
+            .mb(px(8.0))
+            .occlude()
+            .px(px(12.0))
+            .py(px(8.0))
+            .rounded(px(8.0))
+            .bg(palette.toast_bg)
+            .border_1()
+            .border_color(palette.divider)
+            .shadow_md()
+            .flex()
+            .items_center()
+            .whitespace_nowrap()
+            .text_size(px(12.0))
+            .line_height(px(18.0))
+            .text_color(palette.text_secondary)
+            .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                this.set_export_tooltip_hover(*hovered, cx)
+            }))
+            .child("支持 ")
+            .child(crate::dialogs::link_text(
+                "export-tooltip-aria2c",
+                "aria2c",
+                crate::dialogs::ARIA2C_URL,
+                palette,
+            ))
+            .child("、")
+            .child(crate::dialogs::link_text(
+                "export-tooltip-downloader",
+                "downloader",
+                crate::dialogs::DOWNLOADER_URL,
+                palette,
+            ))
+            .child("、")
+            .child(crate::dialogs::link_text(
+                "export-tooltip-robust-downloader",
+                "RobustDownloader",
+                crate::dialogs::ROBUST_DOWNLOADER_URL,
+                palette,
+            ))
+            .child(" 下载脚本")
+            .into_any_element()
+    }
+
     /// 结果独占一页：列表滚动区自动占满窗口剩余高度。
     pub fn render_results_page(
         &mut self,
@@ -1352,12 +1457,14 @@ impl AppView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        if self.result_view == crate::ResultViewMode::Simple {
+            return self.render_results_page_experience(palette, window, cx);
+        }
         let count: usize = self.results.iter().map(ResultItem::entry_count).sum();
         let viewport_width = f32::from(window.bounds().size.width);
         let title_wrap_width = (viewport_width - 136.0).max(120.0);
         let mut items = Vec::new();
         for (index, item) in self.results.iter().enumerate() {
-            let entity = cx.entity();
             let kind_label = match item.media_kind {
                 MediaKind::Video => "视频",
                 MediaKind::Image => "图片",
@@ -1366,51 +1473,98 @@ impl AppView {
                 MediaKind::Video => crate::theme::PRIMARY,
                 MediaKind::Image => 0xD12CFE,
             };
-            let summary = self.entry_summary(item.primary_entry());
-            let mut lines: Vec<AnyElement> = Vec::new();
+            let mut cards: Vec<AnyElement> = Vec::new();
             for (entry_index, entry) in item.entries.iter().enumerate() {
-                let mut line = div()
-                    .flex()
-                    .items_start()
-                    .gap(px(8.0))
-                    .w_full()
-                    .min_w(px(0.0));
-                if item.entries.len() > 1 {
-                    line = line.child(
-                        div()
-                            .font_family(crate::theme::mono_font())
-                            .text_size(px(12.0))
-                            .line_height(px(18.0))
-                            .text_color(palette.text_muted)
-                            .child(format!("{}.", entry_index + 1)),
-                    );
-                }
-                let detail = if item.entries.len() > 1 {
-                    self.entry_line_detail(entry)
-                } else {
-                    String::new()
-                };
-                let mut url_line = div()
-                    .flex_1()
-                    .min_w(px(0.0))
-                    .font_family(crate::theme::mono_font())
+                let group: SharedString = format!("result-entry-{index}-{entry_index}").into();
+                let entry_entity = cx.entity();
+                let meta = self.entry_meta(entry);
+                let idle_hint = div()
                     .text_size(px(12.0))
                     .line_height(px(18.0))
-                    .text_color(palette.text)
-                    .whitespace_normal()
-                    .child(entry.url.clone());
-                if !detail.is_empty() {
-                    url_line = url_line.child(
+                    .text_color(palette.text_muted)
+                    .whitespace_nowrap()
+                    .group_hover(group.clone(), |style| style.opacity(0.0))
+                    .child("点击链接复制");
+                let hover_hint = div()
+                    .absolute()
+                    .top_0()
+                    .right_0()
+                    .flex()
+                    .items_center()
+                    .gap(px(4.0))
+                    .text_size(px(12.0))
+                    .line_height(px(18.0))
+                    .opacity(0.0)
+                    .group_hover(group.clone(), |style| style.opacity(1.0))
+                    .child(widgets::icon(icons::LINK, 13.0, palette.primary))
+                    .child(
                         div()
-                            .text_size(px(11.0))
-                            .line_height(px(18.0))
-                            .text_color(palette.text_muted)
-                            .ml(px(8.0))
-                            .child(detail),
+                            .text_color(palette.primary)
+                            .whitespace_nowrap()
+                            .child("复制链接"),
                     );
-                }
-                line = line.child(url_line);
-                lines.push(line.into_any_element());
+                cards.push(
+                    div()
+                        .id(format!("result-entry-{index}-{entry_index}"))
+                        .group(group)
+                        .mb(px(8.0))
+                        .p(px(12.0))
+                        .w_full()
+                        .min_w(px(0.0))
+                        .rounded(px(8.0))
+                        .border_1()
+                        .border_color(gpui::rgba(0x00000000))
+                        .bg(palette.result_item_bg)
+                        .flex()
+                        .flex_col()
+                        .gap(px(6.0))
+                        .cursor_pointer()
+                        .hover(|style| style.border_color(palette.primary))
+                        .on_click(move |_, _, cx| {
+                            entry_entity
+                                .update(cx, |this, cx| this.copy_entry(index, entry_index, cx));
+                        })
+                        .child(
+                            div()
+                                .w_full()
+                                .min_w(px(0.0))
+                                .font_family(crate::theme::mono_font())
+                                .text_size(px(13.0))
+                                .line_height(px(20.0))
+                                .text_color(palette.primary)
+                                .underline()
+                                .text_decoration_color(palette.primary)
+                                .text_decoration_solid()
+                                .whitespace_normal()
+                                .child(entry.url.clone()),
+                        )
+                        .child(
+                            div()
+                                .w_full()
+                                .min_w(px(0.0))
+                                .flex()
+                                .items_center()
+                                .gap(px(8.0))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w(px(0.0))
+                                        .text_size(px(12.0))
+                                        .line_height(px(18.0))
+                                        .text_color(palette.text_muted)
+                                        .whitespace_normal()
+                                        .child(meta),
+                                )
+                                .child(
+                                    div()
+                                        .relative()
+                                        .flex_shrink_0()
+                                        .child(idle_hint)
+                                        .child(hover_hint),
+                                ),
+                        )
+                        .into_any_element(),
+                );
             }
             let kind_badge = div()
                 .flex_shrink_0()
@@ -1422,7 +1576,7 @@ impl AppView {
                 .border_1()
                 .border_color(gpui::rgb(kind_color))
                 .child(kind_label);
-            let reserved_width = title_meta_width(window, kind_label, &summary, palette);
+            let reserved_width = title_meta_width(window, kind_label, "", palette);
             let title_lines = wrap_title_lines(window, &item.title, title_wrap_width, palette);
             let last_title_line = title_lines.len().saturating_sub(1);
             let mut header = div().flex().flex_col().w_full().min_w(px(0.0));
@@ -1449,17 +1603,7 @@ impl AppView {
                 .unwrap_or(0.0);
             let meta_fits_on_last_line =
                 last_title_width + reserved_width <= title_wrap_width + 2.0;
-            let mut meta = div().flex().items_center().gap(px(8.0)).child(kind_badge);
-            if !summary.is_empty() {
-                meta = meta.child(
-                    div()
-                        .flex_shrink_0()
-                        .text_size(px(11.0))
-                        .line_height(px(18.0))
-                        .text_color(palette.text_muted)
-                        .child(summary.clone()),
-                );
-            }
+            let badge_row = div().flex().items_center().gap(px(8.0)).child(kind_badge);
             if meta_fits_on_last_line {
                 header = header.child(
                     div()
@@ -1478,7 +1622,7 @@ impl AppView {
                                 .whitespace_nowrap()
                                 .child(last_title),
                         )
-                        .child(meta),
+                        .child(badge_row),
                 );
             } else {
                 header = header.child(
@@ -1492,30 +1636,22 @@ impl AppView {
                         .whitespace_nowrap()
                         .child(last_title),
                 );
-                header = header.child(div().w_full().flex().child(meta));
+                header = header.child(div().w_full().flex().child(badge_row));
             }
             items.push(
                 div()
-                    .id(("result-item", index))
-                    .mb(px(12.0))
-                    .p(px(8.0))
-                    .rounded(px(6.0))
-                    .bg(palette.result_item_bg)
+                    .mb(px(18.0))
+                    .w_full()
+                    .min_w(px(0.0))
                     .flex()
                     .flex_col()
-                    .items_start()
-                    .gap(px(4.0))
-                    .cursor_pointer()
-                    .on_click(move |_, _, cx| {
-                        entity.update(cx, |this, cx| this.copy_single(index, cx));
-                    })
+                    .gap(px(8.0))
                     .child(
                         div()
+                            .w_full()
                             .flex()
                             .items_start()
                             .gap(px(8.0))
-                            .w_full()
-                            .min_w(px(0.0))
                             .child(
                                 div()
                                     .w(px(24.0))
@@ -1531,23 +1667,16 @@ impl AppView {
                                     .child(format!("{}", index + 1)),
                             )
                             .child(
-                                div().flex_1().min_w(px(0.0)).child(
-                                    div()
-                                        .flex()
-                                        .flex_col()
-                                        .gap(px(4.0))
-                                        .w_full()
-                                        .min_w(px(0.0))
-                                        .child(header)
-                                        .children(lines),
-                                ),
-                            )
-                            .child(widgets::gradient_icon(
-                                icons::COPY.as_bytes(),
-                                16.0,
-                                &cx.svg_renderer(),
-                            )),
-                    ),
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .flex()
+                                    .flex_col()
+                                    .child(header),
+                            ),
+                    )
+                    .children(cards)
+                    .into_any_element(),
             );
         }
 
@@ -1574,15 +1703,25 @@ impl AppView {
             let export_label = "导出与下载";
             #[cfg(not(target_os = "windows"))]
             let export_label = "导出下载脚本";
-            action_row = action_row.child(
-                div().flex_1().child(
-                    ActionButton::new("export-button", export_label, palette.export_button())
-                        .icon(icons::TERMINAL, 16.0)
-                        .on_click(move |_, _, cx| {
-                            export_entity.update(cx, |this, cx| this.export_scripts(cx));
-                        }),
-                ),
+            let mut export_cell = div().relative().flex_1().id("export-button-hover");
+            #[cfg(target_os = "macos")]
+            {
+                export_cell = export_cell.on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                    this.set_export_tooltip_hover(*hovered, cx)
+                }));
+            }
+            export_cell = export_cell.child(
+                ActionButton::new("export-button", export_label, palette.export_button())
+                    .icon(icons::TERMINAL, 16.0)
+                    .on_click(move |_, _, cx| {
+                        export_entity.update(cx, |this, cx| this.export_scripts(cx));
+                    }),
             );
+            #[cfg(target_os = "macos")]
+            if self.export_tooltip_visible {
+                export_cell = export_cell.child(self.render_export_script_tooltip(palette, cx));
+            }
+            action_row = action_row.child(export_cell);
         }
 
         action_row = action_row.child(

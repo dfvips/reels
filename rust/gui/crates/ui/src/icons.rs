@@ -57,5 +57,23 @@ pub const WIN_CLOSE: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox=
 /// 与其他设置图标一致的蓝紫渐变成品矢量。
 pub const LIVE_PHOTO: &[u8] = include_bytes!("../../../../assets/icons/live-photo.svg");
 
+/// 纯白实况图标（结果卡片角标使用）。
+pub const LIVE_PHOTO_WHITE: &str = include_str!("../../../../assets/icons/live-photo-white.svg");
+
+/// 极客版 / 体验版切换图标。
+pub const SWITCH: &[u8] = include_bytes!("../../../../assets/icons/switch.svg");
+
+/// 轮播与解析结果切换箭头（currentColor）。
+pub const CHEVRON_LEFT: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M15 5 8 12l7 7" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>"##;
+
+pub const CHEVRON_RIGHT: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="m9 5 7 7-7 7" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>"##;
+
+pub const CHEVRON_DOWN: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="m5 9 7 7 7-7" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>"##;
+
+/// 视频卡片中央的半透明白色播放三角。
+pub const PLAY_OVERLAY: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M8 5.2v13.6L19 12z" fill="#ffffff"/></svg>"##;
+
 /// 勾选标记（currentColor），配合方形勾选框使用。
 pub const CHECK_MARK: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M4.8 12.6l4.6 4.6L19.4 6.9" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></svg>"##;
+
+pub const RETRY: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 12a8 8 0 1 1-2.34-5.66M20 4v5h-5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>"##;

@@ -29,6 +29,13 @@ pub struct MediaEntry {
     pub quality: Option<String>,
     pub width: Option<u64>,
     pub height: Option<u64>,
+    /// 预览缩略图（图片为展示图，视频为视频封面）。
+    pub thumbnail_url: Option<String>,
+    /// 缩略图宽高；视频卡片按它（封面比例）展示，避免被视频分辨率拉窄。
+    pub thumbnail_width: Option<u64>,
+    pub thumbnail_height: Option<u64>,
+    /// 封面原图（封面标签页复制/下载使用）。
+    pub cover_url: Option<String>,
 }
 
 /// 一个解析结果卡片：同标题下的一组媒体链接。
@@ -40,6 +47,8 @@ pub struct ExtractionResult {
     pub media_kind: MediaKind,
     pub title: Option<String>,
     pub entries: Vec<MediaEntry>,
+    /// 视频封面（体验版轮播展示与封面下载使用），可能有多张。
+    pub covers: Vec<MediaEntry>,
     pub error: Option<String>,
 }
 
@@ -52,6 +61,7 @@ impl ExtractionResult {
             media_kind: MediaKind::Video,
             title: None,
             entries: Vec::new(),
+            covers: Vec::new(),
             error: Some(error.into()),
         }
     }
@@ -62,6 +72,7 @@ impl ExtractionResult {
         media_kind: MediaKind,
         title: Option<String>,
         entries: Vec<MediaEntry>,
+        covers: Vec<MediaEntry>,
     ) -> Self {
         Self {
             success: true,
@@ -70,6 +81,7 @@ impl ExtractionResult {
             media_kind,
             title,
             entries,
+            covers,
             error: None,
         }
     }
@@ -113,12 +125,36 @@ impl VideoExtractor {
     fn extract_xhs(&self, url: &str) -> ExtractionResult {
         match xhs::parse_note(&self.http, url, self.xhs_cookie.as_deref()) {
             Ok(note) => {
-                let title = if note.title.is_empty() {
-                    note.desc.clone()
-                } else {
-                    note.title.clone()
-                };
+                let title = xhs_display_title(&note.title, &note.desc);
                 if !note.videos.is_empty() {
+                    // 小红书视频笔记的 imageList[0] 即视频封面。
+                    let cover_thumbnail =
+                        note.images.first().map(|image| image.preview_url.clone());
+                    let cover_original = note.images.first().map(|image| {
+                        if image.raw_url.is_empty() {
+                            image.url.clone()
+                        } else {
+                            image.raw_url.clone()
+                        }
+                    });
+                    let cover_size = note.images.first().map(|image| (image.width, image.height));
+                    let cover = note.images.first().map(|image| {
+                        let original = if image.raw_url.is_empty() {
+                            image.url.clone()
+                        } else {
+                            image.raw_url.clone()
+                        };
+                        MediaEntry {
+                            url: original.clone(),
+                            extension: image.extension.clone().or_else(|| Some("jpg".to_string())),
+                            size_bytes: image.size_bytes,
+                            width: image.width,
+                            height: image.height,
+                            thumbnail_url: Some(image.preview_url.clone()),
+                            cover_url: Some(original),
+                            ..Default::default()
+                        }
+                    });
                     // 与 xhs_app 一致：RAW 原画优先，其余按 stream 顺序（h264 在前）。
                     let mut videos = note.videos.clone();
                     videos.sort_by_key(|video| {
@@ -138,6 +174,10 @@ impl VideoExtractor {
                             quality: xhs_quality(video.quality_type.as_deref()),
                             width: video.width,
                             height: video.height,
+                            thumbnail_url: cover_thumbnail.clone(),
+                            thumbnail_width: cover_size.and_then(|(width, _)| width),
+                            thumbnail_height: cover_size.and_then(|(_, height)| height),
+                            cover_url: cover_original.clone(),
                         })
                         .collect();
                     return ExtractionResult::success(
@@ -146,6 +186,7 @@ impl VideoExtractor {
                         MediaKind::Video,
                         non_empty_title(&title),
                         entries,
+                        cover.into_iter().collect(),
                     );
                 }
                 if note.images.is_empty() {
@@ -155,16 +196,25 @@ impl VideoExtractor {
                         "未找到可下载的视频或图片",
                     );
                 }
+                let raw_urls: Vec<&str> = note
+                    .images
+                    .iter()
+                    .map(|image| image.raw_url.as_str())
+                    .collect();
+                let sizes = self.http.head_content_length_batch(&raw_urls);
                 let entries = note
                     .images
                     .iter()
-                    .flat_map(|image| {
+                    .zip(sizes)
+                    .flat_map(|(image, size_bytes)| {
                         let mut entries = vec![MediaEntry {
                             url: image.raw_url.clone(),
                             extension: image.extension.clone().or_else(|| Some("jpg".to_string())),
-                            size_bytes: self.http.head_content_length(&image.raw_url),
+                            size_bytes,
                             width: image.width,
                             height: image.height,
+                            thumbnail_url: Some(image.preview_url.clone()),
+                            cover_url: Some(image.raw_url.clone()),
                             ..Default::default()
                         }];
                         for video in &image.live_videos {
@@ -176,6 +226,7 @@ impl VideoExtractor {
                                 quality: Some("LIVE".to_string()),
                                 width: video.width,
                                 height: video.height,
+                                ..Default::default()
                             });
                         }
                         entries
@@ -187,25 +238,32 @@ impl VideoExtractor {
                     MediaKind::Image,
                     non_empty_title(&title),
                     entries,
+                    Vec::new(),
                 )
             }
-            Err(error) => {
-                ExtractionResult::failure(url, MediaPlatform::Xhs, format!("解析失败: {error}"))
-            }
+            Err(error) => ExtractionResult::failure(url, MediaPlatform::Xhs, error),
         }
     }
 
     /// 图文 / 实况作品：每张图一条，实况图紧跟其动轨视频，
     /// 动轨与小红书一致标记 `LIVE`。
     fn image_entries(&self, detail: &AwemeDetail) -> Vec<MediaEntry> {
+        let urls: Vec<&str> = detail
+            .images
+            .iter()
+            .map(|image| image.url.as_str())
+            .collect();
+        let sizes = self.http.head_content_length_batch(&urls);
         let mut entries = Vec::new();
-        for image in &detail.images {
+        for (image, size_bytes) in detail.images.iter().zip(sizes) {
             entries.push(MediaEntry {
                 url: image.url.clone(),
                 extension: image_extension(&image.url),
-                size_bytes: self.http.head_content_length(&image.url),
+                size_bytes,
                 width: image.width,
                 height: image.height,
+                thumbnail_url: Some(image.url.clone()),
+                cover_url: Some(image.url.clone()),
                 ..Default::default()
             });
             let Some(live) = image.live_video.as_ref() else {
@@ -239,6 +297,7 @@ impl VideoExtractor {
                 quality: Some("LIVE".to_string()),
                 width: live.width,
                 height: live.height,
+                ..Default::default()
             });
         }
         entries
@@ -302,6 +361,7 @@ impl VideoExtractor {
                     MediaKind::Image,
                     detail.desc.clone(),
                     entries,
+                    Vec::new(),
                 );
             }
             // 原画优先：play_addr.uri 通过 aweme/v1/play 会重定向到
@@ -326,6 +386,67 @@ impl VideoExtractor {
                 }
             };
             let duration_secs = detail.duration_ms.map(|ms| ms / 1000);
+            // 手机端与 PC 端封面不同：dynamic_cover 是手机展示的高清原图，
+            // cover 是 PC 端展示的裁切图，两张都放进轮播。
+            let primary_cover = detail
+                .dynamic_cover
+                .clone()
+                .or_else(|| detail.origin_cover.clone())
+                .or_else(|| detail.cover.clone());
+            let pc_cover = detail.cover.clone();
+            let primary_dimensions = primary_cover
+                .as_deref()
+                .and_then(|url| self.http.image_dimensions(url));
+            let pc_dimensions = if pc_cover.as_deref() == primary_cover.as_deref() {
+                primary_dimensions
+            } else {
+                pc_cover
+                    .as_deref()
+                    .and_then(|url| self.http.image_dimensions(url))
+            };
+            let build_cover =
+                |url: &str, dimensions: Option<(u64, u64)>, known_size: Option<u64>| {
+                    let (size_bytes, content_type) = self.http.head_meta(url);
+                    MediaEntry {
+                        url: url.to_string(),
+                        extension: extension_from_content_type(content_type.as_deref())
+                            .or_else(|| image_extension(url))
+                            .or_else(|| Some("jpg".to_string())),
+                        size_bytes: known_size.or(size_bytes),
+                        width: dimensions
+                            .map(|(width, _)| width)
+                            .or(detail.cover_width)
+                            .or(detail.width),
+                        height: dimensions
+                            .map(|(_, height)| height)
+                            .or(detail.cover_height)
+                            .or(detail.height),
+                        thumbnail_url: Some(url.to_string()),
+                        cover_url: Some(url.to_string()),
+                        ..Default::default()
+                    }
+                };
+            let mut covers = Vec::new();
+            if let Some(url) = primary_cover.as_deref() {
+                covers.push(build_cover(
+                    url,
+                    primary_dimensions,
+                    detail.cover_size_bytes,
+                ));
+            }
+            if let Some(url) = pc_cover.as_deref() {
+                if !covers.iter().any(|cover| cover.url == url) {
+                    covers.push(build_cover(url, pc_dimensions, None));
+                }
+            }
+            // 视频卡片的预览用 PC 封面（origin_cover 可能是黑帧）。
+            let cover_thumbnail = pc_cover.clone().or_else(|| primary_cover.clone());
+            let thumbnail_dimensions = if pc_cover.is_some() {
+                pc_dimensions
+            } else {
+                primary_dimensions
+            };
+            let cover_original = primary_cover.clone();
             let mut entries = Vec::new();
             if is_original {
                 entries.push(MediaEntry {
@@ -336,6 +457,14 @@ impl VideoExtractor {
                     quality: Some("原画".to_string()),
                     width: detail.width,
                     height: detail.height,
+                    thumbnail_url: cover_thumbnail.clone(),
+                    thumbnail_width: thumbnail_dimensions
+                        .map(|(width, _)| width)
+                        .or(detail.cover_width),
+                    thumbnail_height: thumbnail_dimensions
+                        .map(|(_, height)| height)
+                        .or(detail.cover_height),
+                    cover_url: cover_original.clone(),
                 });
             } else {
                 let matched = detail
@@ -356,6 +485,14 @@ impl VideoExtractor {
                         .or_else(|| gear_quality(detail.quality.as_deref())),
                     width: matched.and_then(|bit_rate| bit_rate.width),
                     height: matched.and_then(|bit_rate| bit_rate.height),
+                    thumbnail_url: cover_thumbnail.clone(),
+                    thumbnail_width: thumbnail_dimensions
+                        .map(|(width, _)| width)
+                        .or(detail.cover_width),
+                    thumbnail_height: thumbnail_dimensions
+                        .map(|(_, height)| height)
+                        .or(detail.cover_height),
+                    cover_url: cover_original.clone(),
                 });
             }
 
@@ -384,6 +521,14 @@ impl VideoExtractor {
                     quality: bit_rate_quality(bit_rate.quality.as_deref(), Some(height)),
                     width: Some(width),
                     height: Some(height),
+                    thumbnail_url: cover_thumbnail.clone(),
+                    thumbnail_width: thumbnail_dimensions
+                        .map(|(width, _)| width)
+                        .or(detail.cover_width),
+                    thumbnail_height: thumbnail_dimensions
+                        .map(|(_, height)| height)
+                        .or(detail.cover_height),
+                    cover_url: cover_original.clone(),
                 });
             }
 
@@ -404,19 +549,14 @@ impl VideoExtractor {
                 MediaKind::Video,
                 detail.desc,
                 entries,
+                covers,
             );
         }
 
         // 回退：分享页 HTML 流程
         let html = match self.http.fetch_html(&page_url) {
             Ok(html) => html,
-            Err(err) => {
-                return ExtractionResult::failure(
-                    url,
-                    MediaPlatform::Douyin,
-                    format!("解析失败: {err}"),
-                )
-            }
+            Err(err) => return ExtractionResult::failure(url, MediaPlatform::Douyin, err),
         };
         let Some(video_id) = url_parser::extract_video_id(&html) else {
             return ExtractionResult::failure(url, MediaPlatform::Douyin, "无法获取视频播放链接");
@@ -437,7 +577,21 @@ impl VideoExtractor {
             MediaKind::Video,
             video_title,
             vec![entry],
+            Vec::new(),
         )
+    }
+}
+
+fn extension_from_content_type(content_type: Option<&str>) -> Option<String> {
+    let mime = content_type?.split(';').next()?.trim().to_ascii_lowercase();
+    match mime.as_str() {
+        "image/jpeg" | "image/jpg" => Some("jpg".to_string()),
+        "image/png" => Some("png".to_string()),
+        "image/webp" => Some("webp".to_string()),
+        "image/gif" => Some("gif".to_string()),
+        "image/avif" => Some("avif".to_string()),
+        "image/heic" => Some("heic".to_string()),
+        _ => None,
     }
 }
 
@@ -492,4 +646,43 @@ fn xhs_quality(quality: Option<&str>) -> Option<String> {
 fn non_empty_title(title: &str) -> Option<String> {
     let title = title.trim();
     (!title.is_empty()).then(|| title.to_string())
+}
+
+/// 小红书网页标题 = 标题 + 正文；接口的 `title` 常只有第一行。
+/// 正文以标题开头时直接使用正文，避免重复。
+fn xhs_display_title(title: &str, desc: &str) -> String {
+    let title = title.trim();
+    let desc = desc.trim();
+    match (title.is_empty(), desc.is_empty()) {
+        (true, _) => desc.to_string(),
+        (false, true) => title.to_string(),
+        (false, false) if desc.starts_with(title) => desc.to_string(),
+        (false, false) => format!("{title}\n{desc}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::xhs_display_title;
+
+    #[test]
+    fn xhs_title_without_desc_keeps_title() {
+        assert_eq!(xhs_display_title("标题", ""), "标题");
+    }
+
+    #[test]
+    fn xhs_desc_starting_with_title_is_not_duplicated() {
+        assert_eq!(
+            xhs_display_title("墨镜舞教程可以看这里", "墨镜舞教程可以看这里\n正文"),
+            "墨镜舞教程可以看这里\n正文"
+        );
+    }
+
+    #[test]
+    fn xhs_title_and_desc_are_joined_with_newline() {
+        assert_eq!(
+            xhs_display_title("墨镜舞教程可以看这里", "张列车长包教包会😎"),
+            "墨镜舞教程可以看这里\n张列车长包教包会😎"
+        );
+    }
 }

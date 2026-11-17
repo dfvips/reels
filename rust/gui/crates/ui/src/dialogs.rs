@@ -33,11 +33,13 @@ const SUPPORTED_FORMATS: [&str; 7] = [
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 const IDM_HOMEPAGE_URL: &str = "https://www.internetdownloadmanager.com/";
 #[cfg(any(target_os = "windows", target_os = "macos"))]
-const ARIA2C_URL: &str = "https://aria2.org/";
+pub(crate) const ARIA2C_URL: &str = "https://aria2.org/";
 #[cfg(any(target_os = "windows", target_os = "macos"))]
-const ROBUST_DOWNLOADER_URL: &str = "https://github.com/nilaoda/RobustDownloader/releases";
+pub(crate) const ROBUST_DOWNLOADER_URL: &str =
+    "https://github.com/nilaoda/RobustDownloader/releases";
 #[cfg(any(target_os = "windows", target_os = "macos"))]
-const DOWNLOADER_URL: &str = "https://github.com/nilaoda/SharpTools/tree/main/downloader";
+pub(crate) const DOWNLOADER_URL: &str =
+    "https://github.com/nilaoda/SharpTools/tree/main/downloader";
 const SUPPORTED_XHS_FORMATS: [&str; 5] = [
     "75 【新巡演，整起！^_^ - 张杰 | 小红书 - 你的生活兴趣社区】 😆 RC8p7DRyJZO8KBy 😆 https://www.xiaohongshu.com/discovery/item/6a9e414d000000002a02d317?xsec_token=ABxxxx",
     "https://www.xiaohongshu.com/discovery/item/6a9e414d000000002a02d317?xsec_token=ABxxxx",
@@ -101,7 +103,7 @@ fn cookie_input_bg(dark: bool) -> gpui::Rgba {
 }
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
-fn link_text(
+pub(crate) fn link_text(
     id: &'static str,
     label: &'static str,
     url: &'static str,
@@ -1424,7 +1426,6 @@ impl AppView {
                             reset_entity.update(cx, |this, cx| {
                                 this.location_dialog_directory =
                                     this.paths.default_download_dir.display().to_string();
-                                this.location_dialog_remember = false;
                                 cx.notify();
                             });
                         },
@@ -1852,11 +1853,21 @@ impl AppView {
                 });
             },
         );
+        let live_title = if cfg!(target_os = "ios") {
+            "实况照片（Live Photo）"
+        } else {
+            "实况照片（Motion Photo）"
+        };
+        let live_option_subtitle = if cfg!(target_os = "ios") {
+            "保存为 iPhone 实况照片"
+        } else {
+            "保存为谷歌标准 Motion Photo（JPG 内嵌视频）"
+        };
         let live_row = self.live_photo_option(
             palette,
             "live-photo-option-live",
-            "实况照片（Live Photo）",
-            "保存为 iPhone 实况照片",
+            live_title,
+            live_option_subtitle,
             live_selected,
             move |_, _, cx| {
                 live_entity.update(cx, |this, cx| {
@@ -1887,9 +1898,19 @@ impl AppView {
                         this.save_settings();
                         this.dialog = None;
                         let message = if this.settings.live_photo_export {
-                            "导出到相册时将封装为实况照片"
-                        } else {
+                            if cfg!(target_os = "ios") {
+                                "导出到相册时将封装为实况照片"
+                            } else if cfg!(target_os = "android") {
+                                "保存到相册时将封装为 Motion Photo"
+                            } else {
+                                "下载时将封装为 Motion Photo"
+                            }
+                        } else if cfg!(target_os = "ios") {
                             "导出到相册时将保存为图片和视频"
+                        } else if cfg!(target_os = "android") {
+                            "保存到相册时将保存为图片和视频"
+                        } else {
+                            "下载时将保存为图片和视频"
                         };
                         this.toast(message, ToastKind::Info, cx);
                         cx.notify();
@@ -1955,20 +1976,25 @@ impl AppView {
             .child(
                 div()
                     .flex_1()
+                    .min_w(px(0.0))
                     .flex()
                     .flex_col()
                     .gap(px(4.0))
                     .child(
                         div()
+                            .min_w(px(0.0))
                             .text_size(px(17.0))
                             .font_weight(FontWeight::MEDIUM)
                             .text_color(palette.text)
+                            .whitespace_normal()
                             .child(title.to_string()),
                     )
                     .child(
                         div()
+                            .min_w(px(0.0))
                             .text_size(px(14.0))
                             .text_color(palette.text_secondary)
+                            .whitespace_normal()
                             .child(subtitle.to_string()),
                     ),
             )
@@ -2018,6 +2044,7 @@ impl AppView {
                         move |_, _, cx| {
                             cancel_entity.update(cx, |this, cx| {
                                 this.dialog = None;
+                                this.pending_single_export = None;
                                 cx.notify();
                             });
                         },
@@ -2462,7 +2489,7 @@ impl AppView {
                         div()
                             .text_size(px(14.0))
                             .font_weight(FontWeight::BOLD)
-                            .child(format!("已成功下载 {} 个视频文件：", files.len())),
+                            .child(format!("已成功下载 {} 个文件：", files.len())),
                     )
                     .child(div().flex().flex_col().gap(px(4.0)).children(entries)),
             );

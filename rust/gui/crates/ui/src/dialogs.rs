@@ -46,7 +46,39 @@ const SUPPORTED_XHS_FORMATS: [&str; 5] = [
     "https://www.xiaohongshu.com/user/profile/65c5fd5600000000110173a5/6773508e0000000009015fa0?xsec_token=ABxxxx",
 ];
 pub(crate) const XHS_COOKIE_INPUT_ID: &str = "xhs-cookie-input";
+pub(crate) const XHS_COOKIE_PLACEHOLDER: &str = "请输入小红书 Cookie，如 loadts=xxx;xsecappid=xhs-pc-web;acw_tc=xxxx;x-rednote-datactry=CN;webBuild=6.61.6;sec_poison_id=xxxx;web_session=xxxxx;ets=xxxx;id_token=xxxx;webId=xxxx;x-rednote-holderctry=CN";
 static XHS_COOKIE_DIALOG_SEQ: AtomicU32 = AtomicU32::new(0);
+
+/// Cookie 头须为 `name=value; name2=value2` 键值对；空白表示清除 Cookie。
+fn is_valid_cookie_header(value: &str) -> bool {
+    let value = value.trim();
+    if value.is_empty() {
+        return true;
+    }
+    if value.chars().any(char::is_control) {
+        return false;
+    }
+    let mut pairs = 0;
+    for segment in value.split(';') {
+        let segment = segment.trim();
+        if segment.is_empty() {
+            continue;
+        }
+        let Some((name, _)) = segment.split_once('=') else {
+            return false;
+        };
+        let name = name.trim();
+        if name.is_empty()
+            || name
+                .chars()
+                .any(|c| c.is_whitespace() || matches!(c, '=' | ',' | '"'))
+        {
+            return false;
+        }
+        pairs += 1;
+    }
+    pairs > 0
+}
 
 fn next_xhs_cookie_dialog_seq() -> u32 {
     XHS_COOKIE_DIALOG_SEQ.fetch_add(1, Ordering::Relaxed) + 1
@@ -995,7 +1027,7 @@ impl AppView {
             .multiline(true)
             .native_editor_enabled(native_editor_enabled)
             .value(self.xhs_cookie_input.clone())
-            .placeholder("请输入小红书 Cookie")
+            .placeholder(XHS_COOKIE_PLACEHOLDER)
             .size(InputSize::Lg)
             .select_all_on_ctrl(cfg!(target_os = "windows"))
             .min_lines(input_lines)
@@ -1166,7 +1198,7 @@ impl AppView {
                 // the input's own text, which the native editor aligns its
                 // baseline to, so the hand-off does not move the glyphs.
                 let preview_text = if self.xhs_cookie_input.is_empty() {
-                    "请输入小红书 Cookie".to_string()
+                    XHS_COOKIE_PLACEHOLDER.to_string()
                 } else {
                     self.xhs_cookie_input.clone()
                 };
@@ -1254,8 +1286,16 @@ impl AppView {
                                     }
                                     #[cfg(any(target_os = "android", target_os = "ios"))]
                                     sync_xhs_cookie_editor_text(this);
-                                    this.settings.xhs_cookie =
-                                        this.xhs_cookie_input.trim().to_string();
+                                    let cookie = this.xhs_cookie_input.trim().to_string();
+                                    if !is_valid_cookie_header(&cookie) {
+                                        this.toast(
+                                            "Cookie 格式不正确，请粘贴 name=value; name2=value2 形式的键值对",
+                                            ToastKind::Error,
+                                            cx,
+                                        );
+                                        return;
+                                    }
+                                    this.settings.xhs_cookie = cookie;
                                     this.save_settings();
                                     this.close_xhs_cookie_dialog(window, cx);
                                     this.toast("Cookie 设置已保存", ToastKind::Success, cx);
@@ -2529,5 +2569,34 @@ impl AppView {
                     });
                 },
             )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_valid_cookie_header;
+
+    #[test]
+    fn accepts_key_value_cookie_header() {
+        assert!(is_valid_cookie_header(
+            "loadts=xxx;xsecappid=xhs-pc-web;web_session=xxxxx;x-rednote-holderctry=CN"
+        ));
+        assert!(is_valid_cookie_header(" a=1 ; b=abc== "));
+        assert!(is_valid_cookie_header("a=1;"));
+    }
+
+    #[test]
+    fn rejects_non_key_value_input() {
+        assert!(!is_valid_cookie_header("随便粘贴的内容"));
+        assert!(!is_valid_cookie_header("{\"a\":\"b\"}"));
+        assert!(!is_valid_cookie_header("a=1; 缺少等号"));
+        assert!(!is_valid_cookie_header("=1"));
+        assert!(!is_valid_cookie_header("a b=1"));
+        assert!(!is_valid_cookie_header("a=1\nb=2"));
+    }
+
+    #[test]
+    fn empty_cookie_clears_setting() {
+        assert!(is_valid_cookie_header("   "));
     }
 }

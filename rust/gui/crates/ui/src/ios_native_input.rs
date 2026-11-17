@@ -236,7 +236,7 @@ pub fn show_placeholder(
         focus_border_color: rgba_u32(palette.input_focus),
         border_width: 1.0,
         placeholder: Some(if id == dialogs_placeholder_id() {
-            "请输入小红书 Cookie".to_string()
+            crate::dialogs::XHS_COOKIE_PLACEHOLDER.to_string()
         } else {
             "输入或粘贴短视频分享链接".to_string()
         }),

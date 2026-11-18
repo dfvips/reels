@@ -922,13 +922,25 @@ impl AppView {
                             div()
                                 .text_size(px(15.0))
                                 .text_color(palette.text)
-                                .child("功能: 解析抖音、小红书链接，获取视频下载地址"),
+                                .child("功能: 解析抖音、小红书链接，获取下载地址"),
                         )
                         .child(
                             div()
                                 .text_size(px(15.0))
                                 .text_color(palette.text)
-                                .child("注意: 仅用于学习和研究目的"),
+                                .child("作者: 梦丶随心飞 / Dreamfly"),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(15.0))
+                                .text_color(palette.text)
+                                .child("邮箱: dfvips@qq.com"),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(15.0))
+                                .text_color(palette.text)
+                                .child("声明: 本工具仅用于学习和研究视频网站防盗链等安全技术，免费无广告，请勿用于任何商业或非法用途，如产生法律纠纷与本人无关；如果侵犯了您的权益，请通过邮箱联系本人，本人愿意提供视频网站/应用安全性等相关技术支持；私自修改、传播以及利用此工具牟利等行为，后果由修改者/传播者/牟利者承担；使用此工具一切后果由使用者负责；\n使用此工具即代表您同意此声明。"),
                         ),
                 ),
             )

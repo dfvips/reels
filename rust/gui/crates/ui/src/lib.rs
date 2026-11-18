@@ -449,15 +449,6 @@ pub struct AppView {
     /// Actual prepainted Cookie card height. Android centers the card in the
     /// screen area left above the keyboard, with its top clamped to zero.
     pub xhs_cookie_card_height: f32,
-    /// Last prepainted Cookie card top, used to translate its separate native
-    /// editor window by the same IME-induced jump in one frame.
-    pub xhs_cookie_card_top: Option<f32>,
-    /// Whether Android is moving the Cookie editor from its IME inset callback.
-    pub xhs_cookie_ime_follow: bool,
-    /// Android-only: GPUI paints the Cookie input while the native editor is
-    /// hidden for an IME animation.
-    #[cfg(target_os = "android")]
-    pub xhs_cookie_ime_preview: bool,
     /// Android's Cookie editor is a separate WindowManager surface. Keep the
     /// card transparent while Java mounts that window and then reveal both
     /// surfaces together.
@@ -466,6 +457,10 @@ pub struct AppView {
     /// Whether the Android Cookie editor is still being mounted invisibly.
     #[cfg(target_os = "android")]
     pub xhs_cookie_editor_warmup: bool,
+    /// Whether the native Cookie panel has been requested for this dialog.
+    /// The panel renders the whole card, so GPUI only draws the dim overlay.
+    #[cfg(target_os = "android")]
+    pub xhs_cookie_panel_shown: bool,
     /// Visual line count measured by the native Cookie editor.
     pub xhs_cookie_native_input_lines: Option<usize>,
     pub results_scroll: ScrollHandle,
@@ -506,6 +501,8 @@ pub struct AppView {
     /// 实况照片弹窗的草稿选择；点“确定”后才写入设置。
     pub live_photo_dialog_choice: bool,
     pub xhs_cookie_input: String,
+    /// iOS Cookie 弹窗：上次保存因格式校验失败，输入框显示红色描边与提示。
+    pub xhs_cookie_error: bool,
     _appearance_sub: Option<Subscription>,
     #[cfg(target_os = "android")]
     android_back_pressed_at: Option<Instant>,
@@ -540,6 +537,19 @@ impl AppView {
         let result_view = ResultViewMode::from_setting(&settings.result_view);
         #[cfg(target_os = "android")]
         if let Some(window_handle) = window.window_handle().downcast::<AppView>() {
+            let cookie_window_handle = window_handle.clone();
+            let cookie_async_cx = cx.to_async();
+            gpui_android::set_native_cookie_handler(Some(Box::new(move |action| {
+                let async_cx = cookie_async_cx.clone();
+                let window_handle = cookie_window_handle.clone();
+                async_cx
+                    .spawn(async move |cx| {
+                        let _ = window_handle.update(cx, |view, window, cx| {
+                            view.finish_native_cookie_dialog(action, window, cx);
+                        });
+                    })
+                    .detach();
+            })));
             let async_cx = cx.to_async();
             gpui_android::set_back_handler(Some(Box::new(move || {
                 let async_cx = async_cx.clone();
@@ -579,14 +589,12 @@ impl AppView {
             xhs_cookie_scroll: ScrollHandle::new(),
             xhs_cookie_scrollbar_drag: widgets::ScrollbarDrag::default(),
             xhs_cookie_card_height: 0.0,
-            xhs_cookie_card_top: None,
-            xhs_cookie_ime_follow: false,
-            #[cfg(target_os = "android")]
-            xhs_cookie_ime_preview: false,
             #[cfg(target_os = "android")]
             xhs_cookie_warmup_frames: 0,
             #[cfg(target_os = "android")]
             xhs_cookie_editor_warmup: false,
+            #[cfg(target_os = "android")]
+            xhs_cookie_panel_shown: false,
             xhs_cookie_native_input_lines: None,
             results_scroll: ScrollHandle::new(),
             loading: false,
@@ -620,6 +628,7 @@ impl AppView {
             location_dialog_remember: false,
             live_photo_dialog_choice: false,
             xhs_cookie_input: String::new(),
+            xhs_cookie_error: false,
             _appearance_sub,
             #[cfg(target_os = "android")]
             android_back_pressed_at: None,
@@ -929,6 +938,7 @@ impl AppView {
                 && matches!(self.dialog, Some(Dialog::XhsCookie))
             {
                 self.xhs_cookie_input = event.text;
+                self.xhs_cookie_error = false;
                 #[cfg(target_os = "ios")]
                 ios_native_input::confirm_native_text(
                     dialogs::XHS_COOKIE_INPUT_ID,
@@ -1012,8 +1022,6 @@ impl Render for AppView {
             )
         });
         let toast = self.render_toast(palette);
-        #[cfg(target_os = "android")]
-        self.sync_cookie_dialog_native_offset(window);
         let dialog = self.render_dialog(palette, window, cx);
 
         let root = div()

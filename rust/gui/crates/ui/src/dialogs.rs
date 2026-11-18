@@ -49,9 +49,14 @@ const SUPPORTED_XHS_FORMATS: [&str; 5] = [
 ];
 pub(crate) const XHS_COOKIE_INPUT_ID: &str = "xhs-cookie-input";
 pub(crate) const XHS_COOKIE_PLACEHOLDER: &str = "请输入小红书 Cookie，如 loadts=xxx;xsecappid=xhs-pc-web;acw_tc=xxxx;x-rednote-datactry=CN;webBuild=6.61.6;sec_poison_id=xxxx;web_session=xxxxx;ets=xxxx;id_token=xxxx;webId=xxxx;x-rednote-holderctry=CN";
+pub(crate) const COOKIE_ERROR_COLOR: u32 = 0xFFE5484D;
+/// Same red as `COOKIE_ERROR_COLOR` in the RGBA encoding the iOS native
+/// input expects (0xRRGGBBAA); ARGB would decode alpha as 0x4D there.
+pub(crate) const COOKIE_ERROR_RGBA: u32 = (COOKIE_ERROR_COLOR & 0xFFFFFF) << 8 | 0xFF;
 static XHS_COOKIE_DIALOG_SEQ: AtomicU32 = AtomicU32::new(0);
 
-/// Cookie 头须为 `name=value; name2=value2` 键值对；空白表示清除 Cookie。
+/// Cookie 头须为 `name=value; name2=value2` 键值对；名称按 RFC 6265 token
+/// 规则限定字符，粘贴的整段 URL 或自由文本都不合法。空白表示清除 Cookie。
 fn is_valid_cookie_header(value: &str) -> bool {
     let value = value.trim();
     if value.is_empty() {
@@ -71,9 +76,9 @@ fn is_valid_cookie_header(value: &str) -> bool {
         };
         let name = name.trim();
         if name.is_empty()
-            || name
+            || !name
                 .chars()
-                .any(|c| c.is_whitespace() || matches!(c, '=' | ',' | '"'))
+                .all(|c| c.is_ascii_alphanumeric() || "!#$%&'*+-.^_`|~".contains(c))
         {
             return false;
         }
@@ -204,16 +209,14 @@ pub fn close_or_replace_dialog(view: &mut AppView, window: &mut Window, cx: &mut
         let android_owned_native_editor = owned_native_editor;
         let cookie_had_focus = view.xhs_cookie_focus.is_focused(window);
         view.dialog = None;
-        view.xhs_cookie_card_top = None;
         #[cfg(target_os = "android")]
         {
             view.xhs_cookie_warmup_frames = 0;
             view.xhs_cookie_editor_warmup = false;
-            view.xhs_cookie_ime_follow = false;
-            view.xhs_cookie_ime_preview = false;
+            view.xhs_cookie_panel_shown = false;
+            gpui_android::hide_native_cookie_panel();
             gpui_android::set_native_editor_warmup(false);
             gpui_android::set_native_editor_ime_follow(false);
-            gpui_android::set_native_editor_ime_preview(false);
         }
         view.xhs_cookie_input = saved_cookie.clone();
         reset_xhs_cookie_draft(&saved_cookie);
@@ -272,92 +275,6 @@ pub fn close_or_replace_dialog(view: &mut AppView, window: &mut Window, cx: &mut
 }
 
 impl AppView {
-    /// Window-space top of the Cookie dialog for the current viewport.
-    ///
-    /// Uses the same viewport/keyboard math as the overlay itself, so the
-    /// native editor can be moved by the exact layout delta on every device.
-    #[cfg(any(target_os = "android", target_os = "ios"))]
-    pub(crate) fn cookie_dialog_target_top(&self, window: &Window) -> Option<f32> {
-        if !matches!(self.dialog, Some(Dialog::XhsCookie)) {
-            return None;
-        }
-        let viewport = window.viewport_size();
-        let viewport_width: f32 = viewport.width.into();
-        let viewport_height: f32 = viewport.height.into();
-        let landscape_cookie = viewport_width > viewport_height;
-        let keyboard_height = {
-            #[cfg(target_os = "android")]
-            {
-                gpui_android::ime_bottom_inset_logical()
-            }
-            #[cfg(target_os = "ios")]
-            {
-                gpui_ios::keyboard_height()
-            }
-            #[cfg(not(any(target_os = "android", target_os = "ios")))]
-            {
-                0.0
-            }
-        };
-        let available_height = if landscape_cookie {
-            viewport_height.max(1.0)
-        } else {
-            (viewport_height - keyboard_height).max(1.0)
-        };
-        Some(((available_height - self.xhs_cookie_card_height) * 0.5).max(0.0))
-    }
-
-    /// Move the native Cookie editor by the exact dialog-layout delta before
-    /// GPUI paints the frame, so both surfaces target the same vsync.
-    #[cfg(target_os = "android")]
-    pub(crate) fn sync_cookie_dialog_native_offset(&mut self, window: &Window) {
-        let target = self.cookie_dialog_target_top(window);
-        let viewport = window.viewport_size();
-        let portrait = f32::from(viewport.width) <= f32::from(viewport.height);
-        let editor_owned = native_editor_owned_by(&xhs_cookie_input_id());
-        // The card is centred by flex layout from the first frame; its height
-        // is still unknown until the first prepaint. Do not treat the
-        // placeholder height (zero) as a real position: moving the native
-        // editor against that value is what made the first open jump upward.
-        let height_known = self.xhs_cookie_card_height > 0.5;
-        // In portrait the card reflows around the keyboard, so Android can
-        // move the editor from its IME inset callback, one step earlier than
-        // this render pass. Landscape centres the card without the keyboard;
-        // it must not follow the IME. Keep following across the focus/blur
-        // that hides the keyboard; the Java side no-ops when no editor is
-        // attached and resets its inset baseline when one appears.
-        let follow_ime = target.is_some() && portrait;
-        if follow_ime != self.xhs_cookie_ime_follow {
-            if follow_ime {
-                if let (Some(previous), Some(target)) = (self.xhs_cookie_card_top, target) {
-                    // Java's inset baseline starts at the current keyboard
-                    // height. Align any layout change that happened before
-                    // the hand-off so the next inset delta starts from the
-                    // card.
-                    let delta = target - previous;
-                    if delta.abs() > 0.5 && editor_owned {
-                        gpui_android::translate_native_editor(delta);
-                    }
-                }
-            }
-            gpui_android::set_native_editor_ime_follow(follow_ime);
-            self.xhs_cookie_ime_follow = follow_ime;
-        }
-        if follow_ime != self.xhs_cookie_ime_preview {
-            gpui_android::set_native_editor_ime_preview(follow_ime);
-            self.xhs_cookie_ime_preview = follow_ime;
-        }
-        if height_known {
-            if let (Some(previous), Some(target)) = (self.xhs_cookie_card_top, target) {
-                let delta = target - previous;
-                if delta.abs() > 0.5 && editor_owned && !follow_ime {
-                    gpui_android::translate_native_editor(delta);
-                }
-            }
-            self.xhs_cookie_card_top = target;
-        }
-    }
-
     pub fn render_dialog(
         &mut self,
         palette: Palette,
@@ -399,6 +316,24 @@ impl AppView {
         let landscape_cookie = is_cookie_dialog
             && cfg!(any(target_os = "android", target_os = "ios"))
             && viewport_width > viewport_height;
+        // iOS landscape with the keyboard docked: the card gives way to a
+        // full-width editor strip above the keyboard, like the Home input.
+        // Use the keyboard height (not focus) so dismissing the keyboard
+        // restores the regular card with its Save/Cancel buttons.
+        #[cfg(target_os = "ios")]
+        let ios_cookie_compact = is_cookie_dialog && landscape_cookie && keyboard_height > 1.0;
+        #[cfg(not(target_os = "ios"))]
+        let ios_cookie_compact = false;
+        // The Cookie card is centred in the viewport minus the IME inset, so
+        // it moves by exactly half of every IME delta. Let Java move the
+        // separate editor window from the same inset callback and hand Rust
+        // the matching snapshot, instead of repositioning the window from
+        // Rust's per-frame paint. In landscape the card does not reflow with
+        // the keyboard, so it must not follow.
+        #[cfg(target_os = "android")]
+        if is_cookie_dialog {
+            gpui_android::set_native_editor_ime_follow(!landscape_cookie);
+        }
         let available_height = if landscape_cookie {
             viewport_height.max(1.0)
         } else {
@@ -409,6 +344,63 @@ impl AppView {
             .min(480.0)
             .max(1.0);
         let max_card_height = (available_height * 0.8).max(1.0);
+        // On Android the Cookie dialog is a single native window: the card,
+        // its editor and its action buttons move together with the keyboard.
+        // GPUI only paints the dim backdrop, so the two can never desync.
+        #[cfg(target_os = "android")]
+        {
+            if is_cookie_dialog {
+                if !self.xhs_cookie_panel_shown {
+                    self.xhs_cookie_panel_shown = true;
+                    let save_button = palette.download_button();
+                    let cancel_button = palette.plain_button();
+                    gpui_android::show_native_cookie_panel(&gpui_android::NativeCookiePanelSpec {
+                        text: self.xhs_cookie_input.clone(),
+                        width: card_width,
+                        title: "Cookie 设置".to_string(),
+                        hint: "可粘贴浏览器中小红书站点的 Cookie".to_string(),
+                        placeholder: XHS_COOKIE_PLACEHOLDER.to_string(),
+                        cancel_label: "取消".to_string(),
+                        save_label: "保存".to_string(),
+                        card_bg: if palette.dark { 0x2b2b2bff } else { 0xffffffff },
+                        text_color: u32::from(palette.text),
+                        muted_color: u32::from(palette.text_muted),
+                        field_bg: u32::from(cookie_input_bg(palette.dark)),
+                        field_border: u32::from(palette.input_border),
+                        field_focus: u32::from(palette.input_focus),
+                        primary: u32::from(save_button.bg),
+                        primary_text: u32::from(save_button.fg),
+                        cancel_bg: u32::from(cancel_button.bg),
+                        cancel_border: u32::from(cancel_button.border),
+                        cancel_text: u32::from(cancel_button.fg),
+                    });
+                }
+                return Some(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .bg(gpui::rgba(0x00000066))
+                        .occlude()
+                        .on_mouse_down(gpui::MouseButton::Left, |_, window, cx| {
+                            // 点击遮罩视为放弃输入。
+                            crate::hide_soft_keyboard();
+                            window.blur(cx);
+                            let Some(handle) = cx.active_window() else {
+                                return;
+                            };
+                            let Some(handle) = handle.downcast::<AppView>() else {
+                                return;
+                            };
+                            let _ = handle.update(cx, |view, window, cx| {
+                                if matches!(view.dialog, Some(Dialog::XhsCookie)) {
+                                    close_or_replace_dialog(view, window, cx);
+                                }
+                            });
+                        })
+                        .into_any_element(),
+                );
+            }
+        }
         let card = match dialog {
             Dialog::Help => self.dialog_help(palette, card_width, max_card_height, cx),
             Dialog::About => self.dialog_about(palette, card_width, max_card_height, cx),
@@ -420,6 +412,7 @@ impl AppView {
                 card_width,
                 max_card_height,
                 landscape_cookie,
+                ios_cookie_compact,
                 window,
                 cx,
             ),
@@ -483,7 +476,7 @@ impl AppView {
         };
 
         let mut card = card;
-        if landscape_cookie {
+        if landscape_cookie && !ios_cookie_compact {
             // In landscape the dialog keeps its normal, keyboard-independent
             // size. Use the full allowed height so the one-third editor cap
             // has a stable reference and cannot feed back into the card size.
@@ -492,6 +485,7 @@ impl AppView {
 
         let card_entity = cx.entity();
         let card = div()
+            .when(ios_cookie_compact, |el| el.w_full())
             .on_children_prepainted(move |bounds, _, cx| {
                 if !is_cookie_dialog {
                     return;
@@ -544,13 +538,25 @@ impl AppView {
                     }
                 });
             })
-            .child(
-                div()
-                    .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| {
+            .child({
+                let holder = if ios_cookie_compact {
+                    // The compact strip covers the page above the keyboard.
+                    // Tapping beside the editor dismisses the keyboard and
+                    // restores the card, like tapping outside Home's input.
+                    div()
+                        .on_mouse_down(gpui::MouseButton::Left, |_, window, cx| {
+                            crate::hide_soft_keyboard();
+                            window.blur(cx);
+                            cx.stop_propagation();
+                        })
+                        .w_full()
+                } else {
+                    div().on_mouse_down(gpui::MouseButton::Left, |_, _, cx| {
                         cx.stop_propagation();
                     })
-                    .child(card),
-            );
+                };
+                holder.child(card)
+            });
         #[cfg(any(target_os = "android", target_os = "ios"))]
         let overlay = if is_cookie_dialog {
             // Centre the card from the first frame. The previous top-offset
@@ -562,14 +568,18 @@ impl AppView {
             let card_ready = self.xhs_cookie_warmup_frames == 0;
             #[cfg(target_os = "ios")]
             let card_ready = true;
-            overlay
-                .items_center()
+            let overlay = overlay
                 .pb(px(if landscape_cookie {
                     0.0
                 } else {
                     keyboard_height
                 }))
-                .opacity(if card_ready { 1.0 } else { 0.0 })
+                .opacity(if card_ready { 1.0 } else { 0.0 });
+            if ios_cookie_compact {
+                overlay.items_start()
+            } else {
+                overlay.items_center()
+            }
         } else {
             overlay.items_center()
         };
@@ -957,19 +967,15 @@ impl AppView {
         self.xhs_cookie_scroll = gpui::ScrollHandle::new();
         self.xhs_cookie_scrollbar_drag = widgets::ScrollbarDrag::default();
         self.xhs_cookie_card_height = 0.0;
-        self.xhs_cookie_card_top = None;
+        self.xhs_cookie_error = false;
         #[cfg(target_os = "android")]
         {
-            // The card and the native editor are different compositor
-            // surfaces. Mount the editor invisibly for two layout passes,
-            // then reveal it and the card on the same frame.
-            self.xhs_cookie_warmup_frames = 2;
-            self.xhs_cookie_editor_warmup = true;
-            self.xhs_cookie_ime_follow = false;
-            self.xhs_cookie_ime_preview = false;
-            gpui_android::set_native_editor_warmup(true);
-            gpui_android::set_native_editor_ime_follow(false);
-            gpui_android::set_native_editor_ime_preview(false);
+            // The whole card is rendered by the native panel, so there is no
+            // GPUI card or mounted editor to warm up. render_dialog requests
+            // the panel once the viewport width is known.
+            self.xhs_cookie_warmup_frames = 0;
+            self.xhs_cookie_editor_warmup = false;
+            self.xhs_cookie_panel_shown = false;
         }
         self.dialog = Some(Dialog::XhsCookie);
         #[cfg(target_os = "android")]
@@ -982,12 +988,47 @@ impl AppView {
         close_or_replace_dialog(self, window, cx);
     }
 
+    /// Handle Save/Cancel from the native Android Cookie panel.
+    ///
+    /// The panel stays visible on validation failures; Rust hides it only
+    /// through the regular dialog close path.
+    #[cfg(target_os = "android")]
+    pub(crate) fn finish_native_cookie_dialog(
+        &mut self,
+        action: gpui_android::NativeCookieAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !matches!(self.dialog, Some(Dialog::XhsCookie)) {
+            gpui_android::hide_native_cookie_panel();
+            return;
+        }
+        match action {
+            gpui_android::NativeCookieAction::Save(text) => {
+                self.xhs_cookie_input = text;
+                let cookie = self.xhs_cookie_input.trim().to_string();
+                if !is_valid_cookie_header(&cookie) {
+                    self.toast("Cookie 格式不正确", ToastKind::Error, cx);
+                    return;
+                }
+                self.settings.xhs_cookie = cookie;
+                self.save_settings();
+                close_or_replace_dialog(self, window, cx);
+                self.toast("Cookie 设置已保存", ToastKind::Success, cx);
+            }
+            gpui_android::NativeCookieAction::Cancel => {
+                close_or_replace_dialog(self, window, cx);
+            }
+        }
+    }
+
     fn dialog_xhs_cookie(
         &mut self,
         palette: Palette,
         width: f32,
         max_height: f32,
         landscape: bool,
+        compact: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Div {
@@ -1051,6 +1092,7 @@ impl AppView {
                         && this.xhs_cookie_input != text
                     {
                         this.xhs_cookie_input = text.to_string();
+                        this.xhs_cookie_error = false;
                         cx.notify();
                     }
                 });
@@ -1059,39 +1101,48 @@ impl AppView {
         // On iOS the GPUI tree contains only an empty layout slot. The Swift
         // UITextView is the sole renderer and draws the native border.
         #[cfg(target_os = "ios")]
-        let input_scroll = div()
-            .relative()
-            .w_full()
-            .h(px(input_box_height_value))
-            .on_children_prepainted({
-                let placeholder_entity = cx.entity();
-                move |bounds, window, cx| {
-                    let Some(bounds) = bounds.first() else {
-                        return;
-                    };
-                    placeholder_entity.update(cx, |view, cx| {
-                        crate::ios_native_input::show_placeholder(
-                            XHS_COOKIE_INPUT_ID,
-                            &view.xhs_cookie_input,
-                            f32::from(bounds.origin.x),
-                            f32::from(bounds.origin.y),
-                            f32::from(bounds.size.width),
-                            f32::from(bounds.size.height),
-                            input_box_height_value,
-                            146.0,
-                            None,
-                            palette,
-                            view.xhs_cookie_focus.is_focused(window),
-                        );
-                        let _ = cx;
-                    });
-                }
-            })
-            .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| {
-                crate::ios_native_input::focus(XHS_COOKIE_INPUT_ID);
-                cx.stop_propagation();
-            })
-            .child(div().id("xhs-cookie-input-scroll").w_full().h_full());
+        let input_scroll = {
+            let slot = div()
+                .relative()
+                .w_full()
+                .on_children_prepainted({
+                    let placeholder_entity = cx.entity();
+                    move |bounds, window, cx| {
+                        let Some(bounds) = bounds.first() else {
+                            return;
+                        };
+                        placeholder_entity.update(cx, |view, cx| {
+                            crate::ios_native_input::show_placeholder(
+                                XHS_COOKIE_INPUT_ID,
+                                &view.xhs_cookie_input,
+                                f32::from(bounds.origin.x),
+                                f32::from(bounds.origin.y),
+                                f32::from(bounds.size.width),
+                                f32::from(bounds.size.height),
+                                input_box_height_value,
+                                146.0,
+                                None,
+                                palette,
+                                view.xhs_cookie_focus.is_focused(window),
+                                view.xhs_cookie_error,
+                            );
+                            let _ = cx;
+                        });
+                    }
+                })
+                .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| {
+                    crate::ios_native_input::focus(XHS_COOKIE_INPUT_ID);
+                    cx.stop_propagation();
+                })
+                .child(div().id("xhs-cookie-input-scroll").w_full().h_full());
+            if compact {
+                // Fill the strip left above the keyboard instead of using the
+                // card's fixed editor height.
+                slot.flex_1()
+            } else {
+                slot.h(px(input_box_height_value))
+            }
+        };
 
         #[cfg(not(target_os = "ios"))]
         let mut input_scroll = div()
@@ -1108,15 +1159,6 @@ impl AppView {
         if native_editor_enabled {
             input_scroll = input_scroll.overflow_hidden().scrollbar_width(px(0.0));
         }
-
-        #[cfg(target_os = "android")]
-        let ime_preview_visible = native_editor_enabled
-            && self.xhs_cookie_ime_preview
-            && gpui_android::native_editor_ime_preview_visible()
-            && !self.xhs_cookie_editor_warmup
-            && native_editor_owned_by(&xhs_cookie_input_id());
-        #[cfg(all(not(target_os = "android"), not(target_os = "ios")))]
-        let _ime_preview_visible = false;
 
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
         let input_scroll = input_scroll.on_mouse_up_out(MouseButton::Left, {
@@ -1165,71 +1207,63 @@ impl AppView {
 
         #[cfg(not(target_os = "ios"))]
         {
-            // The native editor is invisible while the card fades in and
-            // while the IME animates, so GPUI has to paint the field (chrome
-            // and text) for those frames; otherwise the box looks empty.
-            #[cfg(target_os = "android")]
-            // In landscape the native editor has an opaque GPUI background
-            // but no IME preview, so its EditText remains transparent. A
-            // permanent GPUI text copy would then show through it as a glyph
-            // double image. Keep the copy only for warm-up and portrait IME
-            // animation frames, when Java hides the native text on purpose.
-            let gpui_paints_cookie_input = native_editor_enabled
-                && (!landscape || self.xhs_cookie_editor_warmup || ime_preview_visible);
-            #[cfg(not(target_os = "android"))]
-            let gpui_paints_cookie_input = false;
-            // The native editor paints its own border. Keep an opaque GPUI
-            // background and border underneath it so warm-up and IME preview
-            // frames still show the field without changing its geometry.
+            // The native editor is transparent and paints its own border.
+            // Keep an opaque GPUI background and border underneath it for
+            // the frames before Java mounts the editor window, without
+            // changing the field's geometry.
             input_box = input_box.bg(cookie_input_bg(palette.dark)).child(
                 div()
                     .absolute()
                     .inset_0()
                     .rounded_md()
                     .border_1()
-                    .border_color(if input_focused {
+                    .border_color(if self.xhs_cookie_error {
+                        gpui::rgb(COOKIE_ERROR_COLOR & 0xFFFFFF)
+                    } else if input_focused {
                         palette.input_focus
                     } else {
                         palette.input_border
                     }),
             );
-            if gpui_paints_cookie_input {
-                // The native editor is transparent for the whole IME
-                // animation, so GPUI has to show the field's text too. It
-                // uses the same font size, line height, and 12dp padding as
-                // the input's own text, which the native editor aligns its
-                // baseline to, so the hand-off does not move the glyphs.
-                let preview_text = if self.xhs_cookie_input.is_empty() {
-                    XHS_COOKIE_PLACEHOLDER.to_string()
-                } else {
-                    self.xhs_cookie_input.clone()
-                };
-                let preview_text_color = if self.xhs_cookie_input.is_empty() {
-                    palette.hint
-                } else {
-                    palette.text
-                };
-                let scroll_y = f32::from(self.xhs_cookie_scroll.offset().y);
-                input_box = input_box.child(
-                    div().absolute().inset_0().overflow_hidden().child(
-                        div()
-                            .absolute()
-                            .left(px(12.0))
-                            .right(px(12.0))
-                            .top(px(12.0 + scroll_y))
-                            .text_size(px(16.0))
-                            .line_height(px(20.0))
-                            .text_color(preview_text_color)
-                            .whitespace_normal()
-                            .child(preview_text),
-                    ),
-                );
-            }
+        }
+
+        // Landscape with the docked keyboard: match the Home input's compact
+        // geometry exactly — safe-area insets plus 16pt padding on the sides
+        // and top, and the same viewport-derived line height instead of
+        // stretching to the keyboard.
+        #[cfg(target_os = "ios")]
+        if compact {
+            let viewport_height: f32 = window.viewport_size().height.into();
+            let (safe_top, safe_left, _safe_bottom, safe_right) = gpui_ios::safe_area_insets();
+            let area = (viewport_height - gpui_ios::keyboard_height()).max(1.0);
+            let line_height = douyin_input::MULTILINE_LINE_HEIGHT.max(1.0);
+            let chrome = crate::ios_native_input::TEXT_PADDING * 2.0;
+            let max_height = (viewport_height / 3.0).max(chrome + line_height);
+            let lines = (((max_height - chrome) / line_height).floor() as usize).max(1);
+            let input_height = lines as f32 * line_height + chrome;
+            return div()
+                .w_full()
+                .h(px(area))
+                .pt(px(safe_top + 16.0))
+                .pl(px(safe_left + 16.0))
+                .pr(px(safe_right + 16.0))
+                .flex()
+                .flex_col()
+                .bg(palette.bg)
+                .child(input_box.flex().flex_col().h(px(input_height)));
         }
 
         let content_scroll = self.dialog_content_scroll("xhs-cookie-content-scroll");
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
         let content_scroll = content_scroll.flex_initial();
+
+        let error_text = self.xhs_cookie_error.then(|| {
+            div()
+                .text_size(px(12.0))
+                .line_height(px(16.0))
+                .text_color(gpui::rgb(COOKIE_ERROR_COLOR & 0xFFFFFF))
+                .child("Cookie 格式不正确")
+        });
 
         self.dialog_card(palette, width, max_height)
             .child(
@@ -1249,7 +1283,8 @@ impl AppView {
                                 .text_color(palette.text_muted)
                                 .child("可粘贴浏览器中小红书站点的 Cookie"),
                         )
-                        .child(input_box),
+                        .child(input_box)
+                        .children(error_text),
                 ),
             )
             .child(
@@ -1290,7 +1325,8 @@ impl AppView {
                                     sync_xhs_cookie_editor_text(this);
                                     let cookie = this.xhs_cookie_input.trim().to_string();
                                     if !is_valid_cookie_header(&cookie) {
-                                        this.toast("Cookie 格式不正确", ToastKind::Error, cx);
+                                        this.xhs_cookie_error = true;
+                                        cx.notify();
                                         return;
                                     }
                                     this.settings.xhs_cookie = cookie;

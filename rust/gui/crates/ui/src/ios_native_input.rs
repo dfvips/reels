@@ -198,6 +198,7 @@ pub fn show_placeholder(
     clip_bounds: Option<(f32, f32, f32, f32)>,
     palette: crate::theme::Palette,
     focused: bool,
+    error: bool,
 ) {
     let current_id = c_string(id);
     unsafe {
@@ -228,12 +229,20 @@ pub fn show_placeholder(
         initial: false,
         text_color: rgba_u32(palette.text),
         background_color: 0x00000000,
-        border_color: rgba_u32(if focused {
-            palette.input_focus
+        border_color: if error {
+            crate::dialogs::COOKIE_ERROR_RGBA
         } else {
-            palette.input_border
-        }),
-        focus_border_color: rgba_u32(palette.input_focus),
+            rgba_u32(if focused {
+                palette.input_focus
+            } else {
+                palette.input_border
+            })
+        },
+        focus_border_color: if error {
+            crate::dialogs::COOKIE_ERROR_RGBA
+        } else {
+            rgba_u32(palette.input_focus)
+        },
         border_width: 1.0,
         placeholder: Some(if id == dialogs_placeholder_id() {
             crate::dialogs::XHS_COOKIE_PLACEHOLDER.to_string()

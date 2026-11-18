@@ -123,6 +123,7 @@ static PENDING_EDITOR_OP: Mutex<Option<PendingEditorOp>> = Mutex::new(None);
 /// The next submitted GPUI frame reveals the real editor at its final place.
 static IME_ANIMATION_END_PENDING: AtomicBool = AtomicBool::new(false);
 static NATIVE_EDITOR_IME_PREVIEW_VISIBLE: AtomicBool = AtomicBool::new(false);
+static NATIVE_EDITOR_IME_FOLLOW: AtomicBool = AtomicBool::new(false);
 
 /// Set when the app resumes; the Java host shows a theme-colored cover until
 /// the first resumed GPUI frame is submitted (see `apply_resume`).
@@ -2226,6 +2227,82 @@ pub fn hide_native_editor_now() {
     hide_native_editor_direct();
 }
 
+/// Show the native Cookie panel: one application window that contains the
+/// card, the editor and the action buttons.
+pub fn show_native_cookie_panel_android(spec: &crate::NativeCookiePanelSpec) {
+    let result = with_env(|env| {
+        let activity = activity(env)?;
+        let jtext = env
+            .new_string(&spec.text)
+            .map_err(|error| error.to_string())?;
+        let jtitle = env
+            .new_string(&spec.title)
+            .map_err(|error| error.to_string())?;
+        let jhint = env
+            .new_string(&spec.hint)
+            .map_err(|error| error.to_string())?;
+        let jplaceholder = env
+            .new_string(&spec.placeholder)
+            .map_err(|error| error.to_string())?;
+        let jcancel = env
+            .new_string(&spec.cancel_label)
+            .map_err(|error| error.to_string())?;
+        let jsave = env
+            .new_string(&spec.save_label)
+            .map_err(|error| error.to_string())?;
+        env.call_method(
+            &activity,
+            jni::jni_str!("gpuiShowNativeCookiePanel"),
+            jni::jni_sig!(
+                "(Ljava/lang/String;FLjava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;IIIIIIIIIII)V"
+            ),
+            &[
+                JValue::Object(&jtext),
+                JValue::Float(spec.width),
+                JValue::Object(&jtitle),
+                JValue::Object(&jhint),
+                JValue::Object(&jplaceholder),
+                JValue::Object(&jcancel),
+                JValue::Object(&jsave),
+                JValue::Int(spec.card_bg as i32),
+                JValue::Int(spec.text_color as i32),
+                JValue::Int(spec.muted_color as i32),
+                JValue::Int(spec.field_bg as i32),
+                JValue::Int(spec.field_border as i32),
+                JValue::Int(spec.field_focus as i32),
+                JValue::Int(spec.primary as i32),
+                JValue::Int(spec.primary_text as i32),
+                JValue::Int(spec.cancel_bg as i32),
+                JValue::Int(spec.cancel_border as i32),
+                JValue::Int(spec.cancel_text as i32),
+            ],
+        )
+        .e()?;
+        Ok(())
+    });
+    if let Err(error) = result {
+        log::warn!("gpuiShowNativeCookiePanel failed: {error}");
+    }
+}
+
+/// Remove the native Cookie panel window.
+pub fn hide_native_cookie_panel_android() {
+    let result = with_env(|env| {
+        let activity = activity(env)?;
+        env.call_method(
+            &activity,
+            jni::jni_str!("gpuiHideNativeCookiePanel"),
+            jni::jni_sig!("()V"),
+            &[],
+        )
+        .e()?;
+        Ok(())
+    });
+    if let Err(error) = result {
+        log::warn!("gpuiHideNativeCookiePanel failed: {error}");
+    }
+}
+
 /// Translate the attached editor window by a logical y delta.
 ///
 /// Dialog movement is detected while building the new GPUI frame. Applying
@@ -2243,6 +2320,11 @@ pub fn translate_native_editor_android(delta_y: f32) {
 /// GPUI's render pass. The inset callback runs earlier in the same vsync, so
 /// the separate editor window keeps up with the dialog's reflow.
 pub fn set_native_editor_ime_follow_android(follow: bool) {
+    // The dialog render pass calls this every frame; only cross the JNI
+    // boundary when the effective mode changes.
+    if NATIVE_EDITOR_IME_FOLLOW.load(Ordering::Acquire) == follow {
+        return;
+    }
     let result = with_env(|env| {
         let activity = activity(env)?;
         env.call_method(
@@ -2256,6 +2338,8 @@ pub fn set_native_editor_ime_follow_android(follow: bool) {
     });
     if let Err(error) = result {
         log::warn!("gpuiSetNativeEditorImeFollow failed: {error}");
+    } else {
+        NATIVE_EDITOR_IME_FOLLOW.store(follow, Ordering::Release);
     }
 }
 
@@ -2757,6 +2841,54 @@ pub unsafe extern "C" fn Java_dev_gpui_mobile_GpuiActivity_nativeOnBackPressed(
         .foreground_executor()
         .dispatch_on_main_thread(move || {
             crate::dispatch_back_handler();
+        });
+}
+
+/// Called from `GpuiActivity` when the native Cookie panel's Save button is
+/// tapped. The panel stays visible until Rust hides it, so validation
+/// failures keep the dialog open.
+///
+/// # Safety
+/// Must only be called from the JVM on a valid JNI thread with a valid `text` jobject.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Java_dev_gpui_mobile_GpuiActivity_nativeOnNativeCookieSave(
+    _env: *mut std::ffi::c_void,
+    _class: *mut std::ffi::c_void,
+    text: *mut std::ffi::c_void,
+) {
+    let text_raw = text as jni::sys::jobject;
+    let text = with_env(|env| {
+        let obj = unsafe { JObject::from_raw(env, text_raw) };
+        Ok(get_string(env, &obj))
+    })
+    .unwrap_or_default();
+    let Some(platform) = PLATFORM.get() else {
+        return;
+    };
+    platform
+        .foreground_executor()
+        .dispatch_on_main_thread(move || {
+            crate::dispatch_native_cookie_action(crate::NativeCookieAction::Save(text));
+        });
+}
+
+/// Called from `GpuiActivity` when the native Cookie panel's Cancel button is
+/// tapped.
+///
+/// # Safety
+/// Must only be called from the JVM on a valid JNI thread.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Java_dev_gpui_mobile_GpuiActivity_nativeOnNativeCookieCancel(
+    _env: *mut std::ffi::c_void,
+    _class: *mut std::ffi::c_void,
+) {
+    let Some(platform) = PLATFORM.get() else {
+        return;
+    };
+    platform
+        .foreground_executor()
+        .dispatch_on_main_thread(move || {
+            crate::dispatch_native_cookie_action(crate::NativeCookieAction::Cancel);
         });
 }
 

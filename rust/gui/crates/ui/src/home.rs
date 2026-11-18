@@ -1024,8 +1024,17 @@ impl AppView {
         if !home_in_layout || self.dialog.is_some() {
             crate::ios_native_input::hide_placeholder("url-input");
         }
+        // Compact mode shows only the editor, so landscape keeps it flush
+        // with the top safe area instead of leaving the column's 16px gap.
+        #[cfg(target_os = "android")]
+        let compact_landscape = compact_max_lines.is_some() && viewport_width > visible_height;
+        #[cfg(not(target_os = "android"))]
+        let compact_landscape = false;
         let mut column = div().w_full().flex().flex_col();
-        column = column.p(px(16.0));
+        column = column.px(px(16.0)).pb(px(16.0));
+        if !compact_landscape {
+            column = column.pt(px(16.0));
+        }
         column = column.child(self.render_input_card(
             palette,
             max_input_height,
@@ -1209,6 +1218,7 @@ impl AppView {
                                 native_editor_clip_bounds,
                                 palette,
                                 view.input_focus.is_focused(window),
+                                false,
                             );
                         });
                     }

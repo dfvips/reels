@@ -69,14 +69,18 @@ private final class ReelsNativeInputContainer: UIView {
         borderLayer.zPosition = 100
         layer.addSublayer(borderLayer)
 
-        placeholderLabel.numberOfLines = 1
+        placeholderLabel.numberOfLines = 0
+        placeholderLabel.lineBreakMode = .byCharWrapping
         placeholderLabel.translatesAutoresizingMaskIntoConstraints = false
         placeholderLabel.isUserInteractionEnabled = false
         placeholderLabel.layer.zPosition = 101
         addSubview(placeholderLabel)
         let top = placeholderLabel.topAnchor.constraint(equalTo: topAnchor)
         let leading = placeholderLabel.leadingAnchor.constraint(equalTo: leadingAnchor)
-        let trailing = placeholderLabel.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor)
+        // Equal (not lessThanOrEqual) so the label always takes the field's
+        // full text width; an open-ended trailing bound let Auto Layout pick
+        // a narrower width and wrap the placeholder early.
+        let trailing = placeholderLabel.trailingAnchor.constraint(equalTo: trailingAnchor)
         placeholderTopConstraint = top
         placeholderLeadingConstraint = leading
         placeholderTrailingConstraint = trailing
@@ -302,7 +306,7 @@ final class ReelsNativeTextInputManager: NSObject, UITextViewDelegate {
         container.placeholderLabel.textColor = placeholderColor
         container.placeholderLabel.font = editor.font
         container.placeholderLabel.textAlignment = .natural
-        container.placeholderLabel.lineBreakMode = .byTruncatingTail
+        container.placeholderLabel.lineBreakMode = .byCharWrapping
         container.placeholderTopConstraint?.constant = textInsetTop
         container.placeholderLeadingConstraint?.constant = textInsetLeft
         container.placeholderTrailingConstraint?.constant = -textInsetRight

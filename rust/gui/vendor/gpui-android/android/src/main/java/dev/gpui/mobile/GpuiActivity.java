@@ -1,5 +1,6 @@
 package dev.gpui.mobile;
 
+import android.animation.ValueAnimator;
 import android.app.NativeActivity;
 import android.content.ActivityNotFoundException;
 import android.content.Context;
@@ -21,15 +22,18 @@ import android.graphics.Matrix;
 import android.graphics.Paint;
 import android.graphics.Rect;
 import android.graphics.drawable.Drawable;
+import android.graphics.drawable.GradientDrawable;
 import android.media.ExifInterface;
 import android.net.Uri;
 import android.provider.MediaStore;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Looper;
+import android.os.SystemClock;
 import android.security.keystore.KeyGenParameterSpec;
 import android.security.keystore.KeyProperties;
 import android.text.Editable;
+import android.text.InputType;
 import android.text.Layout;
 import android.text.Selection;
 import android.text.Spannable;
@@ -40,9 +44,14 @@ import android.text.TextWatcher;
 import android.text.style.LineHeightSpan;
 import android.text.method.ArrowKeyMovementMethod;
 import android.util.Base64;
+import android.util.Log;
+import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.ActionMode;
 import android.view.KeyEvent;
+import android.view.Menu;
+import android.view.MenuInflater;
+import android.view.MenuItem;
 import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewConfiguration;
@@ -55,11 +64,17 @@ import android.view.inputmethod.BaseInputConnection;
 import android.view.inputmethod.EditorInfo;
 import android.view.inputmethod.InputConnection;
 import android.view.inputmethod.InputMethodManager;
+import android.view.textclassifier.TextClassifier;
+import android.view.animation.DecelerateInterpolator;
 import android.view.accessibility.AccessibilityEvent;
 import android.view.accessibility.AccessibilityNodeInfo;
 import android.view.accessibility.AccessibilityNodeProvider;
 import android.widget.FrameLayout;
 import android.widget.EditText;
+import android.widget.LinearLayout;
+import android.widget.PopupMenu;
+import android.widget.PopupWindow;
+import android.widget.TextView;
 import android.graphics.Typeface;
 
 import java.io.File;
@@ -376,6 +391,8 @@ public class GpuiActivity extends NativeActivity {
     private static native void nativeOnNativeEditorWindowFocusChanged(boolean ownsFocus);
     private static native void nativeOnNativeEditorImeAnimationEnd();
     private static native void nativeOnNativeEditorImePreviewVisible(boolean visible);
+    private static native void nativeOnNativeCookieSave(String text);
+    private static native void nativeOnNativeCookieCancel();
     private static native void nativeOnResumeCoverFadeStart();
     private static native void nativeSetComposingText(String text);
     private static native void nativeFinishComposingText();
@@ -564,6 +581,10 @@ public class GpuiActivity extends NativeActivity {
         gpuiBackCallback = new OnBackPressedCallback(true) {
             @Override
             public void handleOnBackPressed() {
+                if (nativeCookiePanelActive) {
+                    handleNativeCookieBack();
+                    return;
+                }
                 if (textMenuEditor != null
                         && textMenuEditor.getVisibility() == View.VISIBLE
                         && textMenuEditor.hasFocus()
@@ -705,7 +726,11 @@ public class GpuiActivity extends NativeActivity {
                                             + " active=" + nativeEditorImePreviewAnimating);
                             imeInsetsAnimating = false;
                             WindowInsets finalInsets = inputView.getRootWindowInsets();
-                            if (finalInsets != null) {
+                            // Some ROMs still report the pre-animation
+                            // snapshot here; applying it would drag the card
+                            // and editor back to the old position.
+                            if (finalInsets != null
+                                    && imeBottomOf(finalInsets) != imeBottomPixels) {
                                 applyWindowInsets(finalInsets, false);
                             }
                             if (nativeEditorImePreview && nativeEditorImePreviewAnimating) {
@@ -839,7 +864,9 @@ public class GpuiActivity extends NativeActivity {
         // the background, otherwise GPUI stops rendering while the user is
         // actively typing and the mirrored text never reaches the UI state.
         nativeOnNativeEditorWindowFocusChanged(
-                !hasFocus && nativeEditorAttached && nativeEditorFocusableMode);
+                !hasFocus
+                        && ((nativeEditorAttached && nativeEditorFocusableMode)
+                                || nativeCookiePanelAttached));
         android.util.Log.d(
                 "GPUI_NATIVE_INPUT",
                 "activityWindowFocus=" + hasFocus
@@ -878,6 +905,10 @@ public class GpuiActivity extends NativeActivity {
         if (textMenuEditor != null && nativeEditorAttached) {
             hideTextMenuEditor(true);
         }
+        // The Cookie panel is its own window; remove it so it cannot hover
+        // above the frozen surface or another app. Rust keeps the dialog
+        // state, and onResume re-attaches it when the dialog is still open.
+        detachNativeCookiePanel();
         resumeCoverNeeded = true;
     }
 
@@ -903,12 +934,28 @@ public class GpuiActivity extends NativeActivity {
         if (resumeCoverNeeded) {
             showResumeCover();
         }
+        if (nativeCookiePanelActive && !nativeCookiePanelAttached) {
+            // Re-create the window without raising the keyboard; the user was
+            // editing this dialog before the app went to the background.
+            attachNativeCookiePanel(false);
+        }
     }
 
     @Override
     public void onConfigurationChanged(Configuration newConfig) {
         super.onConfigurationChanged(newConfig);
         applySystemLauncherIcon();
+        // Window metrics changed orientation; the cookie panel is positioned
+        // against the display bounds, so re-centre it even if the inset
+        // callback does not fire again. Rust only sends the card width when
+        // the dialog is shown, so the width has to be re-derived here.
+        if (nativeCookiePanelActive) {
+            recomputeNativeCookiePanelWidth();
+        }
+        if (nativeCookiePanelAttached) {
+            layoutNativeCookiePanel();
+            nativeCookiePanel.requestApplyInsets();
+        }
     }
 
     /**
@@ -1314,6 +1361,15 @@ public class GpuiActivity extends NativeActivity {
     /** Called by Rust; safely hides the software keyboard on the UI thread. */
     public void gpuiHideKeyboard() {
         runOnUiThread(() -> {
+            if (nativeCookiePanelAttached && nativeCookiePanel != null) {
+                nativeCookieEditor.clearFocus();
+                InputMethodManager panelManager =
+                        (InputMethodManager) getSystemService(Context.INPUT_METHOD_SERVICE);
+                if (panelManager != null) {
+                    panelManager.hideSoftInputFromWindow(
+                            nativeCookiePanel.getWindowToken(), 0);
+                }
+            }
             if (imeVisible || imeInsetsAnimating) {
                 hideNativeEditorBeforeImePreview();
             }
@@ -1352,15 +1408,23 @@ public class GpuiActivity extends NativeActivity {
         runOnUiThread(() -> nativeEditorSession = session);
     }
 
+    /** IME bottom inset reported by a snapshot, matching applyWindowInsets. */
+    private static int imeBottomOf(WindowInsets insets) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            return insets.getInsets(WindowInsets.Type.ime()).bottom;
+        }
+        return Math.max(
+                0,
+                insets.getSystemWindowInsetBottom() - insets.getStableInsetBottom());
+    }
+
     /**
      * Apply a WindowInsets snapshot to Java-side IME state and the editor
      * window.
      *
-     * <p>WindowManager applies an editor-window move after two compositor
-     * traversals, while GPUI presents its own surface immediately. When the
-     * Cookie dialog follows the IME, move the native window from the current
-     * animated frame but hand GPUI the same snapshot after the same two
-     * animation frames. Both surfaces then become visible together.</p>
+     * <p>When the Cookie dialog follows the IME, the editor window and GPUI
+     * see the same snapshot in the same callback so the card and the native
+     * editor move on the same frame.</p>
      */
     private void applyWindowInsets(WindowInsets insets, boolean animationFrame) {
         int left;
@@ -1398,8 +1462,28 @@ public class GpuiActivity extends NativeActivity {
         int previousImeBottom = imeBottomPixels;
         imeVisible = imeBottom > 0;
         imeBottomPixels = imeBottom;
-        if (nativeEditorImeFollow) {
-            positionNativeEditorForIme(imeBottom);
+        lastInsetsTop = top;
+        nativeCookieBarsLeft = left;
+        nativeCookieBarsRight = right;
+        if (nativeCookiePanelAttached) {
+            // The panel window is positioned by hand, so it needs the
+            // Activity's keyboard height; the panel's own insets would depend
+            // on that very position.
+            int previousCookieIme = nativeCookieActivityIme;
+            nativeCookieActivityIme = imeBottom;
+            nativeCookieBarsTop = top;
+            // A back press while the keyboard is open is consumed by the IME,
+            // so the panel never sees the key. The keyboard collapsing under
+            // the editor is the same gesture: drop focus with it, exactly
+            // like the panel's own back handling, and leave the card open.
+            if (previousCookieIme > 0
+                    && imeBottom == 0
+                    && nativeCookieEditor != null
+                    && nativeCookieEditor.hasFocus()) {
+                nativeCookieEditor.clearFocus();
+                applyCookieEditorBackground();
+            }
+            layoutNativeCookiePanel();
         }
         android.util.Log.d(
                 "GPUIInsets",
@@ -1407,12 +1491,27 @@ public class GpuiActivity extends NativeActivity {
                         + " ime=(" + imeLeft + "," + imeTop + ","
                         + imeRight + "," + imeBottom + ")"
                         + (animationFrame ? " anim" : ""));
-        // During an IME animation the onProgress callback supplies every
-        // frame. The matching apply-insets callback is only a view-layout
-        // bookkeeping pass, so it must not jump the Rust card ahead.
-        if (imeInsetsAnimating && !animationFrame) {
-            return;
-        }
+        // Keyboards on some ROMs report only the final IME height, without
+        // Deliver every snapshot exactly as the system reports it. Keyboards
+        // that provide inset-animation frames arrive here per frame; the rest
+        // publish one final height, and both surfaces move to it on their own
+        // next frame. No synthesized timing: the editor window follows the
+        // rect Rust paints, so the two never move relative to each other.
+        deliverNativeInsets(
+                left, top, right, bottom, imeLeft, imeTop, imeRight, imeBottom, previousImeBottom);
+    }
+
+    /** Hand an inset snapshot to Rust through the Cookie handoff pipeline. */
+    private void deliverNativeInsets(
+            int left,
+            int top,
+            int right,
+            int bottom,
+            int imeLeft,
+            int imeTop,
+            int imeRight,
+            int imeBottom,
+            int previousImeBottom) {
         if (nativeEditorImeFollow) {
             if (nativeEditorImePreview) {
                 if (imeBottom != previousImeBottom) {
@@ -1438,88 +1537,17 @@ public class GpuiActivity extends NativeActivity {
                             left, top, right, bottom, imeLeft, imeTop, imeRight, imeBottom);
                 }
             } else {
-                scheduleNativeInsetsChanged(
+                // Hand GPUI the inset in the same callback that moved the
+                // editor window. Deferring it behind the WindowManager
+                // traversal makes the card visibly trail the native editor
+                // through the whole keyboard animation.
+                dispatchNativeInsetsChanged(
                         left, top, right, bottom, imeLeft, imeTop, imeRight, imeBottom);
             }
         } else {
             dispatchNativeInsetsChanged(
                     left, top, right, bottom, imeLeft, imeTop, imeRight, imeBottom);
         }
-    }
-
-    /** Queue the Rust notification behind the editor window's traversal. */
-    private void scheduleNativeInsetsChanged(
-            int left,
-            int top,
-            int right,
-            int bottom,
-            int imeLeft,
-            int imeTop,
-            int imeRight,
-            int imeBottom) {
-        if (left == queuedInsetLeft
-                && top == queuedInsetTop
-                && right == queuedInsetRight
-                && bottom == queuedInsetBottom
-                && imeLeft == queuedImeLeft
-                && imeTop == queuedImeTop
-                && imeRight == queuedImeRight
-                && imeBottom == queuedImeBottom) {
-            return;
-        }
-        queuedInsetLeft = left;
-        queuedInsetTop = top;
-        queuedInsetRight = right;
-        queuedInsetBottom = bottom;
-        queuedImeLeft = imeLeft;
-        queuedImeTop = imeTop;
-        queuedImeRight = imeRight;
-        queuedImeBottom = imeBottom;
-        int expectedEditorY = nativeEditorImeFollow
-                        && nativeEditorAttached
-                        && nativeEditorWindowParams != null
-                ? nativeEditorWindowParams.y
-                : Integer.MIN_VALUE;
-        postAfterNativeEditorSettled(
-                expectedEditorY,
-                () -> dispatchNativeInsetsChanged(
-                        left, top, right, bottom, imeLeft, imeTop, imeRight, imeBottom),
-                0);
-    }
-
-    /**
-     * Hold the Rust snapshot until the editor's WindowManager traversal has
-     * moved the real view. The card then draws the same IME height that is
-     * already visible in the native editor.
-     */
-    private void postAfterNativeEditorSettled(
-            int expectedY, Runnable action, int attempt) {
-        inputView.postOnAnimation(() -> {
-            if (expectedY == Integer.MIN_VALUE
-                    || !nativeEditorAttached
-                    || textMenuEditor == null) {
-                action.run();
-                return;
-            }
-            int[] location = new int[2];
-            textMenuEditor.getLocationOnScreen(location);
-            boolean settled = Math.abs(location[1] - expectedY) <= 1;
-            android.util.Log.d(
-                    "GPUIInsetsSync",
-                    "attempt=" + attempt
-                            + " actualY=" + location[1]
-                            + " expectedY=" + expectedY
-                            + (settled ? " settled" : " waiting"));
-            if (settled || attempt >= 4) {
-                // getLocationOnScreen reflects the new window position one
-                // traversal before SurfaceFlinger composites that position.
-                // Request the card one frame later so both surfaces change on
-                // the same composed frame.
-                inputView.postOnAnimation(action);
-            } else {
-                postAfterNativeEditorSettled(expectedY, action, attempt + 1);
-            }
-        });
     }
 
     private void dispatchNativeInsetsChanged(
@@ -1539,34 +1567,18 @@ public class GpuiActivity extends NativeActivity {
     /** Translate the attached native editor window with its moving dialog. */
     public void gpuiTranslateNativeEditor(float deltaY) {
         runOnUiThreadBlocking(() -> {
-            int delta = Math.round(
-                    deltaY * getResources().getDisplayMetrics().density);
+            float delta = deltaY * getResources().getDisplayMetrics().density;
             translateNativeEditorWindow(delta);
         });
     }
 
     /**
-     * Let Java move the editor when the Cookie dialog follows the IME.
-     *
-     * <p>Java positions the separate editor window first, waits for its
-     * WindowManager traversal and the following composition frame, then
-     * hands the same IME height to GPUI. Only the centred Cookie card uses
-     * this; the home editor stays put when the keyboard opens.
+     * Let Java hand every IME snapshot to GPUI while the Cookie dialog is
+     * centred. The card reflows with the IME, and the editor window follows
+     * the rect Rust paints for it on each frame.
      */
     public void gpuiSetNativeEditorImeFollow(boolean follow) {
-        runOnUiThread(() -> {
-            if (nativeEditorImeFollow == follow) {
-                return;
-            }
-            nativeEditorImeFollow = follow;
-            if (follow && nativeEditorAttached && nativeEditorWindowParams != null) {
-                nativeEditorImeReferenceTop = nativeEditorWindowParams.y;
-                nativeEditorImeReferenceBottom = imeBottomPixels;
-            } else {
-                nativeEditorImeReferenceTop = Integer.MIN_VALUE;
-                nativeEditorImeReferenceBottom = Integer.MIN_VALUE;
-            }
-        });
+        runOnUiThread(() -> nativeEditorImeFollow = follow);
     }
 
     /**
@@ -1723,14 +1735,21 @@ public class GpuiActivity extends NativeActivity {
     }
 
     /** Move the attached editor window by a physical-pixel delta. */
-    private void translateNativeEditorWindow(int delta) {
-        if (delta == 0
+    private void translateNativeEditorWindow(float delta) {
+        if (delta == 0.0f
                 || !nativeEditorAttached
                 || nativeEditorWindowParams == null
                 || textMenuEditor == null) {
             return;
         }
-        nativeEditorWindowParams.y += delta;
+        // Keep the position as a float across the IME animation's small
+        // per-frame steps; rounding each step independently drifts.
+        nativeEditorWindowY += delta;
+        int y = Math.round(nativeEditorWindowY);
+        if (y == nativeEditorWindowParams.y) {
+            return;
+        }
+        nativeEditorWindowParams.y = y;
         nativeEditorWindowManager.updateViewLayout(
                 textMenuEditor, nativeEditorWindowParams);
     }
@@ -1757,41 +1776,8 @@ public class GpuiActivity extends NativeActivity {
     }
 
     /**
-     * Place the editor window at the position the centred Cookie card will
-     * occupy for this animated IME height.
-     *
-     * <p>The card's top moves by exactly half the IME inset delta while the
-     * dialog remains centred. Keeping a reference layout (editor top + the
-     * IME height Rust used for it) avoids accumulating per-frame rounding
-     * error across DPI changes and keyboard animations.</p>
+     * Called by Rust when a dialog is dismissed; drop its unsaved draft.
      */
-    private void positionNativeEditorForIme(int imeBottom) {
-        if (!nativeEditorImeFollow
-                || !nativeEditorAttached
-                || nativeEditorWindowParams == null
-                || textMenuEditor == null
-                || nativeEditorImeReferenceTop == Integer.MIN_VALUE
-                || nativeEditorImeReferenceBottom == Integer.MIN_VALUE) {
-            return;
-        }
-        int targetY = nativeEditorImeReferenceTop
-                + Math.round(
-                        (nativeEditorImeReferenceBottom - imeBottom) * 0.5f);
-        if (targetY == nativeEditorWindowParams.y) {
-            return;
-        }
-        nativeEditorWindowParams.y = targetY;
-        nativeEditorWindowManager.updateViewLayout(
-                textMenuEditor, nativeEditorWindowParams);
-        android.util.Log.d(
-                "GPUIInsetsAnim",
-                "ime=" + imeBottom
-                        + " refIme=" + nativeEditorImeReferenceBottom
-                        + " refTop=" + nativeEditorImeReferenceTop
-                        + " y=" + targetY);
-    }
-
-    /** Called by Rust when a dialog is dismissed; drop its unsaved draft. */
     public void gpuiResetNativeEditorText(String text, long session) {
         runOnUiThread(() -> {
             if (textMenuEditor == null) {
@@ -1819,25 +1805,17 @@ public class GpuiActivity extends NativeActivity {
      *  draws its own keyboard, caret, selection handles and edit menu. */
     private MirrorEditText textMenuEditor;
     private WindowManager nativeEditorWindowManager;
-    /** The Cookie dialog reflows with the IME; move its editor in the inset callback. */
+    /** The Cookie dialog reflows with the IME; its editor follows the card. */
     private boolean nativeEditorImeFollow;
     /** Attach the next editor window invisibly and reveal it without another addView. */
     private boolean nativeEditorWarmup;
     private int imeBottomPixels;
-    /** Editor top and IME height for the latest Rust layout. */
-    private int nativeEditorImeReferenceTop = Integer.MIN_VALUE;
-    private int nativeEditorImeReferenceBottom = Integer.MIN_VALUE;
+    /** Editor window top in physical pixels, unrounded across IME frames. */
+    private float nativeEditorWindowY;
     /** IME height used by the latest layout delivered to Rust. */
     private int nativeLayoutImeBottom = Integer.MIN_VALUE;
-    /** Deduplicate delayed snapshots from onProgress and onApplyWindowInsets. */
-    private int queuedInsetLeft = Integer.MIN_VALUE;
-    private int queuedInsetTop = Integer.MIN_VALUE;
-    private int queuedInsetRight = Integer.MIN_VALUE;
-    private int queuedInsetBottom = Integer.MIN_VALUE;
-    private int queuedImeLeft = Integer.MIN_VALUE;
-    private int queuedImeTop = Integer.MIN_VALUE;
-    private int queuedImeRight = Integer.MIN_VALUE;
-    private int queuedImeBottom = Integer.MIN_VALUE;
+    /** Latest system-bar top inset reported to the Activity window. */
+    private int lastInsetsTop;
     private boolean imeInsetsAnimating;
     private android.widget.FrameLayout resumeCoverView;
     private WindowManager.LayoutParams resumeCoverParams;
@@ -2002,6 +1980,11 @@ public class GpuiActivity extends NativeActivity {
                                     ? "null"
                                     : textMenuEditor.getVisibility()));
             if (inputView == null || !inputView.isAttachedToWindow() || textMenuEditor == null) {
+                return;
+            }
+            if (nativeCookiePanelAttached) {
+                // The Cookie dialog owns the keyboard through its own panel
+                // window; a stale GPUI editor op must not steal that focus.
                 return;
             }
             float density = getResources().getDisplayMetrics().density;
@@ -2403,18 +2386,15 @@ public class GpuiActivity extends NativeActivity {
         nativeEditorWindowParams.x = left;
         int windowTop = top;
         if (nativeEditorImeFollow) {
-            int layoutImeBottom = nativeLayoutImeBottom == Integer.MIN_VALUE
-                    ? imeBottomPixels
-                    : nativeLayoutImeBottom;
-            // `top` is the editor position for `layoutImeBottom`. Keep that
-            // reference stable, then place this window at the currently
-            // animating IME height instead of at the older GPUI snapshot.
-            nativeEditorImeReferenceTop = top;
-            nativeEditorImeReferenceBottom = layoutImeBottom;
-            windowTop = top
-                    + Math.round((layoutImeBottom - imeBottomPixels) * 0.5f);
+            // Rust re-reports the editor rect on every paint, already
+            // reflowed for the IME height it received. Anchoring the window
+            // to that rect keeps it glued to the card's input slot; any
+            // IME-derived formula drifts and makes the editor bounce inside
+            // the card.
+            windowTop = top;
         }
         nativeEditorWindowParams.y = windowTop;
+        nativeEditorWindowY = windowTop;
         nativeEditorWindowParams.alpha = nativeEditorWarmup ? 0.0f : 1.0f;
         // Restrict touch ownership to the visible editor rect. The system
         // can then deliver a tap on a sibling button to the Activity in the
@@ -2450,10 +2430,6 @@ public class GpuiActivity extends NativeActivity {
         } else {
             nativeEditorWindowManager.updateViewLayout(
                     textMenuEditor, nativeEditorWindowParams);
-        }
-        if (!nativeEditorImeFollow) {
-            nativeEditorImeReferenceTop = Integer.MIN_VALUE;
-            nativeEditorImeReferenceBottom = Integer.MIN_VALUE;
         }
     }
 
@@ -2780,6 +2756,1367 @@ public class GpuiActivity extends NativeActivity {
                 .setRandomizedEncryptionRequired(true)
                 .build());
         return generator.generateKey();
+    }
+
+    // ---------------------------------------------------------------------
+    // Native Cookie dialog panel
+    //
+    // Renders the whole Cookie dialog — card, title, hint, editor and action
+    // buttons — inside a single application window added directly through
+    // WindowManager. Card and editor share one surface, so they can never
+    // drift apart while the keyboard opens or closes. The window has no
+    // Window.Callback, so the framework refuses to start a text ActionMode
+    // there; CookieCardLayout intercepts the editor's action-mode request and
+    // supplies a floating toolbar for cut/copy/paste/select-all instead while
+    // the native selection handles come from the EditText itself.
+    // ---------------------------------------------------------------------
+
+    private LinearLayout nativeCookiePanel;
+    private EditText nativeCookieEditor;
+    private TextView nativeCookieTitleView;
+    private TextView nativeCookieHintView;
+    private TextView nativeCookieErrorView;
+    private LinearLayout nativeCookieButtonRow;
+    private boolean nativeCookieCompactLayout;
+    private final ExactLineHeightSpan cookieEditorLineHeight = new ExactLineHeightSpan();
+    private TextView nativeCookieCancelView;
+    private TextView nativeCookieSaveView;
+    private WindowManager.LayoutParams nativeCookiePanelParams;
+    private WindowManager nativeCookieWindowManager;
+    /** Rust wants the panel visible; it survives Activity stop/resume. */
+    private boolean nativeCookiePanelActive;
+    private boolean nativeCookiePanelAttached;
+    private int nativeCookiePanelWidthPx;
+    private int nativeCookiePanelImeBottom;
+    private int nativeCookieActivityIme;
+    private int nativeCookieBarsTop;
+    private int nativeCookieBarsLeft;
+    private int nativeCookieBarsRight;
+    private int nativeCookieLastLayoutY = Integer.MIN_VALUE;
+    private int nativeCookieLastLayoutH = Integer.MIN_VALUE;
+    private int nativeCookieLastLoggedIme = Integer.MIN_VALUE;
+    private int nativeCookieCurrentY = Integer.MIN_VALUE;
+    private int nativeCookiePreviousIme = -1;
+    /** Back callback registered on the panel window (API 33+). */
+    private Object nativeCookieBackCallback;
+    private ValueAnimator nativeCookieMoveAnimator;
+    private final View.OnLayoutChangeListener nativeCookiePanelLayoutListener =
+            (view, left, top, right, bottom, oldLeft, oldTop, oldRight, oldBottom) -> {
+                if (bottom - top != oldBottom - oldTop) {
+                    layoutNativeCookiePanel();
+                }
+            };
+    private ActionMode nativeCookieActionMode;
+    // Creating the floating ActionMode on this standalone panel window makes
+    // the vendor TextView collapse a fresh word selection to a caret at the
+    // selection end before the toolbar asks for its content rect. Remember the
+    // range the editor had when the mode was requested and put it back while
+    // the mode is being prepared.
+    private int nativeCookieExpectedSelStart = -1;
+    private int nativeCookieExpectedSelEnd = -1;
+    private long nativeCookieExpectedSelAtMs;
+    private static final long COOKIE_SELECTION_REASSERT_MS = 1000;
+    private static final String COOKIE_FORMAT_ERROR = "Cookie 格式不正确";
+    private static final int COOKIE_ERROR_COLOR = 0xFFE5484D;
+    private float nativeCookieDensity = 1f;
+    private int nativeCookieCardColor;
+    private int nativeCookieFieldColor;
+    private int nativeCookieFieldBorder;
+    private int nativeCookieFieldFocus;
+
+    /** Called by Rust; shows the Cookie dialog rendered entirely natively. */
+    public void gpuiShowNativeCookiePanel(
+            String text,
+            float widthLogical,
+            String title,
+            String hint,
+            String placeholder,
+            String cancelLabel,
+            String saveLabel,
+            int cardBg,
+            int textColor,
+            int mutedColor,
+            int fieldBg,
+            int fieldBorder,
+            int fieldFocus,
+            int primary,
+            int primaryText,
+            int cancelBg,
+            int cancelBorder,
+            int cancelText) {
+        runOnUiThread(() -> {
+            nativeCookieDensity = getResources().getDisplayMetrics().density;
+            nativeCookieCardColor = gpuiColorToArgb(cardBg);
+            nativeCookieFieldColor = gpuiColorToArgb(fieldBg);
+            nativeCookieFieldBorder = gpuiColorToArgb(fieldBorder);
+            nativeCookieFieldFocus = gpuiColorToArgb(fieldFocus);
+            nativeCookiePanelWidthPx = Math.max(
+                    1, Math.round(widthLogical * nativeCookieDensity));
+            buildNativeCookiePanel(
+                    title,
+                    hint,
+                    placeholder,
+                    cancelLabel,
+                    saveLabel,
+                    textColor,
+                    mutedColor,
+                    primary,
+                    primaryText,
+                    cancelBg,
+                    cancelBorder,
+                    cancelText);
+            nativeCookieEditor.setText(text);
+            nativeCookieEditor.setSelection(nativeCookieEditor.getText().length());
+            applyCookieEditorLineHeight();
+            nativeCookiePanelActive = true;
+            // Opening the dialog must not raise the keyboard; the editor
+            // focuses (and moves the card above the IME) only when tapped.
+            attachNativeCookiePanel(false);
+        });
+    }
+
+    /** Called by Rust; removes the Cookie panel window. */
+    public void gpuiHideNativeCookiePanel() {
+        // Synchronous: the dialog frame is already gone, and a posted removal
+        // would leave the card floating over the page for a frame or two.
+        runOnUiThreadBlocking(() -> {
+            nativeCookiePanelActive = false;
+            detachNativeCookiePanel();
+        });
+    }
+
+    private void buildNativeCookiePanel(
+            String title,
+            String hint,
+            String placeholder,
+            String cancelLabel,
+            String saveLabel,
+            int textColor,
+            int mutedColor,
+            int primary,
+            int primaryText,
+            int cancelBg,
+            int cancelBorder,
+            int cancelText) {
+        detachNativeCookiePanel();
+        float density = nativeCookieDensity;
+        int pad = Math.round(24 * density);
+
+        CookieCardLayout card = new CookieCardLayout(this);
+        card.setOrientation(LinearLayout.VERTICAL);
+        card.setBackground(roundedRect(nativeCookieCardColor, 24 * density, 0, 0));
+        card.setPadding(pad, pad, pad, pad);
+        // Selection handles live in this layout and may extend past the card
+        // edge, so they must not be clipped.
+        card.setClipChildren(false);
+        card.setClipToPadding(false);
+
+        TextView titleView = new TextView(this);
+        titleView.setText(title);
+        titleView.setTextSize(TypedValue.COMPLEX_UNIT_PX, 22 * density);
+        titleView.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
+        titleView.setTextColor(gpuiColorToArgb(textColor));
+        titleView.setIncludeFontPadding(false);
+        card.addView(titleView, panelWrap());
+
+        TextView hintView = new TextView(this);
+        hintView.setText(hint);
+        hintView.setTextSize(TypedValue.COMPLEX_UNIT_PX, 13 * density);
+        hintView.setTextColor(gpuiColorToArgb(mutedColor));
+        hintView.setIncludeFontPadding(false);
+        hintView.setLineSpacing(Math.round(4 * density), 1.0f);
+        LinearLayout.LayoutParams hintParams = panelWrap();
+        hintParams.topMargin = Math.round(16 * density);
+        card.addView(hintView, hintParams);
+
+        EditText editor = new EditText(this);
+        editor.setTextSize(TypedValue.COMPLEX_UNIT_PX, 16 * density);
+        editor.setTextColor(gpuiColorToArgb(textColor));
+        editor.setHintTextColor(gpuiColorToArgb(mutedColor));
+        editor.setHint(placeholder);
+        editor.setIncludeFontPadding(false);
+        // The vendor font's fallback metrics give every line a huge box even
+        // with zero line spacing; pin the line boxes to a compact height like
+        // the home input does.
+        cookieEditorLineHeight.setLineHeightPx(Math.round(21 * density));
+        editor.addTextChangedListener(new TextWatcher() {
+            @Override
+            public void beforeTextChanged(CharSequence s, int start, int count, int after) {}
+
+            @Override
+            public void onTextChanged(CharSequence s, int start, int before, int count) {}
+
+            @Override
+            public void afterTextChanged(Editable s) {
+                if (nativeCookieErrorView != null
+                        && nativeCookieErrorView.getVisibility() != View.GONE) {
+                    nativeCookieErrorView.setVisibility(View.GONE);
+                    applyCookieEditorBackground();
+                    layoutNativeCookiePanel();
+                }
+                applyCookieEditorLineHeight();
+            }
+        });
+        editor.setLineSpacing(0, 1.0f);
+        editor.setGravity(Gravity.TOP | Gravity.START);
+        editor.setPadding(
+                Math.round(12 * density),
+                Math.round(12 * density),
+                Math.round(12 * density),
+                Math.round(12 * density));
+        editor.setBackground(
+                roundedRect(nativeCookieFieldColor, 6 * density, 1, nativeCookieFieldBorder));
+        // Plain multi-line text: a password variation would switch MIUI to
+        // its secure keyboard and disable selection/copy/paste.
+        editor.setInputType(
+                InputType.TYPE_CLASS_TEXT
+                        | InputType.TYPE_TEXT_FLAG_MULTI_LINE
+                        | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
+        editor.setImeOptions(
+                EditorInfo.IME_ACTION_NONE
+                        | EditorInfo.IME_FLAG_NO_EXTRACT_UI
+                        | EditorInfo.IME_FLAG_NO_FULLSCREEN);
+        editor.setVerticalScrollBarEnabled(true);
+        editor.setHorizontalScrollBarEnabled(false);
+        editor.setSelectAllOnFocus(false);
+        editor.setFocusable(true);
+        editor.setFocusableInTouchMode(true);
+        editor.setTextIsSelectable(true);
+        // Vendor textual "smart selection" classifies the whole cookie as a
+        // URL and rewrites a double-tap word selection to the full text,
+        // which then collapses to a caret at the end. NO_OP keeps the stock
+        // word selection that double tap produces.
+        editor.setTextClassifier(TextClassifier.NO_OP);
+        // Editor.prepareCursorControllers() runs before the first layout, when
+        // mLayout is still null, and disables the selection controller for
+        // good. TextView never re-runs it after layout, so long press reports
+        // "TextView does not support text selection" on this standalone
+        // window. Toggling cursor visibility makes TextView run it again now
+        // that a layout exists.
+        editor.addOnLayoutChangeListener(
+                (view, l, t, r, b, oldL, oldT, oldR, oldB) ->
+                        refreshNativeCookieSelectionControllers());
+        editor.setOnTouchListener((view, event) -> {
+            if (event.getActionMasked() == MotionEvent.ACTION_DOWN) {
+                clearCookieTextSelectionCapture();
+                Log.d("TextTest", "EditText down x=" + event.getX() + " y=" + event.getY()
+                        + " selection=" + editor.getSelectionStart()
+                        + ".." + editor.getSelectionEnd());
+            } else if (event.getActionMasked() == MotionEvent.ACTION_UP) {
+                Log.d("TextTest", "EditText up x=" + event.getX() + " y=" + event.getY()
+                        + " selection=" + editor.getSelectionStart()
+                        + ".." + editor.getSelectionEnd());
+            }
+            return false;
+        });
+        editor.setOnLongClickListener(view -> {
+            Log.d("TextTest", "EditText long click");
+            Log.d(
+                    "TextTest",
+                    "focus=" + view.hasFocus()
+                            + " windowFocus=" + view.hasWindowFocus()
+                            + " selection=" + editor.getSelectionStart()
+                            + ".." + editor.getSelectionEnd()
+                            + " layout=" + (editor.getLayout() != null)
+                            + " attached=" + editor.isAttachedToWindow()
+                            + " shown=" + editor.isShown()
+                            + " root=" + describeWindowParams(editor));
+            return false;
+        });
+        editor.setOnFocusChangeListener((view, hasFocus) -> applyCookieEditorBackground());
+        LinearLayout.LayoutParams editorParams = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, Math.round(146 * density));
+        editorParams.topMargin = Math.round(8 * density);
+        card.addView(editor, editorParams);
+
+        TextView errorView = new TextView(this);
+        errorView.setTextSize(TypedValue.COMPLEX_UNIT_PX, 12 * density);
+        errorView.setTextColor(COOKIE_ERROR_COLOR);
+        errorView.setIncludeFontPadding(false);
+        errorView.setLineSpacing(0, 1.0f);
+        errorView.setVisibility(View.GONE);
+        LinearLayout.LayoutParams errorParams = panelWrap();
+        errorParams.topMargin = Math.round(8 * density);
+        card.addView(errorView, errorParams);
+
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.END | Gravity.CENTER_VERTICAL);
+        LinearLayout.LayoutParams rowParams = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT);
+        rowParams.topMargin = Math.round(16 * density);
+        card.addView(row, rowParams);
+
+        TextView cancel = panelButton(
+                cancelLabel, gpuiColorToArgb(cancelText), gpuiColorToArgb(cancelBg),
+                gpuiColorToArgb(cancelBorder));
+        LinearLayout.LayoutParams cancelParams = panelWrap();
+        cancelParams.rightMargin = Math.round(12 * density);
+        row.addView(cancel, cancelParams);
+
+        TextView save = panelButton(
+                saveLabel, gpuiColorToArgb(primaryText), gpuiColorToArgb(primary),
+                gpuiColorToArgb(primary));
+        // Same horizontal brand gradient as the app's primary buttons
+        // (assets/gradient/button-background-rounded-8.svg).
+        save.setBackground(gradientButton(8 * density, gpuiColorToArgb(primary)));
+        row.addView(save, panelWrap());
+
+        cancel.setOnClickListener(view -> nativeOnNativeCookieCancel());
+        save.setOnClickListener(view -> {
+            String text = nativeCookieEditor.getText().toString();
+            String error = validateCookieHeader(text);
+            if (error != null) {
+                errorView.setText(error);
+                errorView.setVisibility(View.VISIBLE);
+                applyCookieEditorBackground();
+                layoutNativeCookiePanel();
+                return;
+            }
+            errorView.setVisibility(View.GONE);
+            applyCookieEditorBackground();
+            nativeOnNativeCookieSave(text);
+        });
+
+        nativeCookiePanel = card;
+        nativeCookieEditor = editor;
+        nativeCookieTitleView = titleView;
+        nativeCookieHintView = hintView;
+        nativeCookieErrorView = errorView;
+        nativeCookieButtonRow = row;
+        nativeCookieCancelView = cancel;
+        nativeCookieSaveView = save;
+        nativeCookieCurrentY = Integer.MIN_VALUE;
+        nativeCookiePreviousIme = -1;
+        nativeCookieCompactLayout = false;
+    }
+
+    /**
+     * Mirrors the card width Rust computes for the Cookie dialog
+     * (min(viewport-48, 80%, 480) logical px) against the current display.
+     * Needed after rotation, because the panel is only re-specified when the
+     * dialog is opened.
+     */
+    private void recomputeNativeCookiePanelWidth() {
+        int screenWidth;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            screenWidth = getWindowManager().getMaximumWindowMetrics().getBounds().width();
+        } else {
+            screenWidth = getResources().getDisplayMetrics().widthPixels;
+        }
+        int width = Math.min(
+                screenWidth - Math.round(48 * nativeCookieDensity),
+                Math.min(
+                        Math.round(screenWidth * 0.8f),
+                        Math.round(480 * nativeCookieDensity)));
+        nativeCookiePanelWidthPx = Math.max(1, width);
+    }
+
+    /**
+     * Cookie header must be `name=value; name2=value2`. Names follow RFC 6265
+     * tokens, so pasted URLs (which contain ':' and '/') and free text are
+     * rejected. An empty value clears the stored cookie.
+     *
+     * @return an error message, or {@code null} when the input is acceptable
+     */
+    private static String validateCookieHeader(String raw) {
+        String value = raw == null ? "" : raw.trim();
+        if (value.isEmpty()) {
+            return null;
+        }
+        for (int i = 0; i < value.length(); i++) {
+            if (Character.isISOControl(value.charAt(i))) {
+                return COOKIE_FORMAT_ERROR;
+            }
+        }
+        int pairs = 0;
+        for (String segment : value.split(";", -1)) {
+            String part = segment.trim();
+            if (part.isEmpty()) {
+                continue;
+            }
+            int equals = part.indexOf('=');
+            if (equals <= 0) {
+                return COOKIE_FORMAT_ERROR;
+            }
+            String name = part.substring(0, equals).trim();
+            if (!isCookieName(name)) {
+                return COOKIE_FORMAT_ERROR;
+            }
+            pairs++;
+        }
+        return pairs > 0 ? null : COOKIE_FORMAT_ERROR;
+    }
+
+    private static boolean isCookieName(String name) {
+        if (name.isEmpty()) {
+            return false;
+        }
+        for (int i = 0; i < name.length(); i++) {
+            char c = name.charAt(i);
+            boolean allowed = (c >= 'a' && c <= 'z')
+                    || (c >= 'A' && c <= 'Z')
+                    || (c >= '0' && c <= '9')
+                    || "!#$%&'*+-.^_`|~".indexOf(c) >= 0;
+            if (!allowed) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private void applyCookieEditorBackground() {
+        if (nativeCookieEditor == null) {
+            return;
+        }
+        // Compact mode shows this border as the only chrome, so keep the
+        // focused outline visibly thick at that size.
+        int borderPx = nativeCookieCompactLayout
+                ? Math.max(1, Math.round(1.5f * nativeCookieDensity))
+                : 1;
+        boolean showError = nativeCookieErrorView != null
+                && nativeCookieErrorView.getVisibility() == View.VISIBLE;
+        int borderColor;
+        if (showError) {
+            borderColor = COOKIE_ERROR_COLOR;
+        } else if (nativeCookieEditor.hasFocus()) {
+            borderColor = nativeCookieFieldFocus;
+        } else {
+            borderColor = nativeCookieFieldBorder;
+        }
+        nativeCookieEditor.setBackground(roundedRect(
+                nativeCookieFieldColor,
+                6 * nativeCookieDensity,
+                borderPx,
+                borderColor));
+    }
+
+    private void applyCookieEditorLineHeight() {
+        if (nativeCookieEditor == null) {
+            return;
+        }
+        Editable text = nativeCookieEditor.getEditableText();
+        if (text == null) {
+            return;
+        }
+        text.removeSpan(cookieEditorLineHeight);
+        if (text.length() > 0) {
+            text.setSpan(
+                    cookieEditorLineHeight,
+                    0,
+                    text.length(),
+                    Spanned.SPAN_INCLUSIVE_INCLUSIVE);
+        }
+    }
+
+    private LinearLayout.LayoutParams panelWrap() {
+        return new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT);
+    }
+
+    private String describeWindowParams(View view) {
+        View root = view.getRootView();
+        ViewGroup.LayoutParams params = root.getLayoutParams();
+        if (params instanceof WindowManager.LayoutParams) {
+            WindowManager.LayoutParams windowParams = (WindowManager.LayoutParams) params;
+            return windowParams.type
+                    + "/token=" + (windowParams.token != null)
+                    + "/flags=" + Integer.toHexString(windowParams.flags);
+        }
+        return String.valueOf(params);
+    }
+
+    private GradientDrawable roundedRect(int color, float radius, int strokeWidth, int strokeColor) {
+        GradientDrawable drawable = new GradientDrawable();
+        drawable.setColor(color);
+        drawable.setCornerRadius(radius);
+        if (strokeWidth > 0) {
+            drawable.setStroke(strokeWidth, strokeColor);
+        }
+        return drawable;
+    }
+
+    private GradientDrawable gradientButton(float radius, int borderColor) {
+        GradientDrawable drawable = new GradientDrawable(
+                GradientDrawable.Orientation.LEFT_RIGHT,
+                new int[] { 0xFF0277F9, 0xFF5D47E3 });
+        drawable.setCornerRadius(radius);
+        drawable.setStroke(1, borderColor);
+        return drawable;
+    }
+
+    private TextView panelButton(String label, int textColor, int bgColor, int borderColor) {
+        float density = nativeCookieDensity;
+        TextView view = new TextView(this);
+        view.setText(label);
+        view.setTextSize(TypedValue.COMPLEX_UNIT_PX, 14 * density);
+        view.setTextColor(textColor);
+        view.setGravity(Gravity.CENTER);
+        view.setIncludeFontPadding(false);
+        view.setPadding(Math.round(20 * density), 0, Math.round(20 * density), 0);
+        view.setMinWidth(Math.round(72 * density));
+        view.setMinHeight(Math.round(34 * density));
+        view.setBackground(roundedRect(bgColor, 8 * density, 1, borderColor));
+        view.setClickable(true);
+        view.setFocusable(false);
+        view.setSoundEffectsEnabled(true);
+        return view;
+    }
+
+    private void attachNativeCookiePanel(boolean takeFocus) {
+        if (nativeCookiePanel == null) {
+            return;
+        }
+        if (nativeCookieWindowManager == null) {
+            nativeCookieWindowManager = getWindow().getWindowManager();
+        }
+        if (nativeCookieWindowManager == null) {
+            return;
+        }
+        if (!nativeCookiePanelAttached) {
+            if (nativeCookiePanelParams == null) {
+                int flags = WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
+                        | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
+                        | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
+                        | WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED
+                        | WindowManager.LayoutParams.FLAG_SPLIT_TOUCH;
+                nativeCookiePanelParams = new WindowManager.LayoutParams(
+                        nativeCookiePanelWidthPx,
+                        WindowManager.LayoutParams.WRAP_CONTENT,
+                        WindowManager.LayoutParams.TYPE_APPLICATION,
+                        flags,
+                        android.graphics.PixelFormat.TRANSLUCENT);
+                nativeCookiePanelParams.gravity = Gravity.TOP | Gravity.START;
+                nativeCookiePanelParams.softInputMode =
+                        WindowManager.LayoutParams.SOFT_INPUT_ADJUST_NOTHING;
+                nativeCookiePanelParams.setTitle("ReelsCookieDialog");
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    nativeCookiePanelParams.setFitInsetsTypes(0);
+                }
+            }
+            nativeCookieCurrentY = Integer.MIN_VALUE;
+            nativeCookiePreviousIme = -1;
+            nativeCookieActivityIme = imeBottomPixels;
+            nativeCookieBarsTop = lastInsetsTop;
+            layoutNativeCookiePanel();
+            try {
+                nativeCookieWindowManager.addView(nativeCookiePanel, nativeCookiePanelParams);
+            } catch (WindowManager.BadTokenException error) {
+                if (nativeCookiePanelParams.type
+                        != WindowManager.LayoutParams.TYPE_APPLICATION) {
+                    throw error;
+                }
+                android.util.Log.w(
+                        "GpuiActivity",
+                        "Application cookie panel rejected; falling back to panel",
+                        error);
+                nativeCookieWindowManager =
+                        (WindowManager) getSystemService(Context.WINDOW_SERVICE);
+                nativeCookiePanelParams.type = WindowManager.LayoutParams.TYPE_APPLICATION_PANEL;
+                nativeCookiePanelParams.token =
+                        getWindow().getDecorView().getWindowToken();
+                nativeCookieWindowManager.addView(nativeCookiePanel, nativeCookiePanelParams);
+            }
+            nativeCookiePanelAttached = true;
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                registerNativeCookieBackCallback();
+            }
+            nativeCookiePanel.requestApplyInsets();
+            nativeCookiePanel.removeOnLayoutChangeListener(nativeCookiePanelLayoutListener);
+            nativeCookiePanel.addOnLayoutChangeListener(nativeCookiePanelLayoutListener);
+        }
+        if (takeFocus) {
+            nativeCookiePanel.post(this::focusNativeCookiePanel);
+        }
+    }
+
+    private void refreshNativeCookieSelectionControllers() {
+        if (nativeCookieEditor == null || nativeCookieEditor.getLayout() == null) {
+            return;
+        }
+        boolean cursorVisible = nativeCookieEditor.isCursorVisible();
+        nativeCookieEditor.setCursorVisible(!cursorVisible);
+        nativeCookieEditor.setCursorVisible(cursorVisible);
+        Log.d(
+                "TextTest",
+                "selection controllers refreshed layout="
+                        + (nativeCookieEditor.getLayout() != null));
+    }
+
+    private void focusNativeCookiePanel() {
+        if (!nativeCookiePanelAttached || nativeCookieEditor == null) {
+            return;
+        }
+        boolean focused = nativeCookieEditor.requestFocus();
+        nativeCookieEditor.requestFocusFromTouch();
+        Log.d(
+                "TextTest",
+                "focus requested=" + focused
+                        + " hasFocus=" + nativeCookieEditor.hasFocus()
+                        + " windowFocus=" + nativeCookieEditor.hasWindowFocus()
+                        + " shown=" + nativeCookieEditor.isShown()
+                        + " root=" + describeWindowParams(nativeCookieEditor));
+        requestImeForView(nativeCookieEditor, true);
+    }
+
+    /**
+     * Back pressed while the Cookie panel is up.
+     *
+     * <p>The panel is its own WindowManager window, so the Activity's back
+     * dispatcher does not see the key while the panel holds focus. With the
+     * keyboard open, back closes the keyboard and drops the editor focus but
+     * leaves the card; without it, back closes the dialog like Cancel.</p>
+     */
+    private void handleNativeCookieBack() {
+        if (!nativeCookiePanelActive || !nativeCookiePanelAttached) {
+            nativeOnBackPressed();
+            return;
+        }
+        // Same threshold as the layout: a floating vendor keyboard reports a
+        // one-pixel IME inset and counts as closed.
+        boolean keyboardUp = nativeCookieActivityIme >= Math.round(60 * nativeCookieDensity);
+        if (keyboardUp) {
+            InputMethodManager manager =
+                    (InputMethodManager) getSystemService(Context.INPUT_METHOD_SERVICE);
+            if (manager != null && nativeCookieEditor != null) {
+                manager.hideSoftInputFromWindow(nativeCookieEditor.getWindowToken(), 0);
+            }
+            if (nativeCookieEditor != null && nativeCookieEditor.hasFocus()) {
+                nativeCookieEditor.clearFocus();
+                applyCookieEditorBackground();
+            }
+            return;
+        }
+        nativeOnNativeCookieCancel();
+    }
+
+    @android.annotation.TargetApi(Build.VERSION_CODES.TIRAMISU)
+    private void registerNativeCookieBackCallback() {
+        if (nativeCookieBackCallback != null || nativeCookiePanel == null) {
+            return;
+        }
+        android.window.OnBackInvokedDispatcher dispatcher =
+                nativeCookiePanel.findOnBackInvokedDispatcher();
+        if (dispatcher == null) {
+            return;
+        }
+        android.window.OnBackInvokedCallback callback = this::handleNativeCookieBack;
+        try {
+            dispatcher.registerOnBackInvokedCallback(
+                    android.window.OnBackInvokedDispatcher.PRIORITY_DEFAULT, callback);
+            nativeCookieBackCallback = callback;
+        } catch (IllegalArgumentException | IllegalStateException error) {
+            // Fall back to the panel's key-event handling.
+            Log.w("GPUICookiePanel", "back callback registration failed", error);
+        }
+    }
+
+    private void unregisterNativeCookieBackCallback() {
+        if (nativeCookieBackCallback == null) {
+            return;
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU
+                && nativeCookiePanel != null) {
+            android.window.OnBackInvokedDispatcher dispatcher =
+                    nativeCookiePanel.findOnBackInvokedDispatcher();
+            if (dispatcher != null) {
+                try {
+                    dispatcher.unregisterOnBackInvokedCallback(
+                            (android.window.OnBackInvokedCallback) nativeCookieBackCallback);
+                } catch (IllegalArgumentException ignored) {
+                    // Already unregistered together with the window.
+                }
+            }
+        }
+        nativeCookieBackCallback = null;
+    }
+
+    private void detachNativeCookiePanel() {
+        if (nativeCookiePanel == null || !nativeCookiePanelAttached) {
+            return;
+        }
+        if (nativeCookieActionMode != null) {
+            nativeCookieActionMode.finish();
+            nativeCookieActionMode = null;
+        }
+        if (nativeCookieMoveAnimator != null) {
+            nativeCookieMoveAnimator.cancel();
+            nativeCookieMoveAnimator = null;
+        }
+        InputMethodManager manager =
+                (InputMethodManager) getSystemService(Context.INPUT_METHOD_SERVICE);
+        if (manager != null) {
+            manager.hideSoftInputFromWindow(nativeCookiePanel.getWindowToken(), 0);
+        }
+        nativeCookieEditor.clearFocus();
+        unregisterNativeCookieBackCallback();
+        if (nativeCookieWindowManager != null) {
+            try {
+                nativeCookieWindowManager.removeView(nativeCookiePanel);
+            } catch (IllegalArgumentException ignored) {
+                // The window was already detached by the system.
+            }
+        }
+        nativeCookiePanelAttached = false;
+        nativeCookieCurrentY = Integer.MIN_VALUE;
+    }
+
+    /**
+     * Centre the card in the visible area (the whole screen without the
+     * keyboard, or the screen minus the keyboard when it is open) and move
+     * the single panel window there, so card and editor can never move
+     * relative to each other.
+     *
+     * <p>Only the Activity window's IME inset is used. The panel window's own
+     * insets depend on where the window currently sits, and reading them here
+     * fed the layout back into itself — the endless bounce seen in landscape.
+     * </p>
+     */
+    private void layoutNativeCookiePanel() {
+        if (nativeCookiePanel == null || nativeCookiePanelParams == null) {
+            return;
+        }
+        int width = nativeCookiePanelWidthPx;
+
+        int screenWidth;
+        int screenHeight;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            Rect screen = getWindowManager().getMaximumWindowMetrics().getBounds();
+            screenWidth = screen.width();
+            screenHeight = screen.height();
+        } else {
+            android.util.DisplayMetrics metrics = getResources().getDisplayMetrics();
+            screenWidth = metrics.widthPixels;
+            screenHeight = metrics.heightPixels;
+        }
+        int ime = Math.min(Math.max(0, nativeCookieActivityIme), screenHeight);
+        // The vendor's floating keyboard reports a one-pixel IME inset while
+        // the window keeps the whole display; a real docked keyboard is far
+        // taller. Ignore keyboard heights that cannot be a docked keyboard.
+        if (ime < Math.round(60 * nativeCookieDensity)) {
+            ime = 0;
+        }
+        if (ime > 0) {
+            // Trust the inset only when the Activity's visible frame actually
+            // ends at the keyboard. A floating vendor keyboard (and a stale
+            // inset left over from the previous rotation) reports a height
+            // while the window still owns the whole display; the card must
+            // not move in that case.
+            Rect visibleFrame = new Rect();
+            getWindow().getDecorView().getWindowVisibleDisplayFrame(visibleFrame);
+            if (visibleFrame.bottom > 0
+                    && visibleFrame.bottom > screenHeight - ime + 32) {
+                ime = 0;
+            }
+        }
+        int contentTop = Math.max(0, nativeCookieBarsTop);
+        int spaceAboveKeyboard = ime > 0 ? Math.max(0, screenHeight - ime - contentTop) : 0;
+        // Landscape with a docked keyboard leaves too little room for the
+        // whole card. Shrink to just the editor filling the space above the
+        // keyboard, the way the home input sits there.
+        boolean compact = ime > 0
+                && screenWidth > screenHeight
+                && spaceAboveKeyboard > 0
+                && spaceAboveKeyboard < Math.round(320 * nativeCookieDensity);
+        int safeLeft = compact ? Math.max(0, nativeCookieBarsLeft) : 0;
+        int safeRight = compact ? Math.max(0, nativeCookieBarsRight) : 0;
+        int x = compact ? safeLeft : Math.max(0, (screenWidth - width) / 2);
+        int panelWidth = compact ? screenWidth - safeLeft - safeRight : width;
+        applyNativeCookieCompactMode(compact, spaceAboveKeyboard);
+
+        int height;
+        if (compact) {
+            height = spaceAboveKeyboard;
+        } else {
+            nativeCookiePanel.measure(
+                    View.MeasureSpec.makeMeasureSpec(width, View.MeasureSpec.EXACTLY),
+                    View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED));
+            // Always measure the natural card height. Reading getHeight() here
+            // would feed the previously applied window height (e.g. the
+            // compact strip) back into the next layout after rotation.
+            height = nativeCookiePanel.getMeasuredHeight();
+        }
+
+        int y;
+        if (compact) {
+            y = contentTop;
+        } else if (ime > 0) {
+            y = contentTop
+                    + Math.max(0, (screenHeight - ime - contentTop - height) / 2);
+        } else {
+            y = Math.max(0, (screenHeight - height) / 2);
+        }
+
+        if (nativeCookieLastLoggedIme != ime
+                || nativeCookieLastLayoutY != y
+                || nativeCookieLastLayoutH != height) {
+            nativeCookieLastLoggedIme = ime;
+            nativeCookieLastLayoutY = y;
+            nativeCookieLastLayoutH = height;
+            android.util.Log.d(
+                    "GPUICookiePanel",
+                    "ime=" + ime
+                            + " activityTop=" + nativeCookieBarsTop
+                            + " screen=" + screenWidth + "x" + screenHeight
+                            + " panel=" + panelWidth + "x" + height
+                            + " compact=" + compact
+                            + " at=" + x + "," + y);
+        }
+
+        nativeCookiePanelParams.width = panelWidth;
+        nativeCookiePanelParams.height = height;
+        nativeCookiePanelParams.x = x;
+        applyNativeCookiePanelY(y, ime);
+    }
+
+    /**
+     * Compact state for landscape with a docked keyboard: only the editor
+     * stays visible, filling the strip above the keyboard (the home input
+     * layout), with title, hint and buttons hidden until the keyboard closes.
+     */
+    private void applyNativeCookieCompactMode(boolean compact, int spaceAboveKeyboard) {
+        if (nativeCookiePanel == null || nativeCookieEditor == null) {
+            return;
+        }
+        boolean modeChanged = compact != nativeCookieCompactLayout;
+        nativeCookieCompactLayout = compact;
+        int pad = Math.round((compact ? 16 : 24) * nativeCookieDensity);
+        if (modeChanged) {
+            int visibility = compact ? View.GONE : View.VISIBLE;
+            if (nativeCookieTitleView != null) {
+                nativeCookieTitleView.setVisibility(visibility);
+            }
+            if (nativeCookieHintView != null) {
+                nativeCookieHintView.setVisibility(visibility);
+            }
+            if (nativeCookieButtonRow != null) {
+                nativeCookieButtonRow.setVisibility(visibility);
+            }
+            if (nativeCookieErrorView != null && compact) {
+                nativeCookieErrorView.setVisibility(View.GONE);
+            }
+            nativeCookiePanel.setPadding(pad, pad, pad, pad);
+            // In compact the bordered editor itself is the visible surface,
+            // like the home input; the card behind it stays transparent.
+            nativeCookiePanel.setBackground(compact
+                    ? null
+                    : roundedRect(nativeCookieCardColor, 24 * nativeCookieDensity, 0, 0));
+            applyCookieEditorBackground();
+        }
+        int margin = compact ? 0 : Math.round(8 * nativeCookieDensity);
+        int editorHeight = compact
+                ? Math.max(1, spaceAboveKeyboard - 2 * pad)
+                : Math.round(146 * nativeCookieDensity);
+        ViewGroup.LayoutParams params = nativeCookieEditor.getLayoutParams();
+        if (params instanceof LinearLayout.LayoutParams) {
+            LinearLayout.LayoutParams editorParams = (LinearLayout.LayoutParams) params;
+            if (editorParams.height != editorHeight || editorParams.topMargin != margin) {
+                editorParams.height = editorHeight;
+                editorParams.topMargin = margin;
+                nativeCookieEditor.setLayoutParams(editorParams);
+            }
+        }
+    }
+
+    private void applyNativeCookiePanelY(int y, int ime) {
+        boolean keyboardToggled = nativeCookiePreviousIme >= 0
+                && (nativeCookiePreviousIme == 0) != (ime == 0);
+        nativeCookiePreviousIme = ime;
+        if (!nativeCookiePanelAttached) {
+            nativeCookiePanelParams.y = y;
+            nativeCookieCurrentY = y;
+            return;
+        }
+        if (nativeCookieMoveAnimator != null) {
+            nativeCookieMoveAnimator.cancel();
+            nativeCookieMoveAnimator = null;
+        }
+        if (!keyboardToggled
+                || nativeCookieCurrentY == Integer.MIN_VALUE
+                || Math.abs(y - nativeCookieCurrentY) <= 1) {
+            setNativeCookiePanelY(y);
+            return;
+        }
+        // The ROM reports the keyboard height in one step (no inset animation
+        // frames), so glide the window to the new centre instead of snapping.
+        ValueAnimator animator = ValueAnimator.ofInt(nativeCookieCurrentY, y);
+        animator.setDuration(200);
+        animator.setInterpolator(new DecelerateInterpolator());
+        animator.addUpdateListener(
+                animation -> setNativeCookiePanelY((int) animation.getAnimatedValue()));
+        animator.start();
+        nativeCookieMoveAnimator = animator;
+    }
+
+    private void setNativeCookiePanelY(int y) {
+        if (nativeCookiePanelParams == null) {
+            return;
+        }
+        nativeCookiePanelParams.y = y;
+        if (nativeCookiePanelAttached && nativeCookieWindowManager != null) {
+            try {
+                nativeCookieWindowManager.updateViewLayout(
+                        nativeCookiePanel, nativeCookiePanelParams);
+            } catch (IllegalArgumentException ignored) {
+                // The window was detached mid-animation.
+            }
+        }
+        nativeCookieCurrentY = y;
+    }
+
+    /**
+     * Card container that answers the editor's ActionMode request.
+     *
+     * <p>A view hierarchy added through WindowManager has no
+     * Window.Callback, and ViewRootImpl returns null for every
+     * startActionMode call. Without an ActionMode the EditText never shows
+     * its selection handles or edit menu, so this layout supplies one.</p>
+     */
+    private class CookieCardLayout extends LinearLayout {
+        CookieCardLayout(Context context) {
+            super(context);
+        }
+
+        @Override
+        public boolean dispatchKeyEvent(KeyEvent event) {
+            // The panel is a standalone window with no Window.Callback, so an
+            // unhandled BACK would be dropped here instead of reaching the
+            // Activity. Handle it on the panel: collapse the keyboard first,
+            // close the dialog only when no keyboard is showing.
+            if (event.getKeyCode() == KeyEvent.KEYCODE_BACK) {
+                if (event.getAction() == KeyEvent.ACTION_UP && !event.isCanceled()) {
+                    handleNativeCookieBack();
+                }
+                return true;
+            }
+            return super.dispatchKeyEvent(event);
+        }
+
+        @Override
+        public ActionMode startActionModeForChild(
+                View originalView, ActionMode.Callback callback, int type) {
+            Log.d(
+                    "GPUICookiePanel",
+                    "startActionModeForChild type=" + type
+                            + " view=" + originalView.getClass().getSimpleName()
+                            + " isEditor=" + (originalView == nativeCookieEditor));
+            return startCookieTextActionMode(originalView, callback);
+        }
+
+        @Override
+        public ActionMode startActionModeForChild(
+                View originalView, ActionMode.Callback callback) {
+            Log.d(
+                    "GPUICookiePanel",
+                    "startActionModeForChild legacy view="
+                            + originalView.getClass().getSimpleName()
+                            + " isEditor=" + (originalView == nativeCookieEditor));
+            return startCookieTextActionMode(originalView, callback);
+        }
+    }
+
+    private ActionMode startCookieTextActionMode(
+            View originalView, ActionMode.Callback callback) {
+        Log.d(
+                "GPUICookiePanel",
+                "startCookieTextActionMode isEditor=" + (originalView == nativeCookieEditor)
+                        + " attached=" + nativeCookiePanelAttached
+                        + " selection=" + (nativeCookieEditor == null
+                                ? "null"
+                                : nativeCookieEditor.getSelectionStart()
+                                        + ".." + nativeCookieEditor.getSelectionEnd()));
+        if (originalView != nativeCookieEditor || !nativeCookiePanelAttached) {
+            return null;
+        }
+        captureCookieTextSelection();
+        if (nativeCookieActionMode != null) {
+            nativeCookieActionMode.finish();
+            nativeCookieActionMode = null;
+        }
+        // The real system ActionMode lives in the Activity window, so the
+        // panel window (no Window.Callback of its own) can still hand the
+        // editor a floating ActionMode. Starting it through the DecorView
+        // with the editor as originating view makes the framework anchor the
+        // stock (vendor-customised) toolbar to the selection.
+        ActionMode systemMode = null;
+        View decor = getWindow().getDecorView();
+        if (decor instanceof ViewGroup) {
+            systemMode = ((ViewGroup) decor).startActionModeForChild(
+                    nativeCookieEditor,
+                    wrapCookieTextCallback(callback),
+                    ActionMode.TYPE_FLOATING);
+        }
+        if (systemMode != null) {
+            Log.d("GPUICookiePanel", "system floating action mode started");
+            nativeCookieActionMode = systemMode;
+            return systemMode;
+        }
+        Log.d("GPUICookiePanel", "system action mode refused; in-window toolbar instead");
+        CookieActionMode mode = new CookieActionMode(callback);
+        if (!mode.start()) {
+            Log.d("GPUICookiePanel", "cookie action mode onCreate returned false");
+            return null;
+        }
+        Log.d("GPUICookiePanel", "cookie action mode started");
+        nativeCookieActionMode = mode;
+        return mode;
+    }
+
+    private void captureCookieTextSelection() {
+        nativeCookieExpectedSelStart = -1;
+        nativeCookieExpectedSelEnd = -1;
+        if (nativeCookieEditor == null) {
+            return;
+        }
+        int start = nativeCookieEditor.getSelectionStart();
+        int end = nativeCookieEditor.getSelectionEnd();
+        if (start < 0 || end < 0 || start == end) {
+            return;
+        }
+        nativeCookieExpectedSelStart = Math.min(start, end);
+        nativeCookieExpectedSelEnd = Math.max(start, end);
+        nativeCookieExpectedSelAtMs = SystemClock.uptimeMillis();
+        Log.d(
+                "GPUICookiePanel",
+                "captured selection=" + nativeCookieExpectedSelStart
+                        + ".." + nativeCookieExpectedSelEnd);
+    }
+
+    private void clearCookieTextSelectionCapture() {
+        nativeCookieExpectedSelStart = -1;
+        nativeCookieExpectedSelEnd = -1;
+    }
+
+    private void reassertCookieTextSelection() {
+        if (nativeCookieEditor == null
+                || nativeCookieExpectedSelStart < 0
+                || nativeCookieExpectedSelEnd < 0) {
+            return;
+        }
+        if (SystemClock.uptimeMillis() - nativeCookieExpectedSelAtMs
+                > COOKIE_SELECTION_REASSERT_MS) {
+            clearCookieTextSelectionCapture();
+            return;
+        }
+        CharSequence text = nativeCookieEditor.getText();
+        if (text == null
+                || nativeCookieExpectedSelEnd > text.length()
+                || nativeCookieExpectedSelEnd <= nativeCookieExpectedSelStart) {
+            clearCookieTextSelectionCapture();
+            return;
+        }
+        int start = nativeCookieEditor.getSelectionStart();
+        int end = nativeCookieEditor.getSelectionEnd();
+        if (start == nativeCookieExpectedSelStart && end == nativeCookieExpectedSelEnd) {
+            return;
+        }
+        if (start != end) {
+            // The selection changed to some other range on purpose (select
+            // all, handle drag); leave it alone.
+            clearCookieTextSelectionCapture();
+            return;
+        }
+        Selection.setSelection(
+                nativeCookieEditor.getEditableText(),
+                nativeCookieExpectedSelStart,
+                nativeCookieExpectedSelEnd);
+        Log.d(
+                "GPUICookiePanel",
+                "reasserted selection=" + nativeCookieExpectedSelStart
+                        + ".." + nativeCookieExpectedSelEnd
+                        + " was=" + start + ".." + end);
+    }
+
+    private ActionMode.Callback wrapCookieTextCallback(ActionMode.Callback callback) {
+        return new ActionMode.Callback2() {
+            @Override
+            public boolean onCreateActionMode(ActionMode mode, Menu menu) {
+                reassertCookieTextSelection();
+                return callback.onCreateActionMode(mode, menu);
+            }
+
+            @Override
+            public boolean onPrepareActionMode(ActionMode mode, Menu menu) {
+                reassertCookieTextSelection();
+                return callback.onPrepareActionMode(mode, menu);
+            }
+
+            @Override
+            public boolean onActionItemClicked(ActionMode mode, MenuItem item) {
+                return callback.onActionItemClicked(mode, item);
+            }
+
+            @Override
+            public void onDestroyActionMode(ActionMode mode) {
+                callback.onDestroyActionMode(mode);
+            }
+
+            @Override
+            public void onGetContentRect(ActionMode mode, View view, Rect outRect) {
+                reassertCookieTextSelection();
+                Log.d(
+                        "TextTest",
+                        "contentRect request selection=" + nativeCookieEditor.getSelectionStart()
+                                + ".." + nativeCookieEditor.getSelectionEnd()
+                                + " focused=" + nativeCookieEditor.hasFocus());
+                if (callback instanceof ActionMode.Callback2) {
+                    ((ActionMode.Callback2) callback)
+                            .onGetContentRect(mode, view, outRect);
+                } else {
+                    outRect.set(0, 0, view.getWidth(), view.getHeight());
+                }
+                int[] editorScreen = new int[2];
+                view.getLocationOnScreen(editorScreen);
+                int[] editorWindow = new int[2];
+                view.getLocationInWindow(editorWindow);
+                int[] rootScreen = new int[2];
+                view.getRootView().getLocationOnScreen(rootScreen);
+                Rect global = new Rect();
+                boolean globalOk = view.getGlobalVisibleRect(global);
+                Rect viewport = new Rect();
+                getWindow().getDecorView().getWindowVisibleDisplayFrame(viewport);
+                int[] decorScreen = new int[2];
+                getWindow().getDecorView().getLocationOnScreen(decorScreen);
+                Log.d(
+                        "GPUICookiePanel",
+                        "contentRect=" + outRect
+                                + " editorScreen=" + editorScreen[0] + "," + editorScreen[1]
+                                + " editorWindow=" + editorWindow[0] + "," + editorWindow[1]
+                                + " rootScreen=" + rootScreen[0] + "," + rootScreen[1]
+                                + " globalVisible=" + globalOk + ":" + global
+                                + " decorScreen=" + decorScreen[0] + "," + decorScreen[1]
+                                + " viewport=" + viewport);
+            }
+        };
+    }
+
+    /** ActionMode with a floating cut/copy/paste/select-all toolbar. */
+    private class CookieActionMode extends ActionMode implements View.OnClickListener {
+        private final ActionMode.Callback callback;
+        @SuppressWarnings("unused")
+        private final PopupMenu source;
+        private final Menu menu;
+        private final PopupWindow toolbar;
+        private final LinearLayout toolbarRow;
+        private boolean started;
+        private boolean finished;
+
+        CookieActionMode(ActionMode.Callback callback) {
+            this.callback = callback;
+            source = new PopupMenu(GpuiActivity.this, nativeCookieEditor);
+            menu = source.getMenu();
+            float density = nativeCookieDensity;
+            toolbarRow = new LinearLayout(GpuiActivity.this);
+            toolbarRow.setOrientation(LinearLayout.HORIZONTAL);
+            toolbarRow.setGravity(Gravity.CENTER_VERTICAL);
+            toolbarRow.setBackground(roundedRect(0xF22B2B2B, 8 * density, 0, 0));
+            int pad = Math.round(4 * density);
+            toolbarRow.setPadding(pad, pad, pad, pad);
+            toolbar = new PopupWindow(toolbarRow,
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                    false);
+            toolbar.setBackgroundDrawable(null);
+            toolbar.setOutsideTouchable(true);
+            toolbar.setFocusable(false);
+            toolbar.setOnDismissListener(this::finish);
+        }
+
+        boolean start() {
+            if (!callback.onCreateActionMode(this, menu)) {
+                return false;
+            }
+            started = true;
+            callback.onPrepareActionMode(this, menu);
+            StringBuilder orders = new StringBuilder();
+            for (int i = 0; i < menu.size(); i++) {
+                MenuItem item = menu.getItem(i);
+                orders.append(item.getOrder())
+                        .append(':')
+                        .append(item.getTitle())
+                        .append(':')
+                        .append(item.isVisible() ? "v" : "h")
+                        .append(' ');
+            }
+            Log.d("GPUICookiePanel", "action mode menu " + orders);
+            rebuildToolbar();
+            return true;
+        }
+
+        private void rebuildToolbar() {
+            toolbarRow.removeAllViews();
+            int shown = 0;
+            for (int i = 0; i < menu.size() && shown < 4; i++) {
+                MenuItem item = menu.getItem(i);
+                if (!item.isVisible()) {
+                    continue;
+                }
+                // Keep the core edit items: cut(4), copy(5), paste(6),
+                // select all(8). Assist/share/process-text items would not
+                // fit a compact floating bar.
+                int order = item.getOrder();
+                if (order != 4 && order != 5 && order != 6 && order != 8) {
+                    continue;
+                }
+                TextView entry = new TextView(GpuiActivity.this);
+                entry.setText(item.getTitle());
+                entry.setTextSize(
+                        TypedValue.COMPLEX_UNIT_PX, 16 * nativeCookieDensity);
+                entry.setTextColor(item.isEnabled() ? 0xFFFFFFFF : 0x66FFFFFF);
+                entry.setGravity(Gravity.CENTER);
+                entry.setIncludeFontPadding(false);
+                int padH = Math.round(16 * nativeCookieDensity);
+                entry.setPadding(
+                        padH,
+                        Math.round(10 * nativeCookieDensity),
+                        padH,
+                        Math.round(10 * nativeCookieDensity));
+                entry.setTag(item);
+                entry.setClickable(true);
+                entry.setOnClickListener(this);
+                toolbarRow.addView(entry, new LinearLayout.LayoutParams(
+                        LinearLayout.LayoutParams.WRAP_CONTENT,
+                        LinearLayout.LayoutParams.WRAP_CONTENT));
+                shown++;
+            }
+            if (shown == 0) {
+                Log.d("GPUICookiePanel", "toolbar empty, dismissing");
+                if (toolbar.isShowing()) {
+                    toolbar.dismiss();
+                }
+                return;
+            }
+            Log.d("GPUICookiePanel", "toolbar entries=" + shown);
+            showToolbar();
+        }
+
+        private void showToolbar() {
+            toolbarRow.measure(
+                    View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED),
+                    View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED));
+            int width = toolbarRow.getMeasuredWidth();
+            int height = toolbarRow.getMeasuredHeight();
+            Rect rect = new Rect();
+            if (callback instanceof ActionMode.Callback2) {
+                ((ActionMode.Callback2) callback).onGetContentRect(
+                        this, nativeCookieEditor, rect);
+            }
+            if (rect.isEmpty()) {
+                rect.set(0, 0, nativeCookieEditor.getWidth(),
+                        Math.max(1, nativeCookieEditor.getHeight() / 4));
+            }
+            int[] location = new int[2];
+            nativeCookieEditor.getLocationInWindow(location);
+            int margin = Math.round(8 * nativeCookieDensity);
+            int x = location[0] + rect.centerX() - width / 2;
+            x = Math.max(margin, Math.min(x, nativeCookiePanelWidthPx - width - margin));
+            int above = location[1] + rect.top - height - margin;
+            int y = above >= margin
+                    ? above
+                    : location[1] + rect.bottom + margin;
+            Log.d(
+                    "GPUICookiePanel",
+                    "toolbar at=" + x + "," + y
+                            + " w=" + width + " h=" + height
+                            + " panelWidth=" + nativeCookiePanelWidthPx);
+            if (toolbar.isShowing()) {
+                toolbar.update(x, y, width, height);
+            } else {
+                toolbar.showAtLocation(
+                        nativeCookieEditor, Gravity.NO_GRAVITY, x, y);
+            }
+        }
+
+        @Override
+        public void onClick(View view) {
+            Object tag = view.getTag();
+            if (finished || !(tag instanceof MenuItem)) {
+                return;
+            }
+            MenuItem item = (MenuItem) tag;
+            if (!item.isEnabled()) {
+                return;
+            }
+            if (callback.onActionItemClicked(this, item)) {
+                callback.onPrepareActionMode(this, menu);
+                rebuildToolbar();
+            }
+        }
+
+        @Override
+        public void invalidate() {
+            if (!started || finished) {
+                return;
+            }
+            callback.onPrepareActionMode(this, menu);
+            rebuildToolbar();
+        }
+
+        @Override
+        public void invalidateContentRect() {
+            if (started && !finished) {
+                showToolbar();
+            }
+        }
+
+        @Override
+        public void finish() {
+            if (finished) {
+                return;
+            }
+            finished = true;
+            if (toolbar.isShowing()) {
+                toolbar.dismiss();
+            }
+            if (started) {
+                callback.onDestroyActionMode(this);
+            }
+            if (nativeCookieActionMode == this) {
+                nativeCookieActionMode = null;
+            }
+        }
+
+        @Override
+        public void setTitle(CharSequence title) {}
+
+        @Override
+        public void setTitle(int resId) {}
+
+        @Override
+        public void setSubtitle(CharSequence subtitle) {}
+
+        @Override
+        public void setSubtitle(int resId) {}
+
+        @Override
+        public void setCustomView(View view) {}
+
+        @Override
+        public Menu getMenu() {
+            return menu;
+        }
+
+        @Override
+        public CharSequence getTitle() {
+            return null;
+        }
+
+        @Override
+        public CharSequence getSubtitle() {
+            return null;
+        }
+
+        @Override
+        public View getCustomView() {
+            return null;
+        }
+
+        @Override
+        public MenuInflater getMenuInflater() {
+            return new MenuInflater(GpuiActivity.this);
+        }
     }
 
     /**

@@ -325,6 +325,48 @@ pub fn set_native_editor_warmup(warmup: bool) {
     let _ = warmup;
 }
 
+/// Content and styling for the native Android Cookie dialog panel.
+///
+/// The panel draws the whole card — title, hint, editor and actions — inside
+/// one application window. Card and editor therefore share a single
+/// compositor surface and move together with the keyboard by construction.
+/// Sizes are logical pixels; colors are `0xRRGGBBAA`.
+#[derive(Debug, Clone, Default)]
+pub struct NativeCookiePanelSpec {
+    pub text: String,
+    pub width: f32,
+    pub title: String,
+    pub hint: String,
+    pub placeholder: String,
+    pub cancel_label: String,
+    pub save_label: String,
+    pub card_bg: u32,
+    pub text_color: u32,
+    pub muted_color: u32,
+    pub field_bg: u32,
+    pub field_border: u32,
+    pub field_focus: u32,
+    pub primary: u32,
+    pub primary_text: u32,
+    pub cancel_bg: u32,
+    pub cancel_border: u32,
+    pub cancel_text: u32,
+}
+
+/// Show (or refresh) the native Android Cookie dialog panel.
+pub fn show_native_cookie_panel(spec: &NativeCookiePanelSpec) {
+    #[cfg(target_os = "android")]
+    android::jni::show_native_cookie_panel_android(spec);
+    #[cfg(not(target_os = "android"))]
+    let _ = spec;
+}
+
+/// Hide the native Android Cookie dialog panel.
+pub fn hide_native_cookie_panel() {
+    #[cfg(target_os = "android")]
+    android::jni::hide_native_cookie_panel_android();
+}
+
 /// Read the live contents of the platform native editor, if one is visible.
 ///
 /// This is used during focus changes so the final keystrokes are committed
@@ -622,6 +664,41 @@ type BackHandlerFn = Box<dyn FnMut()>;
 
 thread_local! {
     static BACK_HANDLER: RefCell<Option<BackHandlerFn>> = RefCell::new(None);
+}
+
+/// A dialog action requested by the native Android Cookie panel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NativeCookieAction {
+    Save(String),
+    Cancel,
+}
+
+type NativeCookieHandlerFn = Box<dyn FnMut(NativeCookieAction)>;
+
+thread_local! {
+    static NATIVE_COOKIE_HANDLER: RefCell<Option<NativeCookieHandlerFn>> = RefCell::new(None);
+}
+
+/// Register the handler invoked when the native Cookie panel's actions are
+/// tapped. The callback runs on the Android main thread.
+#[cfg(target_os = "android")]
+pub fn set_native_cookie_handler(handler: Option<NativeCookieHandlerFn>) {
+    NATIVE_COOKIE_HANDLER.with(|slot| {
+        *slot.borrow_mut() = handler;
+    });
+}
+
+/// Deliver a native Cookie panel action to the registered handler.
+#[cfg(target_os = "android")]
+pub fn dispatch_native_cookie_action(action: NativeCookieAction) -> bool {
+    NATIVE_COOKIE_HANDLER.with(|handler| {
+        if let Some(callback) = handler.borrow_mut().as_mut() {
+            callback(action);
+            true
+        } else {
+            false
+        }
+    })
 }
 
 /// Register the application-level handler for Android's back key / gesture.

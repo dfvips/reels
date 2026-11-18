@@ -176,13 +176,11 @@ jobs:
 
           $versionInfo = (Get-Item $exe).VersionInfo
           $expectedVersion = "${{ needs.version.outputs.base }}"
-          $expectedFileVersion = if ($expectedVersion -match '^(\d+)\.(\d+)\.(\d+)$') {
-            "$($Matches[1]).$($Matches[2]).$($Matches[3]).0"
-          } else {
+          if ($expectedVersion -notmatch '^\d+\.\d+\.\d+$') {
             throw "版本号不是 x.y.z 格式: $expectedVersion"
           }
-          if ($versionInfo.FileVersion -ne $expectedFileVersion) {
-            throw "FileVersion 不正确: 期望 $expectedFileVersion，实际 $($versionInfo.FileVersion)"
+          if ($versionInfo.FileVersion -ne $expectedVersion) {
+            throw "FileVersion 不正确: 期望 $expectedVersion，实际 $($versionInfo.FileVersion)"
           }
           if ($versionInfo.ProductVersion -ne $expectedVersion) {
             throw "ProductVersion 不正确: 期望 $expectedVersion，实际 $($versionInfo.ProductVersion)"

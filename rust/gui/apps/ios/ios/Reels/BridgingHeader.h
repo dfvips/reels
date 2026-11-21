@@ -19,6 +19,27 @@ void gpui_ios_will_resign_active(void *app_ptr);
 void gpui_ios_did_enter_background(void *app_ptr);
 void gpui_ios_will_terminate(void *app_ptr);
 
+bool reels_ios_finalize_downloaded_file(const char *path, const char *live_path);
+void reels_ios_download_event_started(const char *batch_id, uint32_t index, uint64_t total);
+void reels_ios_download_event_progress(
+    const char *batch_id,
+    uint32_t index,
+    uint64_t downloaded,
+    uint64_t total
+);
+void reels_ios_download_event_completed(
+    const char *batch_id,
+    uint32_t index,
+    const char *path
+);
+void reels_ios_download_event_failed(
+    const char *batch_id,
+    uint32_t index,
+    const char *message,
+    bool timed_out
+);
+void reels_ios_download_event_finished(const char *batch_id);
+
 void reels_native_text_input_changed(
     const char *id,
     const char *text,

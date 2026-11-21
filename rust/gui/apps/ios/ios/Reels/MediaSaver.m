@@ -117,7 +117,8 @@ static void ReelsCommitLivePhoto(
     NSString *photoUTI,
     NSURL *videoURL,
     NSString *imagePath,
-    NSString *videoPath
+    NSString *videoPath,
+    void (^completion)(BOOL success, NSError *error)
 ) {
     [[PHPhotoLibrary sharedPhotoLibrary] performChanges:^{
         PHAssetCreationRequest *request = [PHAssetCreationRequest creationRequestForAsset];
@@ -137,15 +138,17 @@ static void ReelsCommitLivePhoto(
     } completionHandler:^(BOOL success, NSError *error) {
         if (!success) {
             NSLog(@"reels: live photo save failed: %@", error);
-            return;
         }
-        dispatch_async(dispatch_get_global_queue(QOS_CLASS_BACKGROUND, 0), ^{
-            NSFileManager *fileManager = [NSFileManager defaultManager];
-            [fileManager removeItemAtURL:photoURL error:nil];
-            [fileManager removeItemAtURL:videoURL error:nil];
+        NSFileManager *fileManager = [NSFileManager defaultManager];
+        [fileManager removeItemAtURL:photoURL error:nil];
+        [fileManager removeItemAtURL:videoURL error:nil];
+        if (success) {
             [fileManager removeItemAtPath:imagePath error:nil];
             [fileManager removeItemAtPath:videoPath error:nil];
-        });
+        }
+        if (completion != nil) {
+            completion(success, error);
+        }
     }];
 }
 
@@ -204,57 +207,83 @@ bool reels_convert_image_to_jpeg(
     return written;
 }
 
+static void ReelsSaveMediaToPhotos(
+    NSString *filePath,
+    void (^completion)(BOOL success, NSError *error)
+) {
+    void (^finish)(BOOL, NSError *) = ^(BOOL success, NSError *error) {
+        if (success) {
+            [[NSFileManager defaultManager] removeItemAtPath:filePath error:nil];
+        }
+        if (completion != nil) {
+            completion(success, error);
+        }
+    };
+
+    if ([[filePath.pathExtension lowercaseString] isEqualToString:@"heic"] ||
+        [[filePath.pathExtension lowercaseString] isEqualToString:@"heif"]) {
+        UIImage *image = [UIImage imageWithContentsOfFile:filePath];
+        if (image == nil) {
+            finish(NO, nil);
+            return;
+        }
+        [[PHPhotoLibrary sharedPhotoLibrary] performChanges:^{
+            [PHAssetCreationRequest creationRequestForAssetFromImage:image];
+        } completionHandler:^(BOOL success, NSError *error) {
+            finish(success, error);
+        }];
+    } else if ([filePath hasSuffix:@".mp4"] || [filePath hasSuffix:@".m4v"] ||
+               [filePath hasSuffix:@".mov"]) {
+        [[PHPhotoLibrary sharedPhotoLibrary] performChanges:^{
+            [PHAssetCreationRequest creationRequestForAssetFromVideoAtFileURL:
+                [NSURL fileURLWithPath:filePath]];
+        } completionHandler:^(BOOL success, NSError *error) {
+            finish(success, error);
+        }];
+    } else {
+        UIImage *image = [UIImage imageWithContentsOfFile:filePath];
+        if (image == nil) {
+            finish(NO, nil);
+            return;
+        }
+        [[PHPhotoLibrary sharedPhotoLibrary] performChanges:^{
+            [PHAssetCreationRequest creationRequestForAssetFromImage:image];
+        } completionHandler:^(BOOL success, NSError *error) {
+            finish(success, error);
+        }];
+    }
+}
+
 void reels_save_media_to_photos(const char *path) {
     if (path == NULL) {
         return;
     }
     NSString *filePath = [NSString stringWithUTF8String:path];
     dispatch_async(dispatch_get_main_queue(), ^{
-        if ([[filePath.pathExtension lowercaseString] isEqualToString:@"heic"] ||
-            [[filePath.pathExtension lowercaseString] isEqualToString:@"heif"]) {
-            UIImage *image = [UIImage imageWithContentsOfFile:filePath];
-            if (image == nil) {
-                return;
-            }
-            [[PHPhotoLibrary sharedPhotoLibrary] performChanges:^{
-                [PHAssetCreationRequest creationRequestForAssetFromImage:image];
-            } completionHandler:^(BOOL success, NSError *error) {
-                if (success) {
-                    dispatch_async(dispatch_get_global_queue(QOS_CLASS_BACKGROUND, 0), ^{
-                        [[NSFileManager defaultManager] removeItemAtPath:filePath error:nil];
-                    });
-                }
-            }];
-        } else if ([filePath hasSuffix:@".mp4"] || [filePath hasSuffix:@".m4v"] ||
-                   [filePath hasSuffix:@".mov"]) {
-            [[PHPhotoLibrary sharedPhotoLibrary] performChanges:^{
-                [PHAssetCreationRequest creationRequestForAssetFromVideoAtFileURL:
-                    [NSURL fileURLWithPath:filePath]];
-            } completionHandler:^(BOOL success, NSError *error) {
-                if (success) {
-                    dispatch_async(dispatch_get_global_queue(QOS_CLASS_BACKGROUND, 0), ^{
-                        [[NSFileManager defaultManager] removeItemAtPath:filePath error:nil];
-                    });
-                }
-            }];
-        } else {
-            UIImage *image = [UIImage imageWithContentsOfFile:filePath];
-            if (image != nil) {
-                [[PHPhotoLibrary sharedPhotoLibrary] performChanges:^{
-                    [PHAssetCreationRequest creationRequestForAssetFromImage:image];
-                } completionHandler:^(BOOL success, NSError *error) {
-                    if (success) {
-                        dispatch_async(dispatch_get_global_queue(QOS_CLASS_BACKGROUND, 0), ^{
-                            [[NSFileManager defaultManager] removeItemAtPath:filePath error:nil];
-                        });
-                    }
-                }];
-            }
-        }
+        ReelsSaveMediaToPhotos(filePath, nil);
     });
 }
 
-bool reels_save_live_photo_to_photos(const char *image_path, const char *video_path) {
+bool reels_save_media_to_photos_wait(const char *path) {
+    if (path == NULL) {
+        return false;
+    }
+    NSString *filePath = [NSString stringWithUTF8String:path];
+    __block bool saved = false;
+    dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);
+    ReelsSaveMediaToPhotos(filePath, ^(BOOL success, NSError *error) {
+        saved = success;
+        dispatch_semaphore_signal(semaphore);
+    });
+    dispatch_semaphore_wait(semaphore, DISPATCH_TIME_FOREVER);
+    return saved;
+}
+
+static bool ReelsSaveLivePhoto(
+    const char *image_path,
+    const char *video_path,
+    bool wait_for_completion
+) {
     if (image_path == NULL || video_path == NULL) {
         return false;
     }
@@ -276,7 +305,33 @@ bool reels_save_live_photo_to_photos(const char *image_path, const char *video_p
             [[NSFileManager defaultManager] removeItemAtURL:photoURL error:nil];
             return false;
         }
-        ReelsCommitLivePhoto(photoURL, photoUTI, videoURL, imagePath, videoPath);
+        if (!wait_for_completion) {
+            ReelsCommitLivePhoto(photoURL, photoUTI, videoURL, imagePath, videoPath, nil);
+            return true;
+        }
+        __block bool saved = false;
+        dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);
+        ReelsCommitLivePhoto(
+            photoURL,
+            photoUTI,
+            videoURL,
+            imagePath,
+            videoPath,
+            ^(BOOL success, NSError *error) {
+                saved = success;
+                dispatch_semaphore_signal(semaphore);
+            }
+        );
+        dispatch_semaphore_wait(semaphore, DISPATCH_TIME_FOREVER);
+        return saved;
     }
-    return true;
+    return false;
+}
+
+bool reels_save_live_photo_to_photos(const char *image_path, const char *video_path) {
+    return ReelsSaveLivePhoto(image_path, video_path, false);
+}
+
+bool reels_save_live_photo_to_photos_wait(const char *image_path, const char *video_path) {
+    return ReelsSaveLivePhoto(image_path, video_path, true);
 }

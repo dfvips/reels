@@ -611,6 +611,7 @@ impl AppView {
         if let Some(ui) = self.download.as_ref() {
             ui.cancel.store(true, Ordering::Relaxed);
         }
+        download::cancel_ios_download();
         self.dialog = None;
         self.toast("下载已取消", ToastKind::Info, cx);
     }

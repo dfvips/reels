@@ -64,6 +64,10 @@
     </dict>
     <key>NSPhotoLibraryAddUsageDescription</key>
     <string>保存解析下载的图片和视频到系统相册。</string>
+    <key>NSSupportsLiveActivities</key>
+    <true/>
+    <key>NSSupportsLiveActivitiesFrequentUpdates</key>
+    <true/>
 	<key>UILaunchStoryboardName</key>
 	<string>LaunchScreen</string>
     <key>UIRequiredDeviceCapabilities</key>

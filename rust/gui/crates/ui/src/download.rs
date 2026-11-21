@@ -93,6 +93,19 @@ pub fn start_downloads(
     cancel: Arc<AtomicBool>,
     tx: Sender<DownloadEvent>,
 ) {
+    #[cfg(target_os = "ios")]
+    if crate::ios_download::start(
+        &urls,
+        &titles,
+        &extensions,
+        &live_videos,
+        &directory,
+        &cache_dir,
+        tx.clone(),
+    ) {
+        return;
+    }
+
     std::thread::spawn(move || {
         let client = match reqwest::blocking::Client::builder()
             .connect_timeout(STALL_TIMEOUT)
@@ -258,6 +271,11 @@ pub fn start_downloads(
 
         let _ = tx.send(DownloadEvent::Finished);
     });
+}
+
+pub(crate) fn cancel_ios_download() {
+    #[cfg(target_os = "ios")]
+    crate::ios_download::cancel_active();
 }
 
 fn move_into_place(temp_path: &Path, destination: &Path) -> Result<(), String> {

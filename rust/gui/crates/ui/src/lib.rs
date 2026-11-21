@@ -13,6 +13,8 @@ pub mod icons;
 mod idm;
 mod image_convert;
 #[cfg(target_os = "ios")]
+mod ios_download;
+#[cfg(target_os = "ios")]
 mod ios_native_input;
 mod motion_photo;
 pub mod paths;

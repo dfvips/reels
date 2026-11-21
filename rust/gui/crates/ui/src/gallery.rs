@@ -84,6 +84,39 @@ pub fn save_media(path: &std::path::Path) -> bool {
     true
 }
 
+/// 后台下载专用：等待 PhotoKit 真正完成保存后再返回。
+#[cfg(target_os = "ios")]
+pub fn save_media_and_wait(path: &std::path::Path) -> bool {
+    let converted = webp_as_jpeg(path);
+    let target = converted.as_deref().unwrap_or(path);
+    let Some(text) = target.to_str() else {
+        if let Some(converted) = converted.as_deref() {
+            let _ = std::fs::remove_file(converted);
+        }
+        return false;
+    };
+    let Ok(c_path) = std::ffi::CString::new(text) else {
+        if let Some(converted) = converted.as_deref() {
+            let _ = std::fs::remove_file(converted);
+        }
+        return false;
+    };
+    let saved = unsafe {
+        extern "C" {
+            fn reels_save_media_to_photos_wait(path: *const std::os::raw::c_char) -> bool;
+        }
+        reels_save_media_to_photos_wait(c_path.as_ptr())
+    };
+    if converted.is_some() {
+        if saved {
+            let _ = std::fs::remove_file(path);
+        } else if let Some(converted) = converted.as_deref() {
+            let _ = std::fs::remove_file(converted);
+        }
+    }
+    saved
+}
+
 /// 保存成功后是否由调用方删除沙盒源文件。
 /// iOS 的相册提交是异步的，由原生层在完成后删除；调用方提前删除会导致保存失败。
 pub fn caller_deletes_source_after_save() -> bool {
@@ -116,5 +149,26 @@ pub fn save_live_photo(image: &std::path::Path, video: &std::path::Path) -> bool
     {
         let _ = (image, video);
         false
+    }
+}
+
+/// 后台下载专用：等待实况照片提交完成后再返回。
+#[cfg(target_os = "ios")]
+pub fn save_live_photo_and_wait(image: &std::path::Path, video: &std::path::Path) -> bool {
+    let (Some(image), Some(video)) = (image.to_str(), video.to_str()) else {
+        return false;
+    };
+    let (Ok(image), Ok(video)) = (std::ffi::CString::new(image), std::ffi::CString::new(video))
+    else {
+        return false;
+    };
+    unsafe {
+        extern "C" {
+            fn reels_save_live_photo_to_photos_wait(
+                image_path: *const std::os::raw::c_char,
+                video_path: *const std::os::raw::c_char,
+            ) -> bool;
+        }
+        reels_save_live_photo_to_photos_wait(image.as_ptr(), video.as_ptr())
     }
 }

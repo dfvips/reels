@@ -1,4 +1,5 @@
 import UIKit
+import UserNotifications
 
 private final class AppearanceTraitObserver: UIView {
     var onUserInterfaceStyleChanged: (() -> Void)?
@@ -13,7 +14,7 @@ private final class AppearanceTraitObserver: UIView {
 }
 
 @main
-class AppDelegate: UIResponder, UIApplicationDelegate {
+class AppDelegate: UIResponder, UIApplicationDelegate, UNUserNotificationCenterDelegate {
     var window: UIWindow?
     private var displayLink: CADisplayLink?
     private var launchOverlay: UIView?
@@ -37,7 +38,11 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
         if isFirstLaunch {
             defaults.set(true, forKey: Self.launchedBeforeKey)
         }
+        UNUserNotificationCenter.current().delegate = self
         reels_ios_start()
+        if #available(iOS 16.1, *) {
+            ReelsBackgroundDownloader.shared.activate()
+        }
         DispatchQueue.main.async { [weak self] in
             self?.showLaunchOverlay()
         }
@@ -246,6 +251,7 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
     func applicationDidBecomeActive(_ application: UIApplication) {
         scheduleSystemAppearanceRefresh()
         updateAppIcon(UIScreen.main.traitCollection.userInterfaceStyle == .dark)
+        PhotoLibraryPermission.presentPendingAlertIfNeeded()
         gpui_ios_did_become_active(nil)
     }
 
@@ -257,7 +263,45 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
         gpui_ios_did_enter_background(nil)
     }
 
+    func application(
+        _ application: UIApplication,
+        handleEventsForBackgroundURLSession identifier: String,
+        completionHandler: @escaping () -> Void
+    ) {
+        guard identifier == "com.dreamfly.reels.background-downloads" else {
+            completionHandler()
+            return
+        }
+        if #available(iOS 16.1, *) {
+            ReelsBackgroundDownloader.shared.handleEventsForBackgroundURLSession(
+                completionHandler: completionHandler
+            )
+        } else {
+            completionHandler()
+        }
+    }
+
     func applicationWillTerminate(_ application: UIApplication) {
         gpui_ios_will_terminate(nil)
+    }
+
+    func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        willPresent notification: UNNotification,
+        withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
+    ) {
+        completionHandler([.banner, .sound])
+    }
+
+    func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        didReceive response: UNNotificationResponse,
+        withCompletionHandler completionHandler: @escaping () -> Void
+    ) {
+        if response.notification.request.identifier ==
+            PhotoLibraryPermission.notificationIdentifier {
+            PhotoLibraryPermission.openSettings()
+        }
+        completionHandler()
     }
 }

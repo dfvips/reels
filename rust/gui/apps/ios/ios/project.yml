@@ -9,7 +9,6 @@ settings:
   base:
     SWIFT_VERSION: "5.0"
     IPHONEOS_DEPLOYMENT_TARGET: "18.0"
-    SWIFT_OBJC_BRIDGING_HEADER: Reels/BridgingHeader.h
     EXCLUDED_ARCHS[sdk=iphonesimulator*]: x86_64
     ENABLE_BITCODE: NO
 
@@ -21,10 +20,15 @@ targets:
       - path: Reels
         excludes:
           - Info.plist
+      - path: Shared
+    dependencies:
+      - target: ReelsWidget
+        embed: true
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.dreamfly.reels
         PRODUCT_NAME: Reels
+        SWIFT_OBJC_BRIDGING_HEADER: Reels/BridgingHeader.h
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         ASSETCATALOG_COMPILER_INCLUDE_ALL_APPICON_ASSETS: YES
         MARKETING_VERSION: "1.0.25"
@@ -72,3 +76,26 @@ targets:
           - "-lc++"
     scheme:
       testTargets: []
+
+  ReelsWidget:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: ReelsWidget
+        excludes:
+          - Info.plist
+      - path: Shared
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.dreamfly.reels.widget
+        PRODUCT_NAME: ReelsWidget
+        MARKETING_VERSION: "1.0.25"
+        CURRENT_PROJECT_VERSION: "25"
+        INFOPLIST_FILE: ReelsWidget/Info.plist
+        GENERATE_INFOPLIST_FILE: NO
+        APPLICATION_EXTENSION_API_ONLY: YES
+        SKIP_INSTALL: YES
+        LD_RUNPATH_SEARCH_PATHS:
+          - "$(inherited)"
+          - "@executable_path/Frameworks"
+          - "@executable_path/../../Frameworks"

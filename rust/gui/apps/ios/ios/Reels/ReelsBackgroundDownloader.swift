@@ -280,20 +280,28 @@ final class ReelsBackgroundDownloader: NSObject {
 
     private func enqueueTasks(for batch: BackgroundDownloadBatch) {
         for item in batch.items {
-            enqueueTask(batchID: batch.id, item: item, kind: .main)
-            if item.liveVideoURL != nil {
-                enqueueTask(batchID: batch.id, item: item, kind: .live)
+            if !enqueueTask(batchID: batch.id, item: item, kind: .main) {
+                failInvalidURL(batchID: batch.id, itemIndex: item.index)
+                continue
+            }
+            if item.liveVideoURL != nil &&
+                !enqueueTask(batchID: batch.id, item: item, kind: .live) {
+                failInvalidURL(batchID: batch.id, itemIndex: item.index)
             }
         }
+        finishIfReady()
     }
 
     private func enqueueTask(
         batchID: String,
         item: BackgroundDownloadItem,
         kind: DownloadTaskKind
-    ) {
+    ) -> Bool {
         let rawURL = kind == .main ? item.url : item.liveVideoURL
-        guard let rawURL, let url = URL(string: rawURL) else { return }
+        guard let rawURL, let url = Self.mediaURL(from: rawURL) else {
+            NSLog("reels: invalid media URL for item %d", item.index)
+            return false
+        }
         var request = URLRequest(url: url)
         request.setValue(Self.userAgent, forHTTPHeaderField: "User-Agent")
         request.setValue(Self.referer(for: rawURL), forHTTPHeaderField: "Referer")
@@ -305,6 +313,22 @@ final class ReelsBackgroundDownloader: NSObject {
             kind: kind
         )
         task.resume()
+        return true
+    }
+
+    private func failInvalidURL(batchID: String, itemIndex: Int) {
+        guard var current = batch, current.id == batchID,
+              current.items.indices.contains(itemIndex)
+        else { return }
+        markFailed(
+            batch: &current,
+            itemIndex: itemIndex,
+            message: "无效的下载地址",
+            timedOut: false
+        )
+        batch = current
+        persist(current)
+        publishActivity(current)
     }
 
     private func cancelTasks(for batchID: String) {
@@ -739,6 +763,30 @@ final class ReelsBackgroundDownloader: NSObject {
         return "https://www.douyin.com/"
     }
 
+    private static func mediaURL(from raw: String) -> URL? {
+        var value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        value = value
+            .replacingOccurrences(of: "\r", with: "")
+            .replacingOccurrences(of: "\n", with: "")
+            .replacingOccurrences(of: "&amp;", with: "&")
+        guard !value.isEmpty else { return nil }
+        if value.hasPrefix("//") {
+            value = "https:" + value
+        }
+
+        var parsed = URL(string: value)
+        if parsed?.scheme == nil {
+            parsed = URL(string: "https://" + value)
+        }
+        guard let parsed,
+              let scheme = parsed.scheme?.lowercased(),
+              scheme == "http" || scheme == "https",
+              let host = parsed.host,
+              !host.isEmpty
+        else { return nil }
+        return parsed
+    }
+
     private static func fileSize(at path: String) -> Int64 {
         let attributes = try? FileManager.default.attributesOfItem(atPath: path)
         return (attributes?[.size] as? NSNumber)?.int64Value ?? 0
@@ -886,7 +934,7 @@ extension ReelsBackgroundDownloader: URLSessionDownloadDelegate {
             if current.cancelled || nsError?.code == NSURLErrorCancelled {
                 message = "下载已取消"
             } else if let error {
-                message = "下载失败: \(error.localizedDescription)"
+                message = error.localizedDescription
             } else {
                 message = "下载失败"
             }

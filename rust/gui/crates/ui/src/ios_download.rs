@@ -88,20 +88,20 @@ pub(crate) fn start(
     if urls.is_empty() {
         return false;
     }
-    let (
-        Some((id_string, _)),
-        Some((_, urls)),
-        Some((_, titles)),
-        Some((_, extensions)),
-        Some((_, live_videos)),
-    ) = (
-        required_strings(&[next_batch_id()]),
-        required_strings(urls),
-        required_strings(titles),
-        optional_strings(extensions),
-        optional_strings(live_videos),
-    )
-    else {
+    // CString 的底层缓冲区必须活到 Swift 调用返回，不能用 `_` 丢弃。
+    let Some((id_string, _)) = required_strings(&[next_batch_id()]) else {
+        return false;
+    };
+    let Some((url_strings, url_pointers)) = required_strings(urls) else {
+        return false;
+    };
+    let Some((title_strings, title_pointers)) = required_strings(titles) else {
+        return false;
+    };
+    let Some((extension_strings, extension_pointers)) = optional_strings(extensions) else {
+        return false;
+    };
+    let Some((live_strings, live_pointers)) = optional_strings(live_videos) else {
         return false;
     };
     let (Ok(directory), Ok(cache_dir)) = (
@@ -123,15 +123,16 @@ pub(crate) fn start(
     let started = unsafe {
         reels_ios_background_download_start(
             id_string[0].as_ptr(),
-            urls.as_ptr(),
-            titles.as_ptr(),
-            extensions.as_ptr(),
-            live_videos.as_ptr(),
-            urls.len(),
+            url_pointers.as_ptr(),
+            title_pointers.as_ptr(),
+            extension_pointers.as_ptr(),
+            live_pointers.as_ptr(),
+            url_pointers.len(),
             directory.as_ptr(),
             cache_dir.as_ptr(),
         )
     };
+    drop((url_strings, title_strings, extension_strings, live_strings));
     if !started {
         *ACTIVE
             .get_or_init(|| Mutex::new(None))

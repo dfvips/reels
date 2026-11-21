@@ -41,6 +41,14 @@ pub(crate) fn has_multiple_video_qualities(item: &ResultItem) -> bool {
     false
 }
 
+fn download_failure_text(error: &str) -> String {
+    if error.starts_with("下载失败") {
+        error.to_string()
+    } else {
+        format!("下载失败: {error}")
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct DownloadPlan {
     urls: Vec<String>,
@@ -148,7 +156,7 @@ pub(crate) fn is_live_entry(entry: &MediaEntry) -> bool {
 mod tests {
     use douyin_core::extractor::{MediaEntry, MediaKind, MediaPlatform};
 
-    use super::{build_download_plan, has_multiple_video_qualities};
+    use super::{build_download_plan, download_failure_text, has_multiple_video_qualities};
     use crate::{ResourceScope, ResultItem};
 
     fn video(quality: Option<&str>) -> MediaEntry {
@@ -184,6 +192,18 @@ mod tests {
             video(Some("原画")),
             video(Some("720P")),
         ])));
+    }
+
+    #[test]
+    fn failure_text_is_prefixed_once() {
+        assert_eq!(
+            download_failure_text("服务器返回错误: HTTP 403"),
+            "下载失败: 服务器返回错误: HTTP 403"
+        );
+        assert_eq!(
+            download_failure_text("下载失败: 不支持的 URL"),
+            "下载失败: 不支持的 URL"
+        );
     }
 
     #[test]
@@ -554,7 +574,7 @@ impl AppView {
                 );
             } else if let Some(error) = errors.first() {
                 self.toast(
-                    format!("下载失败: {error}{timeout_note}"),
+                    format!("{}{timeout_note}", download_failure_text(error)),
                     ToastKind::Error,
                     cx,
                 );
@@ -582,10 +602,11 @@ impl AppView {
             );
             self.dialog = None;
         } else if let Some(error) = errors.first() {
+            let base = download_failure_text(error);
             let message = if skipped_audio > 0 {
-                format!("下载失败: {error}（已跳过 {skipped_audio} 个 MP3 文件）")
+                format!("{base}（已跳过 {skipped_audio} 个 MP3 文件）")
             } else {
-                format!("下载失败: {error}")
+                base
             };
             self.toast(message, ToastKind::Error, cx);
             self.dialog = None;

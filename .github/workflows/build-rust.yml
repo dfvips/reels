@@ -446,7 +446,55 @@ jobs:
 
       - uses: android-actions/setup-android@v3
         with:
-          packages: "platform-tools platforms;android-36 build-tools;36.0.0"
+          # Avoid the action's default `tools platform-tools` upgrade. The hosted
+          # image already has platform-tools, and that download can be corrupted.
+          packages: "platforms;android-36"
+
+      - name: Ensure Android SDK components
+        run: |
+          set -euo pipefail
+          : "${ANDROID_HOME:?ANDROID_HOME is not set}"
+          SDKMANAGER=""
+          if [[ -d "${ANDROID_HOME}/cmdline-tools" ]]; then
+            SDKMANAGER="$(find "${ANDROID_HOME}/cmdline-tools" -type f -name sdkmanager \
+              | sort -V | tail -n 1)"
+          fi
+          if [[ -z "${SDKMANAGER}" ]]; then
+            SDKMANAGER="$(command -v sdkmanager || true)"
+          fi
+          if [[ -z "${SDKMANAGER}" ]]; then
+            echo "::error::未找到 sdkmanager"
+            exit 1
+          fi
+          yes | "${SDKMANAGER}" --sdk_root="${ANDROID_HOME}" --licenses \
+            >/dev/null 2>&1 || true
+
+          if [[ -d "${ANDROID_HOME}/platforms/android-36" ]] \
+            && [[ -d "${ANDROID_HOME}/build-tools/36.0.0" ]]; then
+            echo "Android SDK components already installed"
+            exit 0
+          fi
+
+          for attempt in 1 2 3; do
+            echo "Installing Android SDK components (attempt ${attempt}/3)"
+            rm -rf \
+              "${ANDROID_HOME}/.temp" \
+              "${ANDROID_HOME}/temp" \
+              "${ANDROID_HOME}/.downloadIntermediates" \
+              "${HOME}/.android/cache"
+            if "${SDKMANAGER}" --sdk_root="${ANDROID_HOME}" --install \
+              "platforms;android-36" "build-tools;36.0.0"; then
+              break
+            fi
+            if [[ "${attempt}" -eq 3 ]]; then
+              echo "::error::Android SDK components installation failed after 3 attempts"
+              exit 1
+            fi
+            sleep 15
+          done
+
+          test -d "${ANDROID_HOME}/platforms/android-36"
+          test -d "${ANDROID_HOME}/build-tools/36.0.0"
 
       - uses: nttld/setup-ndk@v1
         id: setup-ndk

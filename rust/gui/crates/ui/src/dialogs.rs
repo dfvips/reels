@@ -2432,7 +2432,7 @@ impl AppView {
                                         div()
                                             .text_size(px(12.0))
                                             .font_weight(FontWeight::BOLD)
-                                            .child(format!("{:.1}%", overall * 100.0)),
+                                            .child(format!("{:.0}%", overall * 100.0)),
                                     )
                                     .child(div().text_size(px(12.0)).child(format!(
                                         "{} / {}",
@@ -2469,7 +2469,7 @@ impl AppView {
                                         div()
                                             .text_size(px(12.0))
                                             .font_weight(FontWeight::BOLD)
-                                            .child(format!("{:.1}%", current_progress * 100.0)),
+                                            .child(format!("{:.0}%", current_progress * 100.0)),
                                     )
                                     .child(div().text_size(px(12.0)).child(format!(
                                         "{} / {}",

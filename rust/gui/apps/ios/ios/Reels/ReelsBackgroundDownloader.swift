@@ -2,6 +2,19 @@ import Foundation
 import Photos
 import UIKit
 
+private struct BackgroundDownloadPart: Codable {
+    var index: Int
+    var start: Int64
+    var end: Int64
+    var cachePath: String
+    var downloaded: Int64 = 0
+    var finished = false
+
+    var expected: Int64 {
+        max(end - start + 1, 0)
+    }
+}
+
 private struct BackgroundDownloadItem: Codable {
     var index: Int
     var title: String
@@ -11,6 +24,8 @@ private struct BackgroundDownloadItem: Codable {
     var destinationPath: String
     var mainCachePath: String
     var liveCachePath: String?
+    var expectedMainSize: Int64 = 0
+    var mainSegments: [BackgroundDownloadPart]? = nil
     var mainTotal: Int64 = 0
     var liveTotal: Int64 = 0
     var mainDownloaded: Int64 = 0
@@ -39,6 +54,7 @@ private struct BackgroundDownloadItem: Codable {
     var isTerminal: Bool {
         finalized || failed
     }
+
 }
 
 private struct BackgroundDownloadBatch: Codable {
@@ -62,20 +78,30 @@ private struct DownloadTaskDescriptor {
     let batchID: String
     let index: Int
     let kind: DownloadTaskKind
+    let segment: Int?
 
     init?(description: String?) {
         let parts = description?.split(separator: "|", omittingEmptySubsequences: false) ?? []
-        guard parts.count == 3,
+        guard (parts.count == 3 || parts.count == 4),
               let index = Int(parts[1]),
               let kind = DownloadTaskKind(rawValue: String(parts[2]))
         else { return nil }
         batchID = String(parts[0])
         self.index = index
         self.kind = kind
+        segment = parts.count == 4 ? Int(parts[3]) : nil
     }
 
-    static func encode(batchID: String, index: Int, kind: DownloadTaskKind) -> String {
-        "\(batchID)|\(index)|\(kind.rawValue)"
+    static func encode(
+        batchID: String,
+        index: Int,
+        kind: DownloadTaskKind,
+        segment: Int? = nil
+    ) -> String {
+        if let segment {
+            return "\(batchID)|\(index)|\(kind.rawValue)|\(segment)"
+        }
+        return "\(batchID)|\(index)|\(kind.rawValue)"
     }
 }
 
@@ -88,6 +114,8 @@ final class ReelsBackgroundDownloader: NSObject {
     private static let userAgent =
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
         "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    private static let segmentedDownloadThreshold: Int64 = 50 * 1024 * 1024
+    private static let segmentCount = 6
 
     private let queue = DispatchQueue(label: "com.dreamfly.reels.background-download")
     private var session: URLSession!
@@ -143,13 +171,15 @@ final class ReelsBackgroundDownloader: NSObject {
         titles: [String],
         extensions: [String?],
         liveVideos: [String?],
+        sizes: [UInt64],
         directory: String,
         cacheDirectory: String
     ) -> Bool {
         guard !urls.isEmpty,
               urls.count == titles.count,
               urls.count == extensions.count,
-              urls.count == liveVideos.count
+              urls.count == liveVideos.count,
+              urls.count == sizes.count
         else { return false }
 
         var accepted = false
@@ -199,6 +229,12 @@ final class ReelsBackgroundDownloader: NSObject {
                     ? nil
                     : (cacheDirectory as NSString)
                         .appendingPathComponent("\(batchID)-\(index)-live.mp4")
+                let expectedMainSize = Int64(sizes[index])
+                let segments = Self.segmentPlan(
+                    total: expectedMainSize,
+                    fileExtension: fileExtension,
+                    mainCachePath: mainCachePath
+                )
                 items.append(
                     BackgroundDownloadItem(
                         index: index,
@@ -208,7 +244,10 @@ final class ReelsBackgroundDownloader: NSObject {
                         liveVideoURL: liveURL,
                         destinationPath: (directory as NSString).appendingPathComponent(fileName),
                         mainCachePath: mainCachePath,
-                        liveCachePath: liveCachePath
+                        liveCachePath: liveCachePath,
+                        expectedMainSize: expectedMainSize,
+                        mainSegments: segments,
+                        mainTotal: expectedMainSize
                     )
                 )
             }
@@ -280,12 +319,34 @@ final class ReelsBackgroundDownloader: NSObject {
 
     private func enqueueTasks(for batch: BackgroundDownloadBatch) {
         for item in batch.items {
-            if !enqueueTask(batchID: batch.id, item: item, kind: .main) {
+            if let segments = item.mainSegments, !segments.isEmpty {
+                for segment in segments {
+                    if !enqueueTask(
+                        batchID: batch.id,
+                        item: item,
+                        kind: .main,
+                        segment: segment
+                    ) {
+                        failInvalidURL(batchID: batch.id, itemIndex: item.index)
+                        break
+                    }
+                }
+            } else if !enqueueTask(
+                batchID: batch.id,
+                item: item,
+                kind: .main,
+                segment: nil
+            ) {
                 failInvalidURL(batchID: batch.id, itemIndex: item.index)
                 continue
             }
             if item.liveVideoURL != nil &&
-                !enqueueTask(batchID: batch.id, item: item, kind: .live) {
+                !enqueueTask(
+                    batchID: batch.id,
+                    item: item,
+                    kind: .live,
+                    segment: nil
+                ) {
                 failInvalidURL(batchID: batch.id, itemIndex: item.index)
             }
         }
@@ -295,7 +356,8 @@ final class ReelsBackgroundDownloader: NSObject {
     private func enqueueTask(
         batchID: String,
         item: BackgroundDownloadItem,
-        kind: DownloadTaskKind
+        kind: DownloadTaskKind,
+        segment: BackgroundDownloadPart?
     ) -> Bool {
         let rawURL = kind == .main ? item.url : item.liveVideoURL
         guard let rawURL, let url = Self.mediaURL(from: rawURL) else {
@@ -306,11 +368,18 @@ final class ReelsBackgroundDownloader: NSObject {
         request.setValue(Self.userAgent, forHTTPHeaderField: "User-Agent")
         request.setValue(Self.referer(for: rawURL), forHTTPHeaderField: "Referer")
         request.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
+        if let segment {
+            request.setValue(
+                "bytes=\(segment.start)-\(segment.end)",
+                forHTTPHeaderField: "Range"
+            )
+        }
         let task = session.downloadTask(with: request)
         task.taskDescription = DownloadTaskDescriptor.encode(
             batchID: batchID,
             index: item.index,
-            kind: kind
+            kind: kind,
+            segment: segment?.index
         )
         task.resume()
         return true
@@ -376,13 +445,30 @@ final class ReelsBackgroundDownloader: NSObject {
             guard !item.isTerminal else { return }
 
             let normalizedTotal = max(expected, downloaded)
-            let reportKey = "\(descriptor.batchID)|\(item.index)|\(descriptor.kind.rawValue)"
+            let segmentSuffix = descriptor.segment.map { "|\($0)" } ?? ""
+            let reportKey = "\(descriptor.batchID)|\(item.index)|" +
+                "\(descriptor.kind.rawValue)\(segmentSuffix)"
             let previous = self.lastReportedBytes[reportKey] ?? -1
             if descriptor.kind == .main {
-                if normalizedTotal > item.mainTotal {
-                    item.mainTotal = normalizedTotal
+                if let segmentIndex = descriptor.segment,
+                   var segments = item.mainSegments,
+                   segments.indices.contains(segmentIndex) {
+                    segments[segmentIndex].downloaded = max(
+                        segments[segmentIndex].downloaded,
+                        downloaded
+                    )
+                    item.mainSegments = segments
+                    item.mainDownloaded = segments.reduce(0) { $0 + $1.downloaded }
+                    item.mainTotal = max(
+                        item.expectedMainSize,
+                        segments.reduce(0) { $0 + $1.expected }
+                    )
+                } else {
+                    if normalizedTotal > item.mainTotal {
+                        item.mainTotal = normalizedTotal
+                    }
+                    item.mainDownloaded = max(item.mainDownloaded, downloaded)
                 }
-                item.mainDownloaded = max(item.mainDownloaded, downloaded)
                 if started && !item.mainStartedReported {
                     item.mainStartedReported = true
                     self.emitStarted(
@@ -446,7 +532,27 @@ final class ReelsBackgroundDownloader: NSObject {
                 finishIfReady()
                 return
             }
-            let targetPath = descriptor.kind == .main ? item.mainCachePath : item.liveCachePath
+            if descriptor.segment != nil && statusCode != 206 {
+                markFailed(
+                    batch: &current,
+                    itemIndex: descriptor.index,
+                    message: "服务器不支持分段下载",
+                    timedOut: false
+                )
+                batch = current
+                persist(current)
+                publishActivity(current)
+                finishIfReady()
+                return
+            }
+            let targetPath: String?
+            if let segmentIndex = descriptor.segment,
+               let segments = item.mainSegments,
+               segments.indices.contains(segmentIndex) {
+                targetPath = segments[segmentIndex].cachePath
+            } else {
+                targetPath = descriptor.kind == .main ? item.mainCachePath : item.liveCachePath
+            }
             guard let targetPath else { return }
             let targetURL = URL(fileURLWithPath: targetPath)
             let fileManager = FileManager.default
@@ -470,7 +576,34 @@ final class ReelsBackgroundDownloader: NSObject {
                 return
             }
 
-            if descriptor.kind == .main {
+            if let segmentIndex = descriptor.segment,
+               var segments = item.mainSegments,
+               segments.indices.contains(segmentIndex) {
+                segments[segmentIndex].finished = true
+                segments[segmentIndex].downloaded = max(
+                    segments[segmentIndex].downloaded,
+                    Self.fileSize(at: targetPath)
+                )
+                item.mainSegments = segments
+                item.mainDownloaded = segments.reduce(0) { $0 + $1.downloaded }
+                if segments.allSatisfy(\.finished) {
+                    if let error = Self.mergeSegments(&item) {
+                        markFailed(
+                            batch: &current,
+                            itemIndex: descriptor.index,
+                            message: "合并分段下载失败: \(error)",
+                            timedOut: false
+                        )
+                    } else {
+                        item.mainFinished = true
+                        item.mainDownloaded = max(
+                            item.mainDownloaded,
+                            Self.fileSize(at: item.mainCachePath)
+                        )
+                        item.mainTotal = max(item.mainTotal, item.mainDownloaded)
+                    }
+                }
+            } else if descriptor.kind == .main {
                 item.mainFinished = true
                 item.mainDownloaded = max(
                     item.mainDownloaded,
@@ -492,8 +625,34 @@ final class ReelsBackgroundDownloader: NSObject {
             current.items[descriptor.index] = item
             batch = current
             persist(current)
+            publishActivity(current)
             finalizeIfReady(itemIndex: descriptor.index)
         }
+    }
+
+    private static func mergeSegments(_ item: inout BackgroundDownloadItem) -> String? {
+        guard let segments = item.mainSegments, !segments.isEmpty else { return nil }
+        let fileManager = FileManager.default
+        try? fileManager.removeItem(atPath: item.mainCachePath)
+        guard fileManager.createFile(atPath: item.mainCachePath, contents: nil) else {
+            return "无法创建目标文件"
+        }
+        do {
+            let output = try FileHandle(forWritingTo: URL(fileURLWithPath: item.mainCachePath))
+            defer { try? output.close() }
+            for segment in segments.sorted(by: { $0.index < $1.index }) {
+                let input = try FileHandle(forReadingFrom: URL(fileURLWithPath: segment.cachePath))
+                defer { try? input.close() }
+                while let data = try input.read(upToCount: 1024 * 1024), !data.isEmpty {
+                    try output.write(contentsOf: data)
+                }
+                try? fileManager.removeItem(atPath: segment.cachePath)
+            }
+        } catch {
+            return error.localizedDescription
+        }
+        item.mainSegments = nil
+        return nil
     }
 
     private func finalizeIfReady(itemIndex: Int) {
@@ -625,6 +784,9 @@ final class ReelsBackgroundDownloader: NSObject {
             try? fileManager.removeItem(atPath: item.mainCachePath)
             if let liveCachePath = item.liveCachePath {
                 try? fileManager.removeItem(atPath: liveCachePath)
+            }
+            for segment in item.mainSegments ?? [] {
+                try? fileManager.removeItem(atPath: segment.cachePath)
             }
         }
         batch = nil
@@ -761,6 +923,30 @@ final class ReelsBackgroundDownloader: NSObject {
             return "https://www.xiaohongshu.com/"
         }
         return "https://www.douyin.com/"
+    }
+
+    private static func segmentPlan(
+        total: Int64,
+        fileExtension: String,
+        mainCachePath: String
+    ) -> [BackgroundDownloadPart]? {
+        let videoExtensions = ["mp4", "mov", "m4v", "webm"]
+        guard videoExtensions.contains(fileExtension.lowercased()),
+              total >= segmentedDownloadThreshold
+        else { return nil }
+        let count = segmentCount
+        let segmentSize = total / Int64(count)
+        guard segmentSize > 0 else { return nil }
+        return (0..<count).map { index in
+            let start = Int64(index) * segmentSize
+            let end = index == count - 1 ? total - 1 : start + segmentSize - 1
+            return BackgroundDownloadPart(
+                index: index,
+                start: start,
+                end: end,
+                cachePath: "\(mainCachePath).part\(index)"
+            )
+        }
     }
 
     private static func mediaURL(from raw: String) -> URL? {
@@ -965,11 +1151,12 @@ public func reelsBackgroundDownloadStart(
     _ titles: UnsafePointer<UnsafePointer<CChar>?>?,
     _ extensions: UnsafePointer<UnsafePointer<CChar>?>?,
     _ liveVideos: UnsafePointer<UnsafePointer<CChar>?>?,
+    _ sizes: UnsafePointer<UInt64>?,
     _ count: Int,
     _ directory: UnsafePointer<CChar>?,
     _ cacheDirectory: UnsafePointer<CChar>?
 ) -> Bool {
-    guard let batchID, let urls, let titles, let extensions, let liveVideos,
+    guard let batchID, let urls, let titles, let extensions, let liveVideos, let sizes,
           let directory, let cacheDirectory, count > 0
     else { return false }
     guard #available(iOS 16.1, *) else { return false }
@@ -982,6 +1169,7 @@ public func reelsBackgroundDownloadStart(
     var titleValues: [String] = []
     var extensionValues: [String?] = []
     var liveValues: [String?] = []
+    var sizeValues: [UInt64] = []
     for index in 0..<count {
         guard let url = string(at: urls[index]), let title = string(at: titles[index]) else {
             return false
@@ -990,6 +1178,7 @@ public func reelsBackgroundDownloadStart(
         titleValues.append(title)
         extensionValues.append(string(at: extensions[index]))
         liveValues.append(string(at: liveVideos[index]))
+        sizeValues.append(sizes[index])
     }
     return ReelsBackgroundDownloader.shared.start(
         batchID: String(cString: batchID),
@@ -997,6 +1186,7 @@ public func reelsBackgroundDownloadStart(
         titles: titleValues,
         extensions: extensionValues,
         liveVideos: liveValues,
+        sizes: sizeValues,
         directory: String(cString: directory),
         cacheDirectory: String(cString: cacheDirectory)
     )

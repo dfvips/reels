@@ -88,17 +88,22 @@ pub fn start_downloads(
     titles: Vec<String>,
     extensions: Vec<Option<String>>,
     live_videos: Vec<Option<String>>,
+    sizes: Vec<Option<u64>>,
     directory: PathBuf,
     cache_dir: PathBuf,
     cancel: Arc<AtomicBool>,
     tx: Sender<DownloadEvent>,
 ) {
+    #[cfg(not(target_os = "ios"))]
+    let _ = &sizes;
+
     #[cfg(target_os = "ios")]
     if crate::ios_download::start(
         &urls,
         &titles,
         &extensions,
         &live_videos,
+        &sizes,
         &directory,
         &cache_dir,
         tx.clone(),

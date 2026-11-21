@@ -29,6 +29,7 @@ unsafe extern "C" {
         titles: *const *const c_char,
         extensions: *const *const c_char,
         live_videos: *const *const c_char,
+        sizes: *const u64,
         count: usize,
         directory: *const c_char,
         cache_dir: *const c_char,
@@ -81,6 +82,7 @@ pub(crate) fn start(
     titles: &[String],
     extensions: &[Option<String>],
     live_videos: &[Option<String>],
+    sizes: &[Option<u64>],
     directory: &Path,
     cache_dir: &Path,
     tx: Sender<DownloadEvent>,
@@ -110,6 +112,11 @@ pub(crate) fn start(
     ) else {
         return false;
     };
+    let sizes = urls
+        .iter()
+        .enumerate()
+        .map(|(index, _)| sizes.get(index).and_then(|size| *size).unwrap_or(0))
+        .collect::<Vec<_>>();
     let batch_id = id_string[0].to_string_lossy().into_owned();
 
     *ACTIVE
@@ -127,12 +134,19 @@ pub(crate) fn start(
             title_pointers.as_ptr(),
             extension_pointers.as_ptr(),
             live_pointers.as_ptr(),
+            sizes.as_ptr(),
             url_pointers.len(),
             directory.as_ptr(),
             cache_dir.as_ptr(),
         )
     };
-    drop((url_strings, title_strings, extension_strings, live_strings));
+    drop((
+        url_strings,
+        title_strings,
+        extension_strings,
+        live_strings,
+        sizes,
+    ));
     if !started {
         *ACTIVE
             .get_or_init(|| Mutex::new(None))

@@ -55,6 +55,7 @@ pub(crate) struct DownloadPlan {
     titles: Vec<String>,
     extensions: Vec<Option<String>>,
     live_videos: Vec<Option<String>>,
+    sizes: Vec<Option<u64>>,
     skipped_audio: usize,
 }
 
@@ -64,6 +65,7 @@ impl DownloadPlan {
         self.titles.push(title.to_string());
         self.extensions.push(entry.extension.clone());
         self.live_videos.push(live_video);
+        self.sizes.push(entry.size_bytes);
     }
 }
 
@@ -427,6 +429,7 @@ impl AppView {
             plan.titles,
             plan.extensions,
             plan.live_videos,
+            plan.sizes,
             directory,
             self.paths.cache_dir.clone(),
             cancel,

@@ -24,11 +24,7 @@ use core_text::{
     string_attributes::kCTFontAttributeName,
 };
 use font_kit::{
-    canvas::{Canvas, Format, RasterizationOptions},
-    font::Font as FontKitFont,
-    handle::Handle,
-    hinting::HintingOptions,
-    source::SystemSource,
+    font::Font as FontKitFont, handle::Handle, hinting::HintingOptions, source::SystemSource,
     sources::mem::MemSource,
 };
 use gpui::{
@@ -38,7 +34,7 @@ use gpui::{
 };
 use pathfinder_geometry::{
     transform2d::Transform2F,
-    vector::{Vector2F, Vector2I},
+    vector::Vector2I,
 };
 use smallvec::SmallVec;
 use std::cell::RefCell;
@@ -52,6 +48,8 @@ thread_local! {
     /// Reusable Core Graphics color space for emoji glyph rasterization.
     static GLYPH_EMOJI_COLOR_SPACE: RefCell<Option<CGColorSpace>> = const { RefCell::new(None) };
 }
+
+const kCGImageAlphaOnly: u32 = 7;
 
 #[derive(Clone, Debug)]
 pub(super) struct LayoutCacheKey {
@@ -283,22 +281,14 @@ impl IosTextSystemState {
     pub(super) fn raster_bounds(&self, params: &RenderGlyphParams) -> Result<Bounds<DevicePixels>> {
         let font = &self.fonts[params.font_id.0];
         let scale = Transform2F::from_scale(params.scale_factor);
-        let mut bounds = recti_to_bounds_device_pixels(font.raster_bounds(
+        let bounds = recti_to_bounds_device_pixels(font.raster_bounds(
             params.glyph_id.0,
             params.font_size.into(),
             scale,
             HintingOptions::None,
             font_kit::canvas::RasterizationOptions::GrayscaleAa,
         )?);
-
-        // Match the macOS rasterizer's small horizontal gutter so antialiased
-        // edges do not get cut off in the atlas.
-        let pad =
-            ((params.font_size.as_f32() * 0.03 * params.scale_factor).ceil() as i32).clamp(1, 5);
-        bounds.origin.x -= DevicePixels(pad);
-        bounds.size.width += DevicePixels(pad);
-
-        Ok(bounds)
+        Ok(bounds.dilate(DevicePixels(1)))
     }
 
     pub(super) fn rasterize_glyph(
@@ -329,33 +319,50 @@ impl IosTextSystemState {
         }
         let bitmap_size = bitmap_size;
         if !params.is_emoji {
+            // CoreGraphics keeps fractional glyph positions intact; font-kit's
+            // alpha rasterizer can drop glyphs at some iOS subpixel offsets.
             let canvas_size = Vector2I::new(bitmap_size.width.0, bitmap_size.height.0);
             let stride = bitmap_size.width.0 as usize;
             bitmap.resize(stride * bitmap_size.height.0 as usize, 0);
             bitmap.fill(0);
-            let mut canvas = Canvas {
-                pixels: std::mem::take(bitmap),
-                size: canvas_size,
+            let color_space = CGColorSpace::create_device_gray();
+            let cx = CGContext::create_bitmap_context(
+                Some(bitmap.as_mut_ptr() as *mut _),
+                canvas_size.x() as usize,
+                canvas_size.y() as usize,
+                8,
                 stride,
-                format: Format::A8,
-            };
+                &color_space,
+                kCGImageAlphaOnly,
+            );
             let subpixel_shift = params
                 .subpixel_variant
                 .map(|v| v as f32 / SUBPIXEL_VARIANTS_X as f32);
-            let scale = Transform2F::from_scale(params.scale_factor);
-            let transform = Transform2F::from_translation(Vector2F::new(
-                -glyph_bounds.origin.x.0 as f32 + subpixel_shift.x,
-                -glyph_bounds.origin.y.0 as f32 + subpixel_shift.y,
-            )) * scale;
-            self.fonts[params.font_id.0].rasterize_glyph(
-                &mut canvas,
-                params.glyph_id.0,
-                params.font_size.into(),
-                transform,
-                HintingOptions::None,
-                RasterizationOptions::GrayscaleAa,
-            )?;
-            *bitmap = canvas.pixels;
+            cx.translate(
+                -glyph_bounds.origin.x.0 as CGFloat,
+                (glyph_bounds.origin.y.0 + glyph_bounds.size.height.0) as CGFloat,
+            );
+            cx.scale(
+                params.scale_factor as CGFloat,
+                params.scale_factor as CGFloat,
+            );
+            cx.set_text_drawing_mode(CGTextDrawingMode::CGTextFill);
+            cx.set_allows_antialiasing(true);
+            cx.set_should_antialias(true);
+            cx.set_allows_font_subpixel_positioning(true);
+            cx.set_should_subpixel_position_fonts(true);
+            cx.set_allows_font_subpixel_quantization(false);
+            cx.set_should_subpixel_quantize_fonts(false);
+            cx.set_gray_fill_color(0.0, 1.0);
+            self.glyph_font(params.font_id, params.font_size)
+                .draw_glyphs(
+                    &[params.glyph_id.0 as CGGlyph],
+                    &[CGPoint::new(
+                        (subpixel_shift.x / params.scale_factor) as CGFloat,
+                        (subpixel_shift.y / params.scale_factor) as CGFloat,
+                    )],
+                    cx,
+                );
             return Ok(bitmap_size);
         }
 

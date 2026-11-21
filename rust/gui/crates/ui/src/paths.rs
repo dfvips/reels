@@ -299,7 +299,12 @@ pub fn format_size(bytes: u64) -> String {
     if unit == 0 {
         format!("{bytes} B")
     } else {
-        format!("{value:.1} {}", UNITS[unit])
+        let value = format!("{value:.1}");
+        format!(
+            "{} {}",
+            value.strip_suffix(".0").unwrap_or(&value),
+            UNITS[unit]
+        )
     }
 }
 
@@ -343,5 +348,12 @@ mod tests {
         assert!(size < 1024 * 1024, "sparse file counted as {size} bytes");
 
         let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn format_size_keeps_zero_and_trims_fractional_zero() {
+        assert_eq!(format_size(0), "0 B");
+        assert_eq!(format_size(63 * 1024 * 1024), "63 MB");
+        assert_eq!(format_size(539 * 1024 * 1024 + 512 * 1024), "539.5 MB");
     }
 }

@@ -161,3 +161,38 @@ fn rasterize_glyph_repeated_output_is_stable() {
         "second rasterization should preserve the bitmap length"
     );
 }
+
+#[test]
+fn zero_rasterizes_for_every_subpixel_variant() {
+    let mut state = test_state();
+    let font_id = state
+        .load_family(".AppleSystemUIFont", &Default::default(), None)
+        .ok()
+        .and_then(|ids| ids.first().copied())
+        .expect("system font should be available");
+    let glyph_id = state
+        .glyph_for_char(font_id, '0')
+        .expect("zero glyph should exist");
+
+    for variant in 0..SUBPIXEL_VARIANTS_X {
+        let params = RenderGlyphParams {
+            font_id,
+            glyph_id,
+            font_size: px(12.0),
+            subpixel_variant: point(variant, 0),
+            scale_factor: 3.0,
+            is_emoji: false,
+            subpixel_rendering: false,
+            dilation: 0,
+        };
+        let bounds = state.raster_bounds(&params).expect("bounds");
+        let mut bitmap = Vec::new();
+        state
+            .rasterize_glyph_into(&params, bounds, &mut bitmap)
+            .expect("rasterize");
+        assert!(
+            bitmap.iter().any(|pixel| *pixel != 0),
+            "zero glyph rasterized empty for subpixel variant {variant}"
+        );
+    }
+}

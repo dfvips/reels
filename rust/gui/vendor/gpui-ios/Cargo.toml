@@ -59,3 +59,6 @@ core-graphics = "0.25"
 core-text = "22"
 block2 = "0.6"
 font-kit = { package = "sotf-zed-font-kit", version = "0.14.1-zed", git = "https://github.com/pierreaubert/sotf-3rdparties", default-features = false, features = ["source"] }
+
+[dev-dependencies]
+tempfile = "3"

@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="GpuiStartingTheme" parent="Theme.Material3.DayNight.NoActionBar">
+        <item name="android:windowNoTitle">true</item>
+        <item name="android:windowActionBar">false</item>
+        <item name="android:windowBackground">@drawable/launch_screen</item>
+        <item name="android:windowDrawsSystemBarBackgrounds">true</item>
+        <item name="android:windowLightStatusBar">true</item>
+        <item name="android:windowLightNavigationBar">true</item>
+        <item name="android:colorAccent">#3F8DFF</item>
+        <item name="android:colorControlActivated">#3F8DFF</item>
+        <item name="android:colorControlHighlight">#4D3F8DFF</item>
+        <item name="android:textColorHighlight">#4D3F8DFF</item>
+        <item name="android:statusBarColor">#FFFFFF</item>
+        <item name="android:navigationBarColor">#FFFFFF</item>
+    </style>
+
+    <!--
+      Native text selection must use the device vendor's system ActionMode.
+      Theme.Material forces the legacy Material floating toolbar even on
+      Android 15. DeviceDefault inherits the OEM selection menu, magnifier,
+      overflow behaviour and floating-toolbar styling used by system apps.
+    -->
+    <style name="GpuiTheme" parent="Theme.Material3.DayNight.NoActionBar">
+        <item name="android:windowNoTitle">true</item>
+        <item name="android:windowActionBar">false</item>
+        <item name="android:windowBackground">@color/launch_background</item>
+        <item name="android:windowSplashScreenBackground">@color/launch_background</item>
+        <item name="android:windowDrawsSystemBarBackgrounds">true</item>
+        <item name="android:windowLightStatusBar">true</item>
+        <item name="android:windowLightNavigationBar">true</item>
+        <item name="android:colorAccent">#3F8DFF</item>
+        <item name="android:colorControlActivated">#3F8DFF</item>
+        <item name="android:colorControlHighlight">#4D3F8DFF</item>
+        <item name="android:textColorHighlight">#4D3F8DFF</item>
+        <item name="android:navigationBarColor">#FFFFFF</item>
+        <item name="android:statusBarColor">#FFFFFF</item>
+    </style>
+</resources>

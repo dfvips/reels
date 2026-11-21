@@ -98,6 +98,20 @@ impl IosWindow {
         }
     }
 
+    /// Clear the synthetic hover as soon as the gesture ends. A delayed clear
+    /// is too late when the tap closes a dialog: the newly exposed page under
+    /// the finger can be painted as hovered/active for one or more frames and
+    /// a follow-up event can resolve against it.
+    pub(super) fn clear_hover_now(&self) {
+        self.hover_clear_scheduled.set(false);
+        let _ = self.dispatch_input(PlatformInput::MouseMove(gpui::MouseMoveEvent {
+            position: gpui::point(gpui::px(-10000.0), gpui::px(-10000.0)),
+            modifiers: gpui::Modifiers::default(),
+            pressed_button: None,
+        }));
+        self.request_forced_frame();
+    }
+
     /// Start watching a pending touch for a long press.
     ///
     /// A GCD timer fires on the main thread after `LONG_PRESS_DURATION`;
@@ -595,7 +609,7 @@ impl IosWindow {
                                 modifiers,
                                 click_count: tap_count as usize,
                             }));
-                            self.schedule_hover_clear();
+                            self.clear_hover_now();
                         }
                     }
                     TouchState::Dragging => {

@@ -47,6 +47,10 @@ jobs:
           cargo fmt --all -- --check
           cargo fmt --all --manifest-path gui/Cargo.toml -- --check
 
+      - name: Check GUI lockfile
+        working-directory: rust
+        run: cargo metadata --locked --format-version 1 --manifest-path gui/Cargo.toml > /dev/null
+
       - name: Run core tests
         working-directory: rust
         run: cargo test --locked
@@ -427,11 +431,11 @@ jobs:
       matrix:
         include:
           - label: android-armv7
-            abis: "armeabi-v7a"
+            targets: "armv7"
           - label: android-armv8
-            abis: "arm64-v8a"
+            targets: "aarch64"
           - label: android-universal
-            abis: "armeabi-v7a,arm64-v8a"
+            targets: "armv7 aarch64"
     steps:
       - uses: actions/checkout@v4
 
@@ -440,7 +444,12 @@ jobs:
           distribution: temurin
           java-version: "17"
 
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: "platform-tools platforms;android-36 build-tools;36.0.0"
+
       - uses: nttld/setup-ndk@v1
+        id: setup-ndk
         with:
           ndk-version: r28c
           add-to-path: true
@@ -449,9 +458,11 @@ jobs:
         with:
           targets: armv7-linux-androideabi,aarch64-linux-android
 
-      - uses: taiki-e/install-action@v2
+      - uses: actions/setup-node@v4
         with:
-          tool: cargo-ndk
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: rust/gui/apps/android/frontend/package-lock.json
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -485,47 +496,70 @@ jobs:
             -alias "${ANDROID_KEY_ALIAS}" >/dev/null
           echo "ANDROID_KEYSTORE_PATH=${KEYSTORE}" >> "$GITHUB_ENV"
 
-      - name: Build native libraries
-        env:
-          APP_VERSION: ${{ needs.version.outputs.base }}
+      - name: Build Android frontend
+        working-directory: rust/gui/apps/android/frontend
         run: |
           set -euo pipefail
-          ABI_ARGS=()
-          ABI_LIST="${{ matrix.abis }}"
-          ABI_LIST="${ABI_LIST//,/ }"
-          for abi in ${ABI_LIST}; do
-            ABI_ARGS+=(-t "${abi}")
-          done
-          cd rust/gui
-          cargo ndk "${ABI_ARGS[@]}" -P 26 \
-            -o apps/android/android/app/src/main/jniLibs \
-            build --release --locked -p reels-android
+          npm ci
+          npm run build
+          npx --no-install vue-tsc --noEmit
 
       - name: Build APK
+        env:
+          APP_VERSION: ${{ needs.version.outputs.base }}
+          NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          TAURI_CLI_JS: ${{ github.workspace }}/rust/gui/apps/android/frontend/node_modules/@tauri-apps/cli/tauri.js
         run: |
           set -euo pipefail
-          GPUI_JAVA="${GITHUB_WORKSPACE}/rust/gui/vendor/gpui-android/android/src/main/java"
-          if [[ ! -d "${GPUI_JAVA}" ]]; then
-            echo "::error::gpui-android Java 源码目录不存在: ${GPUI_JAVA}"
-            exit 1
-          fi
-          export GPUI_ANDROID_JAVA_DIR="${GPUI_JAVA}"
-          echo "GPUI_ANDROID_JAVA_DIR=${GPUI_JAVA}" >> "$GITHUB_ENV"
+          cd rust/gui/apps/android
+          node "${TAURI_CLI_JS}" android build \
+            --apk \
+            --ci \
+            --target ${{ matrix.targets }} \
+            --config "{\"version\":\"${APP_VERSION}\",\"bundle\":{\"android\":{\"versionCode\":${{ needs.version.outputs.build }}}}}"
 
-          cd rust/gui/apps/android/android
-          chmod +x gradlew
-          ./gradlew --no-daemon assembleRelease \
-            -PdouyinVersionName=${{ needs.version.outputs.base }} \
-            -PdouyinVersionCode=${{ needs.version.outputs.build }} \
-            -PdouyinAbiFilters="${{ matrix.abis }}"
-
-          APK="app/build/outputs/apk/release/app-release.apk"
+          APK="gen/android/app/build/outputs/apk/universal/release/app-universal-release.apk"
           if [[ ! -f "${APK}" ]]; then
             echo "::error::未生成 APK"
             exit 1
           fi
           cp "${APK}" "${GITHUB_WORKSPACE}/${PRODUCT_NAME}.apk"
           ls -lh "${GITHUB_WORKSPACE}/${PRODUCT_NAME}.apk"
+
+      - name: Verify APK ABIs
+        run: |
+          set -euo pipefail
+          APK="${GITHUB_WORKSPACE}/${PRODUCT_NAME}.apk"
+          case "${{ matrix.label }}" in
+            android-armv7)
+              expected="armeabi-v7a"
+              forbidden="arm64-v8a"
+              ;;
+            android-armv8)
+              expected="arm64-v8a"
+              forbidden="armeabi-v7a"
+              ;;
+            android-universal)
+              expected="armeabi-v7a arm64-v8a"
+              forbidden=""
+              ;;
+            *)
+              echo "::error::未知 Android 矩阵: ${{ matrix.label }}"
+              exit 1
+              ;;
+          esac
+          for abi in ${expected}; do
+            if ! unzip -l "${APK}" | grep -Fq "lib/${abi}/libreels_android.so"; then
+              echo "::error::APK 缺少 ${abi} 原生库"
+              exit 1
+            fi
+          done
+          if [[ -n "${forbidden}" ]] \
+            && unzip -l "${APK}" | grep -Fq "lib/${forbidden}/libreels_android.so"; then
+            echo "::error::APK 混入了 ${forbidden} 原生库"
+            exit 1
+          fi
+          echo "APK ABI 校验通过: ${expected}"
 
       - name: Verify APK signature
         run: |

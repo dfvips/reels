@@ -27,6 +27,31 @@ Payload/
 *.dSYM
 /*.zip
 
+# Android / Gradle 构建缓存与产物
+.gradle/
+.kotlin/
+.cxx/
+.externalNativeBuild/
+captures/
+local.properties
+jniLibs/
+*.hprof
+*.idsig
+
+# Android 前端依赖与 Vite 构建产物
+node_modules/
+rust/gui/apps/android/frontend/dist/
+
+# Tauri 生成的 Android 构建缓存
+rust/gui/apps/android/gen/schemas/
+rust/gui/apps/android/gen/android/.tauri/
+rust/gui/apps/android/gen/android/tauri.settings.gradle
+rust/gui/apps/android/gen/android/app/tauri.build.gradle.kts
+rust/gui/apps/android/gen/android/app/tauri.properties
+rust/gui/apps/android/gen/android/app/proguard-tauri.pro
+rust/gui/apps/android/gen/android/app/src/main/assets/
+rust/gui/apps/android/gen/android/app/src/main/java/**/generated/
+
 # 本地签名材料
 .secrets/
 *.mobileprovision

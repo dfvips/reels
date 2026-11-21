@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="120" height="34" viewBox="0 0 120 34" preserveAspectRatio="none" fill="none">
+  <defs>
+    <linearGradient id="reels-gradient-rounded-8" x1="0" y1="0" x2="120" y2="0" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#0277F9"/>
+      <stop offset="1" stop-color="#5D47E3"/>
+    </linearGradient>
+  </defs>
+  <rect width="120" height="34" rx="8" ry="8" fill="url(#reels-gradient-rounded-8)"/>
+</svg>
